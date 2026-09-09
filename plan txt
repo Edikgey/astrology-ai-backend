@@ -1,0 +1,22 @@
+Ephemeris  
+│
+├── get_planets()        ➝  Позиции планет  
+├── get_asteroids()      ➝  Позиции астероидов  
+├── get_houses()         ➝  Дома Плацидуса  
+├── get_key_points()     ➝  Ключевые точки  
+├── get_moon_phase()     ➝  Фаза Луны  
+└── find_house()         ➝  Определение дома  
+
+Aspects  ⬅️  (отдельный класс)  
+│
+├── get_aspects()        ➝  Анализ аспектов между планетами  
+├── get_major_aspects()  ➝  Выявление мажорных аспектов  
+├── get_minor_aspects()  ➝  Выявление минорных аспектов  
+└── calculate_orbs()     ➝  Учет орбисов  
+
+Interpretation  ⬅️  (отдельный класс)  
+│
+├── interpret_planets()  ➝  Значение планет в знаках и домах  
+├── interpret_aspects()  ➝  Значение аспектов  
+├── interpret_patterns() ➝  Анализ астрологических фигур  
+└── generate_summary()   ➝  Итоговый гороскоп  

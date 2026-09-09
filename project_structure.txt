@@ -1,0 +1,27 @@
+
+natal_chart/
+│── api/
+│   │── endpoints.py        # 🌐 API эндпоинты (FastAPI)
+│   │── auth.py             # 🔑 Аутентификация и авторизация (JWT)
+│── database/
+│   │── connection.py       # 🔗 Подключение к PostgreSQL
+│   │── queries.py          # 📊 SQL-запросы
+│── models/
+│   │── natal_chart.py      # 🗄️ Pydantic-модели для схемы натальной карты
+│   │── user.py             # 👤 Модель пользователя
+│── modules/
+│   │── migration.py
+│   │── ephemeris.py        # 📡 Получение данных из Swiss Ephemeris (Асинхронно)
+│   │── houses.py           # 🏡 Вычисление домов и астрологических точек (MC, IC, AS, DS)
+│   │── aspects.py          # 🔗 Вычисление аспектов между планетами
+│   │── interpretation.py   # 📜 Генерация текстовой интерпретации
+│   │── moon_phase.py       # 🌙 Определение фазы Луны
+│   │── caching.py          # 🗂 Кэширование данных для ускорения вычислений
+│   │── background_tasks.py # 🔄 Фоновые задачи (например, обновление данных)
+│   │── patterns.py         # 🏗 Шаблоны интерпретаций и генерации текстов
+│   │── test_ephemeris.py   # 🧪 Тесты для модуля ephemeris
+├── services/
+│   └── email_service.py
+│── main.py                 # 🚀 Главный файл (запуск FastAPI)
+│── celery_worker.py        # 📌 Запуск Celery worker
+│── requirements.txt        # 📦 Зависимости проекта
