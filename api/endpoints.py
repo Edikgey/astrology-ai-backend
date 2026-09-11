@@ -242,28 +242,18 @@ from datetime import datetime
 async def ask_gpt_interpretation(
     data: GPTInterpretationRequest,
     db: Session = Depends(get_db),
-    identity: dict = Depends(get_current_user_or_guest),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Получает интерпретацию натальной карты по ID.
-    Доступна:
-    - авторизованным пользователям (если карта им принадлежит),
-    - или по session_token для гостей.
+    Доступна только авторизованному владельцу карты по JWT.
     """
     chart = db.query(NatalChart).filter_by(id=data.chart_id).first()
     if not chart:
         raise HTTPException(status_code=404, detail="❌ Натальная карта не найдена")
 
-    user = identity["user"]
-    session_token = identity["session_token"]
-
-    # 🛡 Проверка прав доступа
-    if chart.user_id:
-        if not user or user.id != chart.user_id:
-            raise HTTPException(status_code=403, detail="⛔ Эта карта принадлежит другому пользователю")
-    elif chart.session_token:
-        if not session_token or chart.session_token != session_token:
-            raise HTTPException(status_code=403, detail="⛔ Недействительный session_token для гостевой карты")
+    if chart.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="⛔ Недоступно: карта не принадлежит пользователю")
 
     # ✅ Генерация интерпретации
     interpreter = ChartInterpreter(
@@ -294,26 +284,18 @@ async def ask_gpt_interpretation(
 def get_gpt_messages(
     chart_id: int = Query(...),
     db: Session = Depends(get_db),
-    identity: dict = Depends(get_current_user_or_guest),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Получает список сообщений GPT, связанных с натальной картой.
-    Доступ только владельцу карты (по user_id или session_token).
+    Доступ только авторизованному владельцу карты по JWT.
     """
     chart = db.query(NatalChart).filter_by(id=chart_id).first()
     if not chart:
         raise HTTPException(status_code=404, detail="❌ Натальная карта не найдена")
 
-    user = identity["user"]
-    session_token = identity["session_token"]
-
-    # 🛡 Проверка прав
-    if chart.user_id:
-        if not user or user.id != chart.user_id:
-            raise HTTPException(status_code=403, detail="⛔ Недоступно: чужая карта")
-    elif chart.session_token:
-        if not session_token or session_token != chart.session_token:
-            raise HTTPException(status_code=403, detail="⛔ Недействительный session_token")
+    if chart.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="⛔ Недоступно: карта не принадлежит пользователю")
 
     messages = db.query(GPTMessage).filter_by(chart_id=chart_id).order_by(GPTMessage.created_at).all()
     return messages

@@ -319,11 +319,18 @@ class MyChartsTests(unittest.TestCase):
                         expires_at=datetime.utcnow() + timedelta(minutes=10)))
             session.commit()
 
+    def legacy_history(self, chart_id):
+        # Historical guest messages remain in storage but are no longer public
+        # through guest auth. Read the fixture directly before migrating it.
+        with self.sessions() as db:
+            return [(msg.id, msg.role, msg.content) for msg in db.query(GPTMessage)
+                    .filter_by(chart_id=chart_id).order_by(GPTMessage.created_at).all()]
+
     def test_verification_migrates_guest_chart_and_preserves_history(self):
         chart_id = self.chart(user_id=None, session_token=self.guest_token)
         other_guest_id = self.chart(user_id=None, session_token=uuid4())
         other_user_id = self.chart(user_id=2)
-        history_before = self.client.get(f"/gpt-messages?chart_id={chart_id}", headers=self.guest).json()
+        history_before = self.legacy_history(chart_id)
         self.verification_code()
         response = self.client.post("/auth/verify-code?code=123456", headers=self.guest,
                                     json={"email": "new@example.com", "password": "test-password-only", "guest_chart_id": chart_id})
@@ -341,7 +348,9 @@ class MyChartsTests(unittest.TestCase):
         opened = self.client.get(f"/natal-chart/{chart_id}", headers=registered)
         self.assertEqual(opened.status_code, 200, opened.text)
         self.assertEqual(opened.json()["chart_id"], chart_id)
-        self.assertEqual(self.client.get(f"/gpt-messages?chart_id={chart_id}", headers=registered).json(), history_before)
+        history = self.client.get(f"/gpt-messages?chart_id={chart_id}", headers=registered)
+        self.assertEqual(history.status_code, 200)
+        self.assertEqual([(msg["id"], msg["role"], msg["content"]) for msg in history.json()], history_before)
         self.assertEqual(self.client.get(f"/natal-chart/{chart_id}", headers=self.guest).status_code, 404)
 
     def test_verification_without_guest_header_still_works(self):
@@ -374,13 +383,15 @@ class MyChartsTests(unittest.TestCase):
             user.password_hash = get_password_hash("test-password-only")
             session.commit()
         chart_id = self.chart(user_id=None, session_token=self.guest_token)
-        history_before = self.client.get(f"/gpt-messages?chart_id={chart_id}", headers=self.guest).json()
+        history_before = self.legacy_history(chart_id)
         response = self.client.post("/auth/login", headers=self.guest,
                                     json={"email": "existing@example.com", "password": "test-password-only", "guest_chart_id": chart_id})
         self.assertEqual(response.status_code, 200, response.text)
         headers = {"Authorization": "Bearer " + response.json()["access_token"]}
         self.assertEqual(self.client.get(f"/natal-chart/{chart_id}", headers=headers).status_code, 200)
-        self.assertEqual(self.client.get(f"/gpt-messages?chart_id={chart_id}", headers=headers).json(), history_before)
+        history = self.client.get(f"/gpt-messages?chart_id={chart_id}", headers=headers)
+        self.assertEqual(history.status_code, 200)
+        self.assertEqual([(msg["id"], msg["role"], msg["content"]) for msg in history.json()], history_before)
         with self.sessions() as session:
             self.assertEqual(session.get(NatalChart, chart_id).user_id, 1)
 
@@ -523,8 +534,71 @@ class MyChartsTests(unittest.TestCase):
         self.assertEqual(len(self.client.get(f"/gpt-messages?chart_id={chart_id}", headers=self.owner).json()), 4)
         self.assertEqual(self.client.get(f"/gpt-messages?chart_id={chart_id}", headers=self.other).status_code, 403)
         guest_id = self.chart(user_id=None, session_token=self.guest_token)
-        self.assertEqual(self.client.get(f"/gpt-messages?chart_id={guest_id}", headers=self.guest).status_code, 200)
-        self.assertEqual(self.client.get(f"/gpt-messages?chart_id={guest_id}", headers={"X-Session-Token": str(uuid4())}).status_code, 403)
+        self.assertEqual(self.client.get(f"/gpt-messages?chart_id={guest_id}", headers=self.guest).status_code, 401)
+        self.assertEqual(self.client.get(f"/gpt-messages?chart_id={guest_id}", headers={"X-Session-Token": str(uuid4())}).status_code, 401)
+
+    def test_gpt_rejects_missing_invalid_and_expired_jwt_before_openai(self):
+        guest_id = self.chart(user_id=None, session_token=self.guest_token)
+        expired = create_access_token({"sub": "1"}, expires_delta=timedelta(seconds=-10))
+        invalid_tokens = ["invalid", expired, create_access_token({}),
+                          create_access_token({"sub": None}), create_access_token({"sub": "not-an-id"})]
+        headers_list = [{}, self.guest, {"Authorization": "Basic invalid", **self.guest}]
+        for token in invalid_tokens:
+            headers_list.extend([{"Authorization": f"Bearer {token}"},
+                                 {"Authorization": f"Bearer {token}", **self.guest}])
+        before = self.legacy_history(guest_id)
+        with patch("api.endpoints.ChartInterpreter") as interpreter, \
+                patch("modules.interpretation.client.chat.completions.create") as openai:
+            for headers in headers_list:
+                with self.subTest(headers=list(headers), authorization=headers.get("Authorization")):
+                    response = self.client.post("/ask-gpt", headers=headers,
+                                                json={"chart_id": guest_id, "question": "Denied question"})
+                    self.assertEqual(response.status_code, 401, response.text)
+                    history = self.client.get(f"/gpt-messages?chart_id={guest_id}", headers=headers)
+                    self.assertEqual(history.status_code, 401, history.text)
+                    self.assertNotIn("Existing answer", history.text)
+            interpreter.assert_not_called()
+            openai.assert_not_called()
+        self.assertEqual(self.legacy_history(guest_id), before)
+
+    def test_gpt_denies_foreign_guest_and_ownerless_charts_even_with_session_token(self):
+        ids = [self.chart(user_id=2, session_token=self.guest_token),
+               self.chart(user_id=None, session_token=self.guest_token), self.chart(user_id=None)]
+        with self.sessions() as db:
+            before = db.query(GPTMessage).count()
+        with patch("api.endpoints.ChartInterpreter") as interpreter, \
+                patch("modules.interpretation.client.chat.completions.create") as openai:
+            for chart_id in ids + [999999]:
+                for headers in (self.owner, {**self.owner, **self.guest}):
+                    with self.subTest(chart_id=chart_id, session="X-Session-Token" in headers):
+                        expected = 404 if chart_id == 999999 else 403
+                        response = self.client.post("/ask-gpt", headers=headers,
+                                                    json={"chart_id": chart_id, "question": "Denied question"})
+                        self.assertEqual(response.status_code, expected, response.text)
+                        history = self.client.get(f"/gpt-messages?chart_id={chart_id}", headers=headers)
+                        self.assertEqual(history.status_code, expected, history.text)
+                        self.assertNotIn("Existing answer", history.text)
+            interpreter.assert_not_called()
+            openai.assert_not_called()
+        with self.sessions() as db:
+            self.assertEqual(db.query(GPTMessage).count(), before)
+
+    def test_authenticated_gpt_uses_mock_openai_and_persists_both_messages(self):
+        chart_id = self.chart()
+        reply = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Mock OpenAI answer"))])
+        # Keep the real ask_gpt method, cached prompt and persistence path.
+        # The constructor's astrology calculations are unrelated to auth.
+        with patch("modules.interpretation.ChartInterpreter.__init__", return_value=None), \
+                patch("modules.interpretation.client.chat.completions.create", return_value=reply) as openai:
+            response = self.client.post("/ask-gpt", headers={**self.owner, "X-Session-Token": "ignored-invalid-token"},
+                                        json={"chart_id": chart_id, "question": "Authenticated question"})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json(), {"chart_id": chart_id, "response": "Mock OpenAI answer"})
+            openai.assert_called_once()
+        history = self.client.get(f"/gpt-messages?chart_id={chart_id}", headers=self.owner)
+        self.assertEqual(history.status_code, 200, history.text)
+        self.assertEqual([(m["role"], m["content"]) for m in history.json()][-2:],
+                         [("user", "Authenticated question"), ("gpt", "Mock OpenAI answer")])
 
 
 if __name__ == "__main__":
