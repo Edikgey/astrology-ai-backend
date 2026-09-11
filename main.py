@@ -4,15 +4,18 @@ from api import endpoints, auth
 
 app = FastAPI()
 
-# 🔓 Разрешаем все источники (временно)
+# CORS: разрешаем локальный frontend и production frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ← разрешает доступ с любого домена
+    allow_origins=[
+        "http://localhost:3000",
+        "https://astrology-ai-frontend-production.up.railway.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 📦 Подключаем роутеры
+# Подключаем роутеры
 app.include_router(auth.router)
 app.include_router(endpoints.router)
