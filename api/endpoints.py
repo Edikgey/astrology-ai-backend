@@ -12,10 +12,10 @@ from models.natal_chart import NatalChartListResponse
 from database.queries import User, ChartInterpretationData, NatalChart, ChartData, GPTMessage
 from modules.interpretation import ChartInterpreter
 from uuid import UUID
+from modules.chart_limits import MAX_SAVED_CHARTS
 
 
 router = APIRouter()
-MAX_SAVED_CHARTS = 3
 
 import numpy as np
 

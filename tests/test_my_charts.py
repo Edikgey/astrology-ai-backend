@@ -30,6 +30,7 @@ with patch("dotenv.load_dotenv"), patch.dict(os.environ, {
     from database.connection import Base, get_db
     from database.queries import User, NatalChart, ChartData, ChartInterpretationData, GPTMessage, EmailVerificationCode
     from modules.ephemeris import Ephemeris
+    from modules.migration import migrate_guest_data_to_user
 
 
 BODY = {"☉": {"symbol": "☉", "label": "Солнце", "degree": 10.0,
@@ -325,7 +326,7 @@ class MyChartsTests(unittest.TestCase):
         history_before = self.client.get(f"/gpt-messages?chart_id={chart_id}", headers=self.guest).json()
         self.verification_code()
         response = self.client.post("/auth/verify-code?code=123456", headers=self.guest,
-                                    json={"email": "new@example.com", "password": "test-password-only"})
+                                    json={"email": "new@example.com", "password": "test-password-only", "guest_chart_id": chart_id})
         self.assertEqual(response.status_code, 200, response.text)
         registered = {"Authorization": "Bearer " + response.json()["access_token"]}
         new_user_id = self.client.get("/auth/me", headers=registered).json()["id"]
@@ -375,13 +376,126 @@ class MyChartsTests(unittest.TestCase):
         chart_id = self.chart(user_id=None, session_token=self.guest_token)
         history_before = self.client.get(f"/gpt-messages?chart_id={chart_id}", headers=self.guest).json()
         response = self.client.post("/auth/login", headers=self.guest,
-                                    json={"email": "existing@example.com", "password": "test-password-only"})
+                                    json={"email": "existing@example.com", "password": "test-password-only", "guest_chart_id": chart_id})
         self.assertEqual(response.status_code, 200, response.text)
         headers = {"Authorization": "Bearer " + response.json()["access_token"]}
         self.assertEqual(self.client.get(f"/natal-chart/{chart_id}", headers=headers).status_code, 200)
         self.assertEqual(self.client.get(f"/gpt-messages?chart_id={chart_id}", headers=headers).json(), history_before)
         with self.sessions() as session:
             self.assertEqual(session.get(NatalChart, chart_id).user_id, 1)
+
+    def migration_auth(self, flow, chart_id=None, headers=None, saved_count=0, fail_token=False):
+        email = f"migration-{uuid4().hex}@example.com"
+        password = "test-password-only"
+        if flow == "login":
+            with self.sessions() as db:
+                user = User(email=email, password_hash=get_password_hash(password))
+                db.add(user)
+                db.flush()
+                for _ in range(saved_count):
+                    db.add(NatalChart(**PAYLOAD, user_id=user.id))
+                db.commit()
+        else:
+            self.verification_code(email)
+
+        def transfer(db, user_id, session_token, guest_chart_id):
+            # A newly verified account normally has zero charts. Seed this rare
+            # branch explicitly to test verify's handling of the real limit result.
+            if flow == "verify-code":
+                for _ in range(saved_count):
+                    db.add(NatalChart(**PAYLOAD, user_id=user_id))
+                db.flush()
+            return migrate_guest_data_to_user(db, user_id, session_token, guest_chart_id)
+
+        observations = []
+        def tracked_db():
+            with self.sessions() as db:
+                try:
+                    yield db
+                finally:
+                    observations.append(db.in_transaction())
+
+        body = {"email": email, "password": password}
+        if chart_id is not None:
+            body["guest_chart_id"] = chart_id
+        app.dependency_overrides[get_db] = tracked_db
+        with ExitStack() as stack:
+            stack.enter_context(patch("api.auth.migrate_guest_data_to_user", side_effect=transfer))
+            if fail_token:
+                stack.enter_context(patch("api.auth.create_access_token", side_effect=RuntimeError("token failure")))
+            suffix = "?code=123456" if flow == "verify-code" else ""
+            response = self.client.post(f"/auth/{flow}{suffix}", json=body, headers=headers or {})
+        self.assertEqual(observations, [False])
+        return response, email
+
+    def test_selected_guest_migration_contract_for_both_auth_flows(self):
+        for flow in ("login", "verify-code"):
+            for scenario in ("only_c", "no_id", "no_header", "wrong_token", "owned", "missing", "full", "last_slot"):
+                with self.subTest(flow=flow, scenario=scenario):
+                    token = uuid4()
+                    ids = [self.chart(user_id=None, session_token=token) for _ in range(3)]
+                    selected = ids[2]
+                    requested = selected
+                    headers = {"X-Session-Token": str(token)}
+                    expected = "migrated"
+                    saved_count = 0
+                    if scenario == "no_id":
+                        requested, expected = None, "not_requested"
+                    elif scenario == "no_header":
+                        headers, expected = {}, "not_requested"
+                    elif scenario == "wrong_token":
+                        headers, expected = {"X-Session-Token": str(uuid4())}, "not_found"
+                    elif scenario == "owned":
+                        with self.sessions() as db:
+                            db.get(NatalChart, selected).user_id = 2
+                            db.commit()
+                        expected = "not_found"
+                    elif scenario == "missing":
+                        requested, expected = 999999, "not_found"
+                    elif scenario == "full":
+                        saved_count, expected = 3, "limit_reached"
+                    elif scenario == "last_slot":
+                        saved_count = 2
+                    with self.sessions() as db:
+                        before = {model: [(row.id, row.chart_id) for row in db.query(model).filter_by(chart_id=selected)]
+                                  for model in (ChartData, ChartInterpretationData, GPTMessage)}
+                    response, email = self.migration_auth(flow, requested, headers, saved_count)
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(response.json()["guest_chart_migration"], {"status": expected, "chart_id": requested})
+                    jwt_headers = {"Authorization": "Bearer " + response.json()["access_token"]}
+                    self.assertEqual(self.client.get("/auth/me", headers=jwt_headers).status_code, 200)
+                    with self.sessions() as db:
+                        user = db.query(User).filter_by(email=email).one()
+                        chart = db.get(NatalChart, selected)
+                        self.assertEqual(chart.user_id, user.id if expected == "migrated" else (2 if scenario == "owned" else None))
+                        self.assertEqual(chart.session_token, None if expected == "migrated" else token)
+                        self.assertEqual(db.query(NatalChart).filter_by(user_id=user.id).count(), saved_count + (expected == "migrated"))
+                        for untouched in ids[:2]:
+                            self.assertIsNone(db.get(NatalChart, untouched).user_id)
+                            self.assertEqual(db.get(NatalChart, untouched).session_token, token)
+                        for model, rows in before.items():
+                            self.assertEqual([(row.id, row.chart_id) for row in db.query(model).filter_by(chart_id=selected)], rows)
+                    if expected == "migrated":
+                        opened = self.client.get(f"/natal-chart/{selected}", headers=jwt_headers)
+                        self.assertEqual(opened.status_code, 200, opened.text)
+                        self.assertEqual(opened.json()["chart_id"], selected)
+                        history = self.client.get(f"/gpt-messages?chart_id={selected}", headers=jwt_headers)
+                        self.assertEqual([row["content"] for row in history.json()], ["Existing question", "Existing answer"])
+
+    def test_auth_failure_rolls_back_guest_transfer_for_both_flows(self):
+        for flow in ("login", "verify-code"):
+            with self.subTest(flow=flow):
+                chart_id = self.chart(user_id=None, session_token=self.guest_token)
+                response, email = self.migration_auth(flow, chart_id, self.guest, fail_token=True)
+                self.assertEqual(response.status_code, 500)
+                with self.sessions() as db:
+                    chart = db.get(NatalChart, chart_id)
+                    self.assertIsNone(chart.user_id)
+                    self.assertEqual(chart.session_token, self.guest_token)
+                    self.assertEqual(db.query(GPTMessage).filter_by(chart_id=chart_id).count(), 2)
+                    if flow == "verify-code":
+                        self.assertIsNone(db.query(User).filter_by(email=email).first())
+                        self.assertFalse(db.get(EmailVerificationCode, email).used)
 
     def test_creation_failure_does_not_leave_partial_chart(self):
         def fail_insert(conn, cursor, statement, parameters, context, executemany):

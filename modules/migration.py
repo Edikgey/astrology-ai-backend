@@ -1,13 +1,31 @@
 from sqlalchemy.orm import Session
-from database.queries import NatalChart
+from typing import Optional
+from uuid import UUID
+from database.queries import NatalChart, User
+from modules.chart_limits import MAX_SAVED_CHARTS
 
-def migrate_guest_data_to_user(db: Session, user_id: int, session_token: str):
-    db.query(NatalChart).filter(
+def migrate_guest_data_to_user(
+    db: Session, user_id: int, session_token: Optional[UUID],
+    guest_chart_id: Optional[int] = None,
+):
+    """Transfer only the requested chart. The auth caller owns commit/rollback."""
+    if guest_chart_id is None or session_token is None:
+        return {"status": "not_requested", "chart_id": guest_chart_id}
+
+    # Match creation's lock order: user first, then the individual guest chart.
+    db.query(User).filter(User.id == user_id).with_for_update().one()
+    chart = db.query(NatalChart).filter(
+        NatalChart.id == guest_chart_id,
         NatalChart.session_token == session_token,
-        NatalChart.user_id == None
-    ).update({
-        NatalChart.user_id: user_id,
-        NatalChart.session_token: None
-    }, synchronize_session=False)
+        NatalChart.user_id.is_(None),
+    ).populate_existing().with_for_update().first()
+    if chart is None:
+        return {"status": "not_found", "chart_id": guest_chart_id}
 
-    db.commit()
+    if db.query(NatalChart).filter(NatalChart.user_id == user_id).count() >= MAX_SAVED_CHARTS:
+        return {"status": "limit_reached", "chart_id": guest_chart_id}
+
+    chart.user_id = user_id
+    chart.session_token = None
+    db.flush()
+    return {"status": "migrated", "chart_id": guest_chart_id}

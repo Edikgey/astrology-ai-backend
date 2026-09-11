@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
-from models.user import UserCreate, UserLogin, Token, UserResponse
+from models.user import UserCreate, UserVerify, UserLogin, Token, UserResponse
 from models.natal_chart import NatalChartCreate
 from database.queries import EmailVerificationCode, NatalChart
 from database.connection import get_db
@@ -81,7 +81,7 @@ async def request_register(
 
 @router.post("/verify-code", response_model=Token)
 def verify_code(
-    user_data: UserCreate,
+    user_data: UserVerify,
     code: str,
     db: Session = Depends(get_db),
     session_token: Optional[UUID] = Header(None, alias="X-Session-Token")
@@ -97,21 +97,22 @@ def verify_code(
     db.add(user)
 
     try:
-        db.commit()
-        db.refresh(user)
+        db.flush()
         record.used = True
+        migration = migrate_guest_data_to_user(
+            db=db, user_id=user.id, session_token=session_token,
+            guest_chart_id=user_data.guest_chart_id,
+        )
+        access_token = create_access_token(data={"sub": str(user.id)})
         db.commit()
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=400, detail="Email уже зарегистрирован")
+    except Exception:
+        db.rollback()
+        raise
 
-    # 🔄 Миграция гостевых данных, если передан session_token
-    if session_token:
-        migrate_guest_data_to_user(db=db, user_id=user.id, session_token=session_token)
-
-    # 🎫 Возвращаем JWT
-    access_token = create_access_token(data={"sub": str(user.id)})
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {"access_token": access_token, "token_type": "bearer", "guest_chart_migration": migration}
 
 # === Авторизация с миграцией гостевых данных ===
 @router.post("/login", response_model=Token)
@@ -124,30 +125,28 @@ def login(
     if not user or not verify_password(credentials.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Неверный email или пароль")
 
-    # 🌀 Миграция гостевых данных, если есть session_token
-            # 🌀 Миграция гостевых данных, если есть session_token
     session_token = request.headers.get("X-Session-Token")
+    session_token_uuid = None
     if session_token:
         try:
             session_token_uuid = UUID(session_token)
-            migrate_guest_data_to_user(
-                db=db,
-                user_id=user.id,
-                session_token=session_token_uuid
-            )
         except ValueError:
             raise HTTPException(
                 status_code=400,
                 detail="Некорректный X-Session-Token"
             )
 
-    # 🎫 Возвращаем JWT
-    access_token = create_access_token(data={"sub": str(user.id)})
-    return {"access_token": access_token, "token_type": "bearer"}
-
-    # 🎫 Возвращаем JWT
-    access_token = create_access_token(data={"sub": str(user.id)})
-    return {"access_token": access_token, "token_type": "bearer"}
+    try:
+        migration = migrate_guest_data_to_user(
+            db=db, user_id=user.id, session_token=session_token_uuid,
+            guest_chart_id=credentials.guest_chart_id,
+        )
+        access_token = create_access_token(data={"sub": str(user.id)})
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {"access_token": access_token, "token_type": "bearer", "guest_chart_migration": migration}
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
