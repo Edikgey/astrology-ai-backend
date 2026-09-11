@@ -1,19 +1,21 @@
 from datetime import datetime
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request, Response
 from sqlalchemy.orm import Session
 from database.connection import get_db
 from modules.ephemeris import Ephemeris
 from modules.aspects import Aspects
 from modules.patterns import AstrologicalPatterns
 from models.natal_chart import NatalChartResponse, NatalChartCreate, GPTInterpretationRequest, GPTInterpretationResponse, ChartIdRequest, GPTMessageResponse, PatternResponse
-from api.auth import get_current_user_or_guest
+from api.auth import get_current_user, get_current_user_or_guest
+from models.natal_chart import NatalChartListResponse
 from database.queries import User, ChartInterpretationData, NatalChart, ChartData, GPTMessage
 from modules.interpretation import ChartInterpreter
 from uuid import UUID
 
 
 router = APIRouter()
+MAX_SAVED_CHARTS = 3
 
 import numpy as np
 
@@ -34,12 +36,33 @@ def clean_json_data(data):
         return data
 
 @router.post("/natal-chart", response_model=NatalChartResponse, tags=["Natal Chart"])
-async def create_natal_chart(
+def create_natal_chart(
     chart_data: NatalChartCreate,
     request: Request,
     identity: dict = Depends(get_current_user_or_guest),
     db: Session = Depends(get_db)
 ):
+    # FastAPI runs sync endpoints in its thread pool, including database lock waits.
+    # End failed transactions here, before dependency cleanup releases the session.
+    try:
+        return _create_natal_chart(chart_data, identity, db)
+    except Exception:
+        db.rollback()
+        raise
+
+
+def _create_natal_chart(chart_data: NatalChartCreate, identity: dict, db: Session):
+    if identity["user"] is not None:
+        # Serialize authenticated creates until both the chart and its data commit.
+        user_id = identity["user"].id
+        db.query(User).filter(User.id == user_id).with_for_update().one()
+        if db.query(NatalChart).filter(NatalChart.user_id == user_id).count() >= MAX_SAVED_CHARTS:
+            raise HTTPException(status_code=409, detail={
+                "code": "CHART_LIMIT_REACHED",
+                "message": "Можно сохранить максимум 3 карты. Удалите одну из карт, чтобы создать новую.",
+                "limit": MAX_SAVED_CHARTS,
+            })
+
     # 1. Эфемериды
     ephem = Ephemeris(
         chart_data.year, chart_data.month, chart_data.day,
@@ -101,8 +124,7 @@ async def create_natal_chart(
         session_token=session_token
     )
     db.add(natal_chart)
-    db.commit()
-    db.refresh(natal_chart)
+    db.flush()
 
     # 7. Сохраняем связанные данные
     chart_data_entry = ChartData(
@@ -115,11 +137,12 @@ async def create_natal_chart(
     )
 
     db.add(chart_data_entry)
+    chart_id = natal_chart.id
     db.commit()
 
     # 8. Возвращаем результат
     return {
-        "chart_id": natal_chart.id,
+        "chart_id": chart_id,
         "bodies_for_circle": body_data,
         "aspects_for_circle": aspects_for_chart,
         "points_data": points_data,
@@ -144,13 +167,13 @@ def get_natal_chart_by_id(
     if not chart:
         raise HTTPException(status_code=404, detail="❌ Карта не найдена")
 
-    # 🛡 Проверка доступа
-    if chart.user_id:
-        if not user or user.id != chart.user_id:
-            raise HTTPException(status_code=403, detail="⛔ Эта карта принадлежит другому пользователю")
-    elif chart.session_token:
-        if not session_token or chart.session_token != chart.session_token:
-            raise HTTPException(status_code=403, detail="⛔ Недействительный session_token для гостевой карты")
+    # A user-owned chart can never be accessed through its guest token.
+    if chart.user_id is not None:
+        allowed = user is not None and user.id == chart.user_id
+    else:
+        allowed = session_token is not None and chart.session_token == session_token
+    if not allowed:
+        raise HTTPException(status_code=404, detail="❌ Карта не найдена")
 
     # Получаем все связанные данные
     chart_data = db.query(ChartData).filter_by(chart_id=chart.id).first()
@@ -164,8 +187,53 @@ def get_natal_chart_by_id(
         "points_data": chart_data.points_data,
         "patterns_data": chart_data.patterns_data,
         "aspects_structured": chart_data.aspects_structured,
-        "houses": chart.houses if hasattr(chart, "houses") else [],  # опционально
+        "houses": Ephemeris(
+            chart.year, chart.month, chart.day, chart.hour, chart.lon, chart.lat
+        ).get_house_cusps(),
     }
+
+
+@router.get("/natal-charts", response_model=NatalChartListResponse, tags=["Natal Chart"])
+def list_natal_charts(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    charts = db.query(NatalChart).filter(
+        NatalChart.user_id == current_user.id
+    ).order_by(NatalChart.id.desc()).all()
+    return {
+        "charts": [{
+            "chart_id": chart.id,
+            "year": chart.year, "month": chart.month, "day": chart.day,
+            "hour": chart.hour, "city": chart.city,
+        } for chart in charts],
+        "count": len(charts),
+        "limit": MAX_SAVED_CHARTS,
+    }
+
+
+@router.delete("/natal-chart/{chart_id}", status_code=204, tags=["Natal Chart"])
+def delete_natal_chart(
+    chart_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    chart = db.query(NatalChart).filter(
+        NatalChart.id == chart_id, NatalChart.user_id == current_user.id
+    ).with_for_update().first()
+    if chart is None:
+        raise HTTPException(status_code=404, detail="❌ Карта не найдена")
+    try:
+        for model in (GPTMessage, ChartInterpretationData, ChartData):
+            db.query(model).filter(model.chart_id == chart_id).delete(synchronize_session=False)
+        db.query(NatalChart).filter(
+            NatalChart.id == chart_id, NatalChart.user_id == current_user.id
+        ).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return Response(status_code=204)
 
 
 from datetime import datetime

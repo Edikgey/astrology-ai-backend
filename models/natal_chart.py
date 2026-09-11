@@ -59,6 +59,21 @@ class GPTInterpretationRequest(BaseModel):
     chart_id: int
     question: str = Field(...)
 
+
+class NatalChartSummary(BaseModel):
+    chart_id: int
+    year: Optional[int]
+    month: Optional[int]
+    day: Optional[int]
+    hour: Optional[float]
+    city: Optional[str]
+
+
+class NatalChartListResponse(BaseModel):
+    charts: List[NatalChartSummary]
+    count: int
+    limit: int
+
 class GPTInterpretationResponse(BaseModel):
     chart_id: int
     response: str

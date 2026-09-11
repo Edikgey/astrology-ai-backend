@@ -84,7 +84,7 @@ def verify_code(
     user_data: UserCreate,
     code: str,
     db: Session = Depends(get_db),
-    session_token: Optional[str] = Header(None)
+    session_token: Optional[UUID] = Header(None, alias="X-Session-Token")
 ):
     record = db.query(EmailVerificationCode).filter(
         EmailVerificationCode.email == user_data.email
