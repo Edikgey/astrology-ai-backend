@@ -99,6 +99,37 @@ class BirthPipelineTests(unittest.TestCase):
     chart=f.MyChartsTests.chart
     mock_calculations=f.MyChartsTests.mock_calculations
 
+    def test_selected_location_snapshot_rejects_stale_fields_before_calculation(self):
+        snapshot={key:f.PAYLOAD[key] for key in ('city','region','country','lat','lon','timezone')}
+        for field, value in [('city','Changed city'),('region','Changed region'),('country','Changed country'),
+                             ('lat',0),('lon',0),('timezone','Europe/Warsaw')]:
+            with self.subTest(field=field), patch('api.endpoints.Ephemeris') as calculator:
+                response=self.client.post('/natal-chart',json={**f.PAYLOAD,'selected_location':snapshot,field:value},headers=self.owner)
+                self.assertEqual(response.status_code,422,response.text)
+                calculator.assert_not_called()
+        with self.sessions() as db:self.assertEqual(db.query(NatalChart).count(),0)
+
+    def test_consistent_provider_selection_is_saved_without_geographic_guessing(self):
+        payload={**f.PAYLOAD,'city':'Toronto, Ontario, Canada','region':'Ontario','country':'Canada',
+                 'lat':43.65,'lon':-79.38,'timezone':'America/Toronto','hour':12,'minute':37}
+        payload['selected_location']={key:payload[key] for key in ('city','region','country','lat','lon','timezone')}
+        with self.mock_calculations():
+            response=self.client.post('/natal-chart',json=payload,headers=self.owner)
+        self.assertEqual(response.status_code,200,response.text)
+        with self.sessions() as db:
+            chart=db.get(NatalChart,response.json()['chart_id'])
+            for field,value in payload['selected_location'].items():self.assertEqual(getattr(chart,field),value)
+            self.assertEqual(chart.birth_utc,datetime(2000,1,2,17,37))
+
+    def test_selected_location_with_invalid_zone_is_rejected_without_fallback(self):
+        for zone in ('', 'Invalid/Zone'):
+            payload={**f.PAYLOAD,'timezone':zone}
+            payload['selected_location']={key:payload[key] for key in ('city','region','country','lat','lon','timezone')}
+            with self.subTest(zone=zone), patch('api.endpoints.Ephemeris') as calculator:
+                response=self.client.post('/natal-chart',json=payload,headers=self.owner)
+                self.assertEqual(response.status_code,422,response.text)
+                calculator.assert_not_called()
+
     def test_full_local_time_zone_utc_and_house_snapshot_survive_db_and_refresh(self):
         payload={**f.PAYLOAD,'year':2000,'month':1,'day':1,'hour':0,'minute':15,'timezone':'Asia/Kathmandu'}
         with self.mock_calculations(), patch('api.endpoints.Ephemeris',wraps=None) as ephem:

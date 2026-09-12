@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import List, Dict, Literal, Optional, Union
 from uuid import UUID
 
@@ -47,6 +47,15 @@ class NatalChartResponse(BaseModel):
     birth_utc: Optional[datetime] = None
     house_system: Optional[str] = None
     time_provenance: str = 'legacy_unverified'
+class SelectedLocation(BaseModel):
+    city: str = Field(..., min_length=1)
+    region: str
+    country: str
+    lat: float = Field(..., ge=-90, le=90, allow_inf_nan=False)
+    lon: float = Field(..., ge=-180, le=180, allow_inf_nan=False)
+    timezone: str = Field(..., min_length=1, max_length=100)
+
+
 class NatalChartCreate(BaseModel):
     year: int
     month: int
@@ -60,6 +69,17 @@ class NatalChartCreate(BaseModel):
     city: str
     region: str
     country: str
+    # Browser selection snapshot catches stale/mixed fields; this is consistency
+    # validation, not independent geocoding or provider authenticity verification.
+    selected_location: Optional[SelectedLocation] = None
+
+    @model_validator(mode='after')
+    def location_fields_agree(self):
+        if self.selected_location is not None:
+            for field in ('city', 'region', 'country', 'lat', 'lon', 'timezone'):
+                if getattr(self, field) != getattr(self.selected_location, field):
+                    raise ValueError('Место рождения изменилось. Выберите его из подсказок заново.')
+        return self
  
 
 class GPTInterpretationRequest(BaseModel):
