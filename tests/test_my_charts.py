@@ -24,7 +24,7 @@ with patch("dotenv.load_dotenv"), patch.dict(os.environ, {
     "SECRET_KEY": "my-charts-isolated-tests-only",
     "OPENAI_API_KEY": "test-not-a-real-key",
 }):
-    from main import app
+    from main import api_app as app, app as cors_app
     from api.auth import create_access_token, get_current_user_or_guest, get_password_hash
     from api.endpoints import _create_natal_chart
     from database.connection import Base, get_db
@@ -52,7 +52,7 @@ class MyChartsTests(unittest.TestCase):
                 yield session
 
         app.dependency_overrides[get_db] = test_db
-        self.client = TestClient(app, raise_server_exceptions=False)
+        self.client = TestClient(cors_app, raise_server_exceptions=False)
         with self.sessions() as session:
             session.add_all([User(id=1, email="a@example.test", password_hash="unused"),
                              User(id=2, email="b@example.test", password_hash="unused")])

@@ -419,22 +419,13 @@ class Ephemeris:
 
 
     def calculate_vertex(self):
-        """ Точный расчет Вертекса (Vertex) через сдвиг LST на 12 часов и широту 90° - lat """
+        """Swiss Ephemeris returns Vertex at ascmc[3] for the actual birthplace.
 
-        # ✅ 1. Вычисляем сдвинутое звёздное время (LST + 12 часов)
-        gst = swe.sidtime(self.jd) * 15  # Переводим GST из часов в градусы
-        longitude = self.lon  # Долгота места рождения
-        lst_shifted = (gst + longitude + 180) % 360  # Смещение на 12 часов
-
-        # ✅ 2. Корректируем широту (90° - широта, по формуле из статьи)
-        latitude_corrected = 90 - self.lat  
-
-        # ✅ 3. Получаем Асцендент (ASC) для этих параметров — он и есть Вертекс!
-        houses_shifted = swe.houses(self.jd, latitude_corrected, self.lon, HOUSE_SYSTEM_CODE)[0]
-        vertex_longitude = houses_shifted[0]  # ASC для новых параметров = Вертекс
-
-
-        return vertex_longitude
+        Do not replace latitude with 90-lat: that creates polar/out-of-range
+        coordinates near the equator and throughout the southern hemisphere.
+        """
+        _, ascmc = swe.houses(self.jd, self.lat, self.lon, HOUSE_SYSTEM_CODE)
+        return ascmc[3]
 
 
 

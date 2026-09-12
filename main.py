@@ -2,11 +2,16 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from api import endpoints, auth, payments
 
-app = FastAPI()
+api_app = FastAPI()
 
-# CORS: разрешаем локальный frontend и production frontend
-app.add_middleware(
-    CORSMiddleware,
+api_app.include_router(auth.router)
+api_app.include_router(endpoints.router)
+api_app.include_router(payments.router)
+
+# Wrap ServerErrorMiddleware too, so unhandled 500s retain CORS headers.
+# Keep the existing explicit local/production origin allowlist.
+app = CORSMiddleware(
+    app=api_app,
     allow_origins=[
         "http://localhost:3000",
         "https://astrology-ai-frontend-production.up.railway.app",
@@ -15,8 +20,3 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Подключаем роутеры
-app.include_router(auth.router)
-app.include_router(endpoints.router)
-app.include_router(payments.router)
