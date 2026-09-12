@@ -269,13 +269,14 @@ class MyChartsTests(unittest.TestCase):
 
             def query(self, model): return self
             def filter(self, *args): return self
+            def populate_existing(self): return self
             def with_for_update(self): return self
 
             def one(self):
                 if not lock.acquire(timeout=1):
                     raise RuntimeError("row lock timeout")
                 self.held = True
-                return SimpleNamespace(id=1)
+                return SimpleNamespace(id=1, plan="free")
 
             def count(self): return 3
 

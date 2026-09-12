@@ -1,4 +1,4 @@
-from sqlalchemy import JSON, Column, Integer, String, Float, Boolean, ForeignKey, DateTime
+from sqlalchemy import JSON, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, CheckConstraint, Index
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from database.connection import Base
@@ -12,8 +12,32 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    plan = Column(String, nullable=False, default="free", server_default="free")
+    current_period_start = Column(DateTime, nullable=True)  # UTC, as elsewhere in this schema
+    current_period_end = Column(DateTime, nullable=True)
+    __table_args__ = (CheckConstraint("plan IN ('free', 'premium')", name="ck_users_plan"),)
 
     natal_charts = relationship("NatalChart", back_populates="user")
+
+
+class GPTUsage(Base):
+    """Durable quota ledger. Deleting messages clears the link, not the usage."""
+    __tablename__ = "gpt_usage"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    chart_id = Column(Integer, nullable=False)  # audit reference, not a cascading FK
+    source_message_id = Column(Integer, ForeignKey("gpt_messages.id", ondelete="SET NULL"), unique=True, nullable=True)
+    status = Column(String, nullable=False)  # reserved / succeeded / released
+    plan = Column(String, nullable=False)
+    period_start = Column(DateTime, nullable=True)
+    period_end = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=True)
+    __table_args__ = (
+        CheckConstraint("status IN ('reserved', 'succeeded', 'released')", name="ck_gpt_usage_status"),
+        CheckConstraint("plan IN ('free', 'premium')", name="ck_gpt_usage_plan"),
+        Index("ix_gpt_usage_account", "user_id", "status", "period_start"),
+    )
 
 
 class NatalChart(Base):

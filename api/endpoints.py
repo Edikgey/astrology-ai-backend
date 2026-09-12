@@ -12,7 +12,9 @@ from models.natal_chart import NatalChartListResponse
 from database.queries import User, ChartInterpretationData, NatalChart, ChartData, GPTMessage
 from modules.interpretation import ChartInterpreter
 from uuid import UUID
-from modules.chart_limits import MAX_SAVED_CHARTS
+from modules.chart_limits import saved_chart_limit
+from modules import usage
+import asyncio
 
 
 router = APIRouter()
@@ -55,12 +57,16 @@ def _create_natal_chart(chart_data: NatalChartCreate, identity: dict, db: Sessio
     if identity["user"] is not None:
         # Serialize authenticated creates until both the chart and its data commit.
         user_id = identity["user"].id
-        db.query(User).filter(User.id == user_id).with_for_update().one()
-        if db.query(NatalChart).filter(NatalChart.user_id == user_id).count() >= MAX_SAVED_CHARTS:
+        user = usage.locked_user(db, user_id)
+        limit = saved_chart_limit(user)
+        used = db.query(NatalChart).filter(NatalChart.user_id == user_id).count()
+        if used >= limit:
             raise HTTPException(status_code=409, detail={
                 "code": "CHART_LIMIT_REACHED",
-                "message": "Можно сохранить максимум 3 карты. Удалите одну из карт, чтобы создать новую.",
-                "limit": MAX_SAVED_CHARTS,
+                "message": f"Можно сохранить максимум {limit} карт. Удалите одну из карт, чтобы создать новую.",
+                "plan": user.plan,
+                "used": used,
+                "limit": limit,
             })
 
     # 1. Эфемериды
@@ -208,7 +214,7 @@ def list_natal_charts(
             "hour": chart.hour, "city": chart.city,
         } for chart in charts],
         "count": len(charts),
-        "limit": MAX_SAVED_CHARTS,
+        "limit": saved_chart_limit(current_user),
     }
 
 
@@ -218,12 +224,15 @@ def delete_natal_chart(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    # Preserve legacy usage before deleting message history; use the same lock order.
+    usage.locked_user(db, current_user.id)
     chart = db.query(NatalChart).filter(
         NatalChart.id == chart_id, NatalChart.user_id == current_user.id
     ).with_for_update().first()
     if chart is None:
         raise HTTPException(status_code=404, detail="❌ Карта не найдена")
     try:
+        usage.backfill_user_history(db, current_user.id)
         for model in (GPTMessage, ChartInterpretationData, ChartData):
             db.query(model).filter(model.chart_id == chart_id).delete(synchronize_session=False)
         db.query(NatalChart).filter(
@@ -239,7 +248,7 @@ def delete_natal_chart(
 from datetime import datetime
 
 @router.post("/ask-gpt", response_model=GPTInterpretationResponse, tags=["Natal Chart"])
-async def ask_gpt_interpretation(
+def ask_gpt_interpretation(
     data: GPTInterpretationRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -255,31 +264,28 @@ async def ask_gpt_interpretation(
     if chart.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="⛔ Недоступно: карта не принадлежит пользователю")
 
-    # ✅ Генерация интерпретации
-    interpreter = ChartInterpreter(
-        chart.year, chart.month, chart.day,
-        chart.hour, chart.lon, chart.lat
-    )
-    interpretation = await interpreter.ask_gpt(chart.id, db, data.question)
+    # Copy scalar values before reserve commits/expires the ORM instances.
+    user_id, chart_id = current_user.id, chart.id
+    chart_args = (chart.year, chart.month, chart.day, chart.hour, chart.lon, chart.lat)
+    reservation_id = usage.reserve(db, user_id, chart_id)
+    try:
+        interpreter = ChartInterpreter(*chart_args)
+        # Sync SQLAlchemy and lock waits stay in FastAPI's worker thread.
+        interpretation = asyncio.run(interpreter.ask_gpt(chart_id, db, data.question))
+        if not isinstance(interpretation, str) or not interpretation.strip():
+            raise HTTPException(502, detail="GPT не вернул ответ. Квота не списана.")
+        result = GPTInterpretationResponse(chart_id=chart_id, response=interpretation)
+        usage.finalize(db, user_id, reservation_id, data.question, interpretation)
+        return result
+    except BaseException:
+        usage.release(db, user_id, reservation_id)
+        raise
 
-    # 💬 Сохраняем вопрос и ответ в базе
-    db.add_all([
-        GPTMessage(
-            chart_id=chart.id,
-            role="user",
-            content=data.question,
-            created_at=datetime.utcnow()
-        ),
-        GPTMessage(
-            chart_id=chart.id,
-            role="gpt",
-            content=interpretation,
-            created_at=datetime.utcnow()
-        )
-    ])
-    db.commit()
 
-    return GPTInterpretationResponse(chart_id=chart.id, response=interpretation)
+@router.get("/account/usage", tags=["Account"])
+def get_account_usage(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return usage.account_usage(db, current_user.id)
+
 @router.get("/gpt-messages", response_model=List[GPTMessageResponse])
 def get_gpt_messages(
     chart_id: int = Query(...),

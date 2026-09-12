@@ -6,7 +6,8 @@ from sqlalchemy.orm import Session
 from database.connection import get_db  # если вдруг используется Depends где-то
 from database.queries import ChartInterpretationData
 from openai import OpenAI
-client = OpenAI()
+from modules.usage import OPENAI_TIMEOUT_SECONDS
+client = OpenAI(timeout=OPENAI_TIMEOUT_SECONDS, max_retries=0)
 OPENAI_PARAMS = {
     "model": "gpt-4o-mini",  # или используйте другую модель по вашему усмотрению
     "temperature": 0.7,
@@ -127,10 +128,11 @@ class ChartInterpreter:
             chart_data = self.get_prompt_astrology_data()
             interpretation = ChartInterpretationData(chart_id=chart_id, raw_text=chart_data)
             db.add(interpretation)
-            db.commit()
-            db.refresh(interpretation)
         else:
             chart_data = interpretation.raw_text
+
+        # End BOTH cache-hit and cache-miss transactions before the network call.
+        db.commit()
 
         prompt = (
             "Ты астролог. Ниже будет приведена натальная карта.\n"
