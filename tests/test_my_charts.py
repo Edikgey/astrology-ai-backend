@@ -36,7 +36,7 @@ with patch("dotenv.load_dotenv"), patch.dict(os.environ, {
 BODY = {"☉": {"symbol": "☉", "label": "Солнце", "degree": 10.0,
                 "roundedDegree": "10°", "sign": "Овен", "house": 1, "retrograde": False}}
 PAYLOAD = {"year": 2000, "month": 1, "day": 2, "hour": 12.0,
-           "lon": 30.0, "lat": 50.0, "city": "Test city", "region": "", "country": ""}
+           "timezone": "UTC", "lon": 30.0, "lat": 50.0, "city": "Test city", "region": "", "country": ""}
 
 
 class MyChartsTests(unittest.TestCase):

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 from sqlalchemy import event
 import test_my_charts as fixtures
 from test_my_charts import PAYLOAD, app, get_db, get_password_hash
-from database.queries import User, NatalChart, GPTMessage, GPTUsage, ChartInterpretationData
+from database.queries import User, NatalChart, GPTMessage, GPTUsage, ChartInterpretationData, ChartData
 from modules import usage
 from modules.chart_limits import saved_chart_limit
 from modules.plans import PLAN_LIMITS
@@ -260,14 +260,14 @@ class UsageTests(unittest.TestCase):
         for cached in (False, True):
             with self.subTest(cached=cached):
                 chart_id = self.chart(related=False)
+                with self.sessions() as db:
+                    db.add(ChartData(chart_id=chart_id, bodies_for_circle=fixtures.BODY, aspects_for_circle=[]))
+                    db.commit()
                 if cached:
                     with self.sessions() as db:
                         db.add(ChartInterpretationData(chart_id=chart_id, raw_text="Cached"))
                         db.commit()
-                with patch("modules.interpretation.ChartInterpreter.__init__", return_value=None), \
-                        patch("modules.interpretation.ChartInterpreter._merge_astrology_data", return_value={}), \
-                        patch("modules.interpretation.ChartInterpreter.get_prompt_astrology_data", return_value="Chart"), \
-                        patch("modules.interpretation.client.chat.completions.create", side_effect=mock_openai) as openai:
+                with patch("modules.interpretation.client.chat.completions.create", side_effect=mock_openai) as openai:
                     response = self.ask(chart_id)
                     self.assertEqual(response.status_code, 200, response.text)
                     openai.assert_called_once()

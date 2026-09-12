@@ -7,17 +7,21 @@ from database.connection import get_db  # если вдруг используе
 from database.queries import ChartInterpretationData
 from openai import OpenAI
 from modules.usage import OPENAI_TIMEOUT_SECONDS
+from modules.ai_conversation import generate_answer
+import os
 client = OpenAI(timeout=OPENAI_TIMEOUT_SECONDS, max_retries=0)
 OPENAI_PARAMS = {
-    "model": "gpt-4o-mini",  # или используйте другую модель по вашему усмотрению
+    "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
     "temperature": 0.7,
     "presence_penalty": 0.3,
     "frequency_penalty": 0.1
 }
 class ChartInterpreter:
-    def __init__(self, year: int, month: int, day: int, hour: float, lon: float, lat: float):
+    def __init__(self, year: int, month: int, day: int, hour: float, lon: float, lat: float, calculate=True):
         self.date = (year, month, day, hour)
         self.coords = (lon, lat)
+        if not calculate:
+            return
 
         # 1. Получаем тела (имя -> знак, дом, ретро)
         ephem = Ephemeris(year, month, day, hour, lon, lat)
@@ -114,47 +118,10 @@ class ChartInterpreter:
 
         return "\n".join(lines)
 
-    async def ask_gpt(self, chart_id: int, db: Session, question: str) -> str:
-        """
-        Отправляет натальную карту и вопрос в ChatGPT, возвращает интерпретацию.
-        Кэширует результат get_prompt_astrology_data() в таблицу chart_interpretation_data.
-        """
-        interpretation = db.query(ChartInterpretationData).filter_by(chart_id=chart_id).first()
+    async def ask_gpt(self, chart_id: int, db: Session, question: str, user_id: int):
+        # The sync FastAPI worker owns the DB session; no asyncio thread receives it.
+        return generate_answer(db, user_id, chart_id, question, client, OPENAI_PARAMS)
 
-        if not interpretation:
-            # 🔁 Обязательно перед get_prompt_astrology_data
-            self.enriched_bodies = self._merge_astrology_data()
-
-            chart_data = self.get_prompt_astrology_data()
-            interpretation = ChartInterpretationData(chart_id=chart_id, raw_text=chart_data)
-            db.add(interpretation)
-        else:
-            chart_data = interpretation.raw_text
-
-        # End BOTH cache-hit and cache-miss transactions before the network call.
-        db.commit()
-
-        prompt = (
-            "Ты астролог. Ниже будет приведена натальная карта.\n"
-            "Каждая строка имеет формат:\n"
-            "[Точка]|[Знак]|[Дом]|[Ретроградность]|[Аспекты]|[Паттерны]\n"
-            "Тебе нужно анализировать карту и отвечать на вопрос пользователя.\n"
-            "Избегай сухих технических терминов. Говори образно и по-человечески, нежно и мягко.\n"
-            "Вот натальная карта:\n"
-            f"{chart_data}\n"
-            f"\nВопрос: {question}"
-        )
-
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
-            model=OPENAI_PARAMS["model"],
-            messages=[{"role": "system", "content": prompt}],
-            temperature=OPENAI_PARAMS["temperature"],
-            presence_penalty=OPENAI_PARAMS["presence_penalty"],
-            frequency_penalty=OPENAI_PARAMS["frequency_penalty"]
-        )
-
-        return response.choices[0].message.content.strip()
     def get_all_enriched(self):
         return self.enriched_bodies
 

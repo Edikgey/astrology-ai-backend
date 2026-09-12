@@ -106,6 +106,10 @@ def reserve(db, user_id, chart_id):
             raise HTTPException(409, detail={"code": "GPT_LIMIT_REACHED", "plan": user.plan,
                 "used": state["gpt_messages_used"], "reserved": state["gpt_messages_reserved"],
                 "limit": state["gpt_messages_limit"], "message": "Достигнут лимит GPT-сообщений аккаунта."})
+        if db.query(GPTUsage).filter_by(user_id=user_id, chart_id=chart_id, status="reserved").filter(
+                GPTUsage.expires_at > now).first():
+            raise HTTPException(409, detail={"code": "GPT_REQUEST_IN_PROGRESS",
+                                            "message": "Дождитесь ответа на предыдущий вопрос этой карты."})
         reservation_id = uuid4()
         db.add(GPTUsage(id=reservation_id, user_id=user_id, chart_id=chart_id, status="reserved",
                         plan=user.plan, period_start=user.current_period_start if user.plan == "premium" else None,
@@ -133,6 +137,12 @@ def finalize(db, user_id, reservation_id, question, answer):
         db.flush()
         item.status = "succeeded"
         item.source_message_id = user_message.id
+        from modules.ai_conversation import AIAnswer, save_memory
+        if isinstance(answer, AIAnswer):
+            for field, value in answer.metadata.items():
+                setattr(item, field, value)
+            item.summary_usage = answer.summary_usage or None
+            save_memory(db, user_id, chart.id, answer.memory_update)
         db.commit()
     except BaseException:
         db.rollback()

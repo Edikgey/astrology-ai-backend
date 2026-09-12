@@ -59,6 +59,11 @@ class GPTUsage(Base):
     period_end = Column(DateTime, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     expires_at = Column(DateTime, nullable=True)
+    input_tokens = Column(Integer, nullable=True)
+    output_tokens = Column(Integer, nullable=True)
+    total_tokens = Column(Integer, nullable=True)
+    model = Column(String, nullable=True)
+    summary_usage = Column(JSON, nullable=True)  # separate provider calls, never product quota
     __table_args__ = (
         CheckConstraint("status IN ('reserved', 'succeeded', 'released')", name="ck_gpt_usage_status"),
         CheckConstraint("plan IN ('free', 'premium')", name="ck_gpt_usage_plan"),
@@ -87,6 +92,8 @@ class NatalChart(Base):
     city = Column(String)
     region = Column(String)
     country = Column(String)
+    timezone = Column(String, nullable=True)  # IANA zone of local birth date/hour
+    birth_utc = Column(DateTime, nullable=True)  # frozen calculation instant, naive UTC
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -97,6 +104,7 @@ class NatalChart(Base):
     messages = relationship("GPTMessage", back_populates="chart", cascade="all, delete-orphan")
 class GPTMessage(Base):
     __tablename__ = "gpt_messages"
+    __table_args__ = (Index("ix_gpt_messages_chart_id_id", "chart_id", "id"),)
 
     id = Column(Integer, primary_key=True, index=True)
     chart_id = Column(Integer, ForeignKey("natal_charts.id", ondelete="CASCADE"), nullable=False)
@@ -107,6 +115,17 @@ class GPTMessage(Base):
 
     # Связь с картой
     chart = relationship("NatalChart", back_populates="messages")
+
+
+class GPTConversation(Base):
+    """One compact memory per owner/chart; raw messages remain the UI history."""
+    __tablename__ = "gpt_conversations"
+    chart_id = Column(Integer, ForeignKey("natal_charts.id", ondelete="CASCADE"), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    summary = Column(String, nullable=False)
+    through_message_id = Column(Integer, nullable=False)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
 class ChartData(Base):
     __tablename__ = "chart_data"
 
@@ -118,6 +137,8 @@ class ChartData(Base):
     points_data = Column(JSON, nullable=True)            # Список строк: [ "☉ Солнце 15° Телец (10 Дом)", ... ]
     patterns_data = Column(JSON, nullable=True)          # Паттерны
     aspects_structured = Column(JSON, nullable=True)     # 🔹 Новый столбец для аспектов (маж/мин)
+    houses = Column(JSON, nullable=True)
+    house_system = Column(String, nullable=True)
 
     chart = relationship("NatalChart", back_populates="chart_data")
 

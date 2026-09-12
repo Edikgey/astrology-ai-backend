@@ -3,13 +3,14 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request, Response
 from sqlalchemy.orm import Session
 from database.connection import get_db
-from modules.ephemeris import Ephemeris
+from modules.ephemeris import Ephemeris, HOUSE_SYSTEM_NAME
+from modules.birth_time import calculator_args, resolve_birth_time
 from modules.aspects import Aspects
 from modules.patterns import AstrologicalPatterns
 from models.natal_chart import NatalChartResponse, NatalChartCreate, GPTInterpretationRequest, GPTInterpretationResponse, ChartIdRequest, GPTMessageResponse, PatternResponse
 from api.auth import get_current_user, get_current_user_or_guest
 from models.natal_chart import NatalChartListResponse
-from database.queries import User, ChartInterpretationData, NatalChart, ChartData, GPTMessage
+from database.queries import User, ChartInterpretationData, NatalChart, ChartData, GPTMessage, GPTConversation
 from modules.interpretation import ChartInterpreter
 from uuid import UUID
 from modules.chart_limits import saved_chart_limit
@@ -69,11 +70,13 @@ def _create_natal_chart(chart_data: NatalChartCreate, identity: dict, db: Sessio
                 "limit": limit,
             })
 
+    local_hour, birth_utc = resolve_birth_time(chart_data)
+    calculation = (birth_utc.year, birth_utc.month, birth_utc.day,
+                   birth_utc.hour + birth_utc.minute / 60 + birth_utc.second / 3600,
+                   chart_data.lon, chart_data.lat)
+
     # 1. Эфемериды
-    ephem = Ephemeris(
-        chart_data.year, chart_data.month, chart_data.day,
-        chart_data.hour, chart_data.lon, chart_data.lat
-    )
+    ephem = Ephemeris(*calculation)
     body_data = ephem.get_all_bodies_with_degrees()
 
     # ⬇️ Генерируем points_data как список строк
@@ -92,10 +95,7 @@ def _create_natal_chart(chart_data: NatalChartCreate, identity: dict, db: Sessio
         raise HTTPException(status_code=400, detail="❌ Ошибка: не получены данные по телам")
 
     # 2. Аспекты
-    aspects_module = Aspects(
-        chart_data.year, chart_data.month, chart_data.day,
-        chart_data.hour, chart_data.lon, chart_data.lat
-    )
+    aspects_module = Aspects(*calculation)
     raw_aspect_list = aspects_module.get_all_aspects_flat().split("\n")
     raw_aspect_list = [line.strip() for line in raw_aspect_list if line.strip()]
     aspects_for_chart = aspects_module.convert_aspects_for_chart(raw_aspect_list)
@@ -120,7 +120,9 @@ def _create_natal_chart(chart_data: NatalChartCreate, identity: dict, db: Sessio
         year=chart_data.year,
         month=chart_data.month,
         day=chart_data.day,
-        hour=chart_data.hour,
+        hour=local_hour,
+        timezone=chart_data.timezone,
+        birth_utc=birth_utc,
         lon=chart_data.lon,
         lat=chart_data.lat,
         city=chart_data.city,
@@ -139,7 +141,9 @@ def _create_natal_chart(chart_data: NatalChartCreate, identity: dict, db: Sessio
         aspects_for_circle=clean_json_data(aspects_for_chart),
         points_data=clean_json_data(points_data),
         patterns_data=clean_json_data(patterns),
-        aspects_structured=clean_json_data(aspects_structured)
+        aspects_structured=clean_json_data(aspects_structured),
+        houses=clean_json_data(houses),
+        house_system=HOUSE_SYSTEM_NAME
     )
 
     db.add(chart_data_entry)
@@ -154,7 +158,8 @@ def _create_natal_chart(chart_data: NatalChartCreate, identity: dict, db: Sessio
         "points_data": points_data,
         "patterns_data": patterns,
         "aspects_structured": aspects_structured,
-        "houses": houses
+        "houses": houses, "timezone": chart_data.timezone, "birth_utc": birth_utc,
+        "house_system": HOUSE_SYSTEM_NAME, "time_provenance": "local_iana"
     }
 @router.get("/natal-chart/{chart_id}", response_model=NatalChartResponse, tags=["Natal Chart"])
 def get_natal_chart_by_id(
@@ -193,9 +198,10 @@ def get_natal_chart_by_id(
         "points_data": chart_data.points_data,
         "patterns_data": chart_data.patterns_data,
         "aspects_structured": chart_data.aspects_structured,
-        "houses": Ephemeris(
-            chart.year, chart.month, chart.day, chart.hour, chart.lon, chart.lat
-        ).get_house_cusps(),
+        "houses": chart_data.houses if chart_data.houses is not None else Ephemeris(*calculator_args(chart)).get_house_cusps(),
+        "timezone": chart.timezone, "birth_utc": chart.birth_utc,
+        "house_system": chart_data.house_system or HOUSE_SYSTEM_NAME,
+        "time_provenance": "local_iana" if chart.birth_utc and chart.timezone else "legacy_unverified",
     }
 
 
@@ -233,7 +239,7 @@ def delete_natal_chart(
         raise HTTPException(status_code=404, detail="❌ Карта не найдена")
     try:
         usage.backfill_user_history(db, current_user.id)
-        for model in (GPTMessage, ChartInterpretationData, ChartData):
+        for model in (GPTConversation, GPTMessage, ChartInterpretationData, ChartData):
             db.query(model).filter(model.chart_id == chart_id).delete(synchronize_session=False)
         db.query(NatalChart).filter(
             NatalChart.id == chart_id, NatalChart.user_id == current_user.id
@@ -269,9 +275,9 @@ def ask_gpt_interpretation(
     chart_args = (chart.year, chart.month, chart.day, chart.hour, chart.lon, chart.lat)
     reservation_id = usage.reserve(db, user_id, chart_id)
     try:
-        interpreter = ChartInterpreter(*chart_args)
+        interpreter = ChartInterpreter(*chart_args, calculate=False)
         # Sync SQLAlchemy and lock waits stay in FastAPI's worker thread.
-        interpretation = asyncio.run(interpreter.ask_gpt(chart_id, db, data.question))
+        interpretation = asyncio.run(interpreter.ask_gpt(chart_id, db, data.question, user_id))
         if not isinstance(interpretation, str) or not interpretation.strip():
             raise HTTPException(502, detail="GPT не вернул ответ. Квота не списана.")
         result = GPTInterpretationResponse(chart_id=chart_id, response=interpretation)
@@ -303,7 +309,7 @@ def get_gpt_messages(
     if chart.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="⛔ Недоступно: карта не принадлежит пользователю")
 
-    messages = db.query(GPTMessage).filter_by(chart_id=chart_id).order_by(GPTMessage.created_at).all()
+    messages = db.query(GPTMessage).filter_by(chart_id=chart_id).order_by(GPTMessage.id).all()
     return messages
 @router.post("/chart-bodies-info", tags=["Natal Chart"])
 def get_bodies_info(
@@ -321,7 +327,7 @@ def get_bodies_info(
         return {"bodies": chart_data.points_data}
 
     # Если данных нет — считаем их
-    ephem = Ephemeris(chart.year, chart.month, chart.day, chart.hour, chart.lon, chart.lat)
+    ephem = Ephemeris(*calculator_args(chart))
     combined_bodies = ephem.get_all_bodies_with_symbols()
 
     result = []
@@ -370,16 +376,13 @@ async def get_patterns(
         return chart_data.patterns_data
 
     # Создаём объект для работы с аспектами
-    aspects_module = Aspects(
-        chart.year, chart.month, chart.day,
-        chart.hour, chart.lon, chart.lat
-    )
+    aspects_module = Aspects(*calculator_args(chart))
     raw_aspect_list = aspects_module.get_all_aspects_flat().split("\n")
     raw_aspect_list = [line.strip() for line in raw_aspect_list if line.strip()]
     aspect_dict = aspects_module.convert_aspects_for_chart(raw_aspect_list)
     
     # Создаём объект для получения тел с символами
-    ephem = Ephemeris(chart.year, chart.month, chart.day, chart.hour, chart.lon, chart.lat)
+    ephem = Ephemeris(*calculator_args(chart))
     bodies = ephem.get_all_bodies_with_symbols()
 
     # Создаём объект паттернов с телами и аспектами

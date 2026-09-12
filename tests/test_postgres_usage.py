@@ -16,7 +16,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
 import test_my_charts as fixtures  # isolated imports, dummy OpenAI key, no network
-from database.queries import User, GPTMessage, GPTUsage
+from database.queries import User, GPTMessage, GPTUsage, GPTConversation
 from modules import usage
 
 
@@ -37,15 +37,21 @@ class PostgreSQLUsageTests(unittest.TestCase):
         # Reconstruct the repository's pre-feature schema, then run the exact SQL.
         legacy = MetaData()
         for table in fixtures.Base.metadata.sorted_tables:
-            if table.name in ("gpt_usage", "paddle_checkouts", "paddle_events"):
+            if table.name in ("gpt_usage", "paddle_checkouts", "paddle_events", "gpt_conversations"):
                 continue
             if table.name == "users":
                 Table("users", legacy, *(col._copy() for col in table.columns if col.name not in
                                           ("plan", "current_period_start", "current_period_end", "payment_provider",
                                            "provider_customer_id", "provider_subscription_id", "subscription_status",
                                            "paddle_updated_at", "scheduled_cancel_at")))
+            elif table.name in ('natal_charts', 'chart_data'):
+                Table(table.name, legacy, *(col._copy() for col in table.columns if col.name not in
+                    ('timezone','birth_utc','houses','house_system')))
             else:
                 table.to_metadata(legacy)
+        for index in list(legacy.tables['gpt_messages'].indexes):
+            if index.name == 'ix_gpt_messages_chart_id_id':
+                legacy.tables['gpt_messages'].indexes.remove(index)
         legacy.create_all(self.engine)
         self.legacy = legacy
         with self.engine.begin() as conn:
@@ -54,9 +60,9 @@ class PostgreSQLUsageTests(unittest.TestCase):
                 {"id": 2, "email": "other@example.com", "password_hash": "unused"},
             ])
             conn.execute(legacy.tables["natal_charts"].insert(), [
-                {"id": 1, "user_id": 1, **fixtures.PAYLOAD},
-                {"id": 2, "user_id": 2, **fixtures.PAYLOAD},
-                {"id": 3, "user_id": None, **fixtures.PAYLOAD},
+                {"id": 1, "user_id": 1, **{k:v for k,v in fixtures.PAYLOAD.items() if k != "timezone"}},
+                {"id": 2, "user_id": 2, **{k:v for k,v in fixtures.PAYLOAD.items() if k != "timezone"}},
+                {"id": 3, "user_id": None, **{k:v for k,v in fixtures.PAYLOAD.items() if k != "timezone"}},
             ])
             conn.execute(legacy.tables["gpt_messages"].insert(), [
                 {"chart_id": chart_id, "role": role, "content": f"Historical {role} {chart_id}"}
@@ -76,6 +82,45 @@ class PostgreSQLUsageTests(unittest.TestCase):
         self.apply_script(self.script)
         self.paddle_script = (Path(__file__).parents[1] / "migrations" / "paddle_billing.sql").read_text(encoding="utf-8")
         self.apply_script(self.paddle_script)
+        self.ai_script = (Path(__file__).parents[1] / "migrations" / "ai_conversation.sql").read_text(encoding="utf-8")
+        self.apply_script(self.ai_script)
+        self.birth_script = (Path(__file__).parents[1] / "migrations" / "birth_time_houses.sql").read_text(encoding="utf-8")
+        self.apply_script(self.birth_script)
+
+    def test_birth_migration_preserves_legacy_data_without_inventing_timezone(self):
+        self.assertEqual(self.snapshot(), self.before)
+        with self.engine.connect() as conn:
+            self.assertTrue(all(row == (None,None) for row in conn.exec_driver_sql('SELECT timezone,birth_utc FROM natal_charts').all()))
+            self.assertTrue(all(row == (None,None) for row in conn.exec_driver_sql('SELECT houses,house_system FROM chart_data').all()))
+        with self.assertRaises(Exception): self.apply_script(self.birth_script)
+        self.assertEqual(self.snapshot(),self.before)
+
+    def test_ai_migration_preserves_rows_and_refuses_reapplication(self):
+        self.assertEqual(self.snapshot(), self.before)
+        with self.engine.connect() as conn:
+            self.assertIn('gpt_conversations', inspect(conn).get_table_names())
+            columns = {c['name'] for c in inspect(conn).get_columns('gpt_usage')}
+            self.assertTrue({'input_tokens','output_tokens','total_tokens','model','summary_usage'} <= columns)
+        with self.assertRaises(Exception):
+            self.apply_script(self.ai_script)
+        self.assertEqual(self.snapshot(), self.before)
+
+    def test_same_chart_cannot_answer_concurrently_with_spare_quota(self):
+        barrier = Barrier(2)
+        def attempt():
+            with self.sessions() as db:
+                barrier.wait(timeout=5)
+                try:
+                    return usage.reserve(db, 1, 1)
+                except HTTPException as exc:
+                    self.assertEqual(exc.detail['code'], 'GPT_REQUEST_IN_PROGRESS')
+                    return None
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: attempt(), range(2)))
+        winner, = [r for r in results if r is not None]
+        with self.sessions() as db:
+            usage.finalize(db, 1, winner, 'Question', 'Answer')
+            self.assertEqual(db.query(GPTUsage).filter_by(status='succeeded',user_id=1).count(), 2)
 
     def test_paddle_migration_is_additive_and_cannot_reset_existing_data(self):
         self.assertEqual(self.snapshot(), self.before)
@@ -142,6 +187,8 @@ class PostgreSQLUsageTests(unittest.TestCase):
     def test_failure_after_backfill_rolls_back_all_ddl_and_preserves_legacy_data(self):
         # Revert only this test's generated schema to its pre-feature shape.
         with self.engine.begin() as conn:
+            conn.exec_driver_sql("DROP TABLE gpt_conversations")
+            conn.exec_driver_sql("DROP INDEX ix_gpt_messages_chart_id_id")
             conn.exec_driver_sql("DROP TABLE gpt_usage")
             conn.exec_driver_sql("ALTER TABLE users DROP COLUMN plan, DROP COLUMN current_period_start, DROP COLUMN current_period_end")
         broken_script = self.script.replace("COMMIT;", "SELECT 1 / 0;\nCOMMIT;")
@@ -153,6 +200,7 @@ class PostgreSQLUsageTests(unittest.TestCase):
             self.assertNotIn("gpt_usage", inspect(conn).get_table_names())
             self.assertNotIn("plan", {column["name"] for column in inspect(conn).get_columns("users")})
         self.apply_script(self.script)
+        self.apply_script(self.ai_script)
         self.assertEqual(self.snapshot(), self.before)
         with self.sessions() as db:
             self.assertEqual(usage.account_usage(db, 1)["gpt_messages_used"], 1)

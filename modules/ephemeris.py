@@ -7,6 +7,9 @@ import ephem
 
 
 
+HOUSE_SYSTEM_CODE = b'P'
+HOUSE_SYSTEM_NAME = "Placidus"
+
 ZODIAC_SIGNS = [
     "Овен", "Телец", "Близнецы", "Рак", "Лев", "Дева",
     "Весы", "Скорпион", "Стрелец", "Козерог", "Водолей", "Рыбы"
@@ -58,7 +61,7 @@ class Ephemeris:
             # ✅ Определяем, является ли объект ретроградным
             retro = True if body in ["Северный Узел", "Южный Узел"] else speed < 0  
 
-            house = self._find_house(degree, sign, houses)  
+            house = self._find_house(pos[0], sign, houses, is_key_point=True)
 
             results[body] = {
                 "знак": sign,
@@ -144,7 +147,7 @@ class Ephemeris:
                 lat = eph["ObsEclLat"][0]  # Эклиптическая широта
 
                 # ✅ Определяем дом
-                house = self._find_house(degree, sign, houses)
+                house = self._find_house(eph["ObsEclLon"][0], sign, houses, is_key_point=True)
 
                 # 🔹 **Корректно извлекаем скорость**
                 retrograde = eph["RA_rate"][0] < 0  # Используем правильный индекс
@@ -181,7 +184,7 @@ class Ephemeris:
                 degree = float(parts[0]) + float(parts[1].strip("'")) / 60
 
                 # ✅ Определяем дом
-                house = self._find_house(degree, sign, houses)
+                house = self._find_house(abs_degree, sign, houses, is_key_point=True)
 
                 # 🔥 **Исправление ретроградности Лилит**
                 if body == "Черная Луна Лилит":
@@ -196,7 +199,7 @@ class Ephemeris:
                     "градус": degree_str,
                     "ретроградный": retrograde,
                     "дом": house,
-                    "абс_долгота": eph["ObsEclLon"][0]
+                    "абс_долгота": abs_degree
 
                 }
                 
@@ -246,7 +249,7 @@ class Ephemeris:
 
     def get_houses(self):
         """ Вычисляет границы домов по системе Плацидуса и ключевые точки """
-        cusps, ascmc = swe.houses(self.jd, self.lat, self.lon, b'P')  # 'P' = Плацидус
+        cusps, ascmc = swe.houses(self.jd, self.lat, self.lon, HOUSE_SYSTEM_CODE)  # 'P' = Плацидус
 
         houses = {
             "Дом 1": cusps[0],
@@ -266,13 +269,9 @@ class Ephemeris:
 
         return houses
     def get_house_cusps(self):
-        jd = swe.julday(self.year, self.month, self.day, self.hour)
-        houses, _ = swe.houses(jd, self.lat, self.lon, b'A')  # Placidus
+        houses = self.get_houses()
+        return [{"symbol": str(i), "degree": houses[f"Дом {i}"]} for i in range(1, 13)]
 
-        return [
-            {"symbol": str(i + 1), "degree": round(houses[i], 2)}
-            for i in range(12)
-        ]
     def _find_house(self, degree, sign, houses, is_key_point=False):
         """Определение дома для планет и ключевых точек по куспидам домов Плацидуса."""
 
@@ -296,10 +295,15 @@ class Ephemeris:
 
             absolute_degree = base_degree + degree  # Убираем % 360
 
+        absolute_degree %= 360
+
         # ✅ Получаем куспиды домов
         cusps = [houses[f"Дом {i}"] for i in range(1, 13)]
-
-
+        # Normalize wraparound without moving a value on a cusp into the preceding
+        # house due solely to floating-point modulo error (sub-microarcsecond).
+        for i, cusp in enumerate(cusps):
+            if abs((absolute_degree - cusp + 180) % 360 - 180) < 1e-10:
+                return i + 1
 
         # ✅ Определяем дом по куспидам
         for i in range(12):
@@ -323,7 +327,7 @@ class Ephemeris:
         """ Получает ключевые точки гороскопа с их знаками, градусами, домами и абсолютной долготой """
 
         # ✅ Используем систему домов **Placidus**
-        cusps, ascmc = swe.houses(self.jd, self.lat, self.lon, b'P')  
+        cusps, ascmc = swe.houses(self.jd, self.lat, self.lon, HOUSE_SYSTEM_CODE)
         houses = self.get_houses()  
 
         # ✅ Пересчитываем Солнце и Луну
@@ -366,7 +370,7 @@ class Ephemeris:
         """ Получает долготу ключевых точек гороскопа (только числа) """
 
         # Основные оси (Асцендент, Десцендент, МС, IC)
-        ascmc = swe.houses(self.jd, self.lat, self.lon, b'P')[1]  # Асцендент и МС
+        ascmc = swe.houses(self.jd, self.lat, self.lon, HOUSE_SYSTEM_CODE)[1]  # Асцендент и МС
         asc, mc, desc, ic = ascmc[0], ascmc[1], (ascmc[0] + 180) % 360, (ascmc[1] + 180) % 360
 
         # Долгота Солнца и Луны
@@ -426,7 +430,7 @@ class Ephemeris:
         latitude_corrected = 90 - self.lat  
 
         # ✅ 3. Получаем Асцендент (ASC) для этих параметров — он и есть Вертекс!
-        houses_shifted = swe.houses(self.jd, latitude_corrected, self.lon, b'P')[0]
+        houses_shifted = swe.houses(self.jd, latitude_corrected, self.lon, HOUSE_SYSTEM_CODE)[0]
         vertex_longitude = houses_shifted[0]  # ASC для новых параметров = Вертекс
 
 
@@ -448,14 +452,9 @@ class Ephemeris:
 
     def get_planet_houses(self):
         """ Определяет, в каком доме находится каждая планета """
-        houses = self.get_houses()  # Получаем 12 домов
-        planet_positions = self.get_planets()  # Получаем планеты
-
-        for planet, data in planet_positions.items():
-            degree = float(data["градус"].split("°")[0]) + float(data["градус"].split("°")[1].strip("'")) / 60
-            house = self.find_house(degree, houses)  # Используем существующую функцию
-            data["дом"] = f"{house} Дом"
-
+        planet_positions = self.get_planets()
+        for data in planet_positions.values():
+            data["дом"] = f"{data['дом']} Дом"
         return planet_positions
 
     def get_moon_phase(self):
@@ -576,7 +575,9 @@ class Ephemeris:
             name_clean = name.replace(" (R)", "").strip()
             symbol = body_symbols.get(name_clean, name_clean[:2])
 
-            absolute_degree = data.get("абс_долгота") or data.get("degree")
+            absolute_degree = data.get("абс_долгота")
+            if absolute_degree is None:
+                absolute_degree = data.get("degree")
             if absolute_degree is None:
                 print(f"⚠️ Нет градуса у тела: {name}")
                 continue

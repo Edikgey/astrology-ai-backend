@@ -43,13 +43,20 @@ class NatalChartResponse(BaseModel):
     patterns_data: Optional[List[PatternResponse]]
     aspects_structured: Optional[Dict[str, List[str]]]
     houses: List[HouseData]
+    timezone: Optional[str] = None
+    birth_utc: Optional[datetime] = None
+    house_system: Optional[str] = None
+    time_provenance: str = 'legacy_unverified'
 class NatalChartCreate(BaseModel):
     year: int
     month: int
     day: int
-    hour: float
-    lon: float
-    lat: float
+    hour: float = Field(..., ge=0, lt=24, allow_inf_nan=False)
+    minute: Optional[int] = Field(None, ge=0, le=59)
+    timezone: Optional[str] = Field(None, max_length=100)
+    time_fold: Optional[int] = Field(None, ge=0, le=1)
+    lon: float = Field(..., ge=-180, le=180, allow_inf_nan=False)
+    lat: float = Field(..., ge=-90, le=90, allow_inf_nan=False)
     city: str
     region: str
     country: str
@@ -57,7 +64,7 @@ class NatalChartCreate(BaseModel):
 
 class GPTInterpretationRequest(BaseModel):
     chart_id: int
-    question: str = Field(...)
+    question: str = Field(..., min_length=1, max_length=4000, pattern=r"\S")
 
 
 class NatalChartSummary(BaseModel):
