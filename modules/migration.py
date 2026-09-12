@@ -3,6 +3,7 @@ from typing import Optional
 from uuid import UUID
 from database.queries import NatalChart, User
 from modules.chart_limits import saved_chart_limit
+from modules.usage import locked_user
 
 def migrate_guest_data_to_user(
     db: Session, user_id: int, session_token: Optional[UUID],
@@ -13,7 +14,7 @@ def migrate_guest_data_to_user(
         return {"status": "not_requested", "chart_id": guest_chart_id}
 
     # Match creation's lock order: user first, then the individual guest chart.
-    user = db.query(User).filter(User.id == user_id).populate_existing().with_for_update().one()
+    user = locked_user(db, user_id)
     chart = db.query(NatalChart).filter(
         NatalChart.id == guest_chart_id,
         NatalChart.session_token == session_token,

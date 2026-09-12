@@ -37,11 +37,13 @@ class PostgreSQLUsageTests(unittest.TestCase):
         # Reconstruct the repository's pre-feature schema, then run the exact SQL.
         legacy = MetaData()
         for table in fixtures.Base.metadata.sorted_tables:
-            if table.name == "gpt_usage":
+            if table.name in ("gpt_usage", "paddle_checkouts", "paddle_events"):
                 continue
             if table.name == "users":
                 Table("users", legacy, *(col._copy() for col in table.columns if col.name not in
-                                          ("plan", "current_period_start", "current_period_end")))
+                                          ("plan", "current_period_start", "current_period_end", "payment_provider",
+                                           "provider_customer_id", "provider_subscription_id", "subscription_status",
+                                           "paddle_updated_at", "scheduled_cancel_at")))
             else:
                 table.to_metadata(legacy)
         legacy.create_all(self.engine)
@@ -72,6 +74,16 @@ class PostgreSQLUsageTests(unittest.TestCase):
         self.before = self.snapshot()
         self.script = (Path(__file__).parents[1] / "migrations" / "plan_usage.sql").read_text(encoding="utf-8")
         self.apply_script(self.script)
+        self.paddle_script = (Path(__file__).parents[1] / "migrations" / "paddle_billing.sql").read_text(encoding="utf-8")
+        self.apply_script(self.paddle_script)
+
+    def test_paddle_migration_is_additive_and_cannot_reset_existing_data(self):
+        self.assertEqual(self.snapshot(), self.before)
+        with self.sessions() as db:
+            self.assertTrue(all(user.payment_provider is None for user in db.query(User)))
+        with self.assertRaises(Exception):
+            self.apply_script(self.paddle_script)
+        self.assertEqual(self.snapshot(), self.before)
 
     def snapshot(self):
         with self.engine.connect() as conn:

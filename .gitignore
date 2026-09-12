@@ -182,6 +182,7 @@ astrology.db
 # Local secrets
 .env.*
 !.env.example
+!.env.paddle.example
 
 # Windows
 Thumbs.db

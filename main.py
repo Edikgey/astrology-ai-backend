@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from api import endpoints, auth
+from api import endpoints, auth, payments
 
 app = FastAPI()
 
@@ -19,3 +19,4 @@ app.add_middleware(
 # Подключаем роутеры
 app.include_router(auth.router)
 app.include_router(endpoints.router)
+app.include_router(payments.router)

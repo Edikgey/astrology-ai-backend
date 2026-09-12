@@ -8,7 +8,7 @@ from uuid import uuid4
 from fastapi import HTTPException
 from sqlalchemy import exists
 from database.queries import User, NatalChart, GPTMessage, GPTUsage
-from modules.plans import plan_limits
+from modules.plans import plan_limits, effective_plan
 
 OPENAI_TIMEOUT_SECONDS = 60
 RESERVATION_TTL = timedelta(minutes=5)
@@ -19,7 +19,11 @@ def utcnow():
 
 
 def locked_user(db, user_id):
-    return db.query(User).filter(User.id == user_id).populate_existing().with_for_update().one()
+    user = db.query(User).filter(User.id == user_id).populate_existing().with_for_update().one()
+    if user.plan != effective_plan(user, utcnow()):
+        user.plan = "free"
+        user.current_period_start = user.current_period_end = None
+    return user
 
 
 def backfill_user_history(db, user_id):
@@ -72,7 +76,11 @@ def account_usage(db, user_id):
         backfill_user_history(db, user_id)
         result = quota_state(db, user, utcnow())
         result.update(saved_charts_used=db.query(NatalChart).filter_by(user_id=user_id).count(),
-                      saved_charts_limit=plan_limits(user).max_saved_charts)
+                      saved_charts_limit=plan_limits(user).max_saved_charts,
+                      subscription_status=user.subscription_status,
+                      scheduled_cancel_at=user.scheduled_cancel_at,
+                      cancel_at_period_end=user.scheduled_cancel_at is not None,
+                      can_manage_subscription=bool(user.payment_provider == "paddle" and user.provider_customer_id))
         db.commit()
         return result
     except BaseException:
@@ -144,26 +152,31 @@ def release(db, user_id, reservation_id):
         raise  # If storage is unavailable the lease expires; it cannot finalize later.
 
 
-def set_plan(db, user_id, plan, period_start=None, period_end=None):
-    """Trusted backend helper only; not exposed via HTTP. Owns its transaction."""
+def apply_plan(db, user, plan, period_start=None, period_end=None):
+    """Caller owns the user row lock and transaction (including webhook ledger)."""
     def utc(value):
         return value.astimezone(timezone.utc).replace(tzinfo=None) if value and value.tzinfo else value
     start, end = utc(period_start), utc(period_end)
     if plan not in ("free", "premium") or (plan == "premium" and (not start or not end or start >= end)):
         raise ValueError("Invalid plan or billing period")
+    if plan == "premium":
+        # No resetting quota by shifting the start inside an existing period.
+        previous = db.query(GPTUsage).filter_by(user_id=user.id, plan="premium").all()
+        periods = [(row.period_start, row.period_end) for row in previous]
+        if user.current_period_start:
+            periods.append((user.current_period_start, user.current_period_end))
+        if any(a and b and a != start and start < b and end > a for a, b in periods):
+            raise ValueError("Billing periods must not overlap")
+    user.plan = plan
+    user.current_period_start = start if plan == "premium" else None
+    user.current_period_end = end if plan == "premium" else None
+
+
+def set_plan(db, user_id, plan, period_start=None, period_end=None):
+    """Trusted backend helper only; not exposed via HTTP. Owns its transaction."""
     try:
         user = locked_user(db, user_id)
-        if plan == "premium":
-            # No resetting quota by shifting the start inside an existing period.
-            previous = db.query(GPTUsage).filter_by(user_id=user_id, plan="premium").all()
-            periods = [(row.period_start, row.period_end) for row in previous]
-            if user.current_period_start:
-                periods.append((user.current_period_start, user.current_period_end))
-            if any(a and b and a != start and start < b and end > a for a, b in periods):
-                raise ValueError("Billing periods must not overlap")
-        user.plan = plan
-        user.current_period_start = start if plan == "premium" else None
-        user.current_period_end = end if plan == "premium" else None
+        apply_plan(db, user, plan, period_start, period_end)
         db.commit()
     except BaseException:
         db.rollback()

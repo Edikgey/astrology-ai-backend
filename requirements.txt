@@ -60,6 +60,7 @@ openai==1.62.0
 orjson==3.10.15
 packaging==24.2
 passlib==1.7.4
+paddle-python-sdk==1.15.0
 propcache==0.2.1
 psycopg2-binary==2.9.10
 pyasn1==0.4.8

@@ -15,9 +15,35 @@ class User(Base):
     plan = Column(String, nullable=False, default="free", server_default="free")
     current_period_start = Column(DateTime, nullable=True)  # UTC, as elsewhere in this schema
     current_period_end = Column(DateTime, nullable=True)
+    payment_provider = Column(String, nullable=True)
+    provider_customer_id = Column(String, unique=True, nullable=True)
+    provider_subscription_id = Column(String, unique=True, nullable=True)
+    subscription_status = Column(String, nullable=True)
+    paddle_updated_at = Column(DateTime, nullable=True)
+    scheduled_cancel_at = Column(DateTime, nullable=True)
     __table_args__ = (CheckConstraint("plan IN ('free', 'premium')", name="ck_users_plan"),)
 
     natal_charts = relationship("NatalChart", back_populates="user")
+
+
+class PaddleCheckout(Base):
+    """Server-created ownership binding and reusable checkout; no payment payloads."""
+    __tablename__ = "paddle_checkouts"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    transaction_id = Column(String, unique=True, nullable=True)
+    subscription_id = Column(String, unique=True, nullable=True)
+    state = Column(String, nullable=False, default="creating")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class PaddleEvent(Base):
+    __tablename__ = "paddle_events"
+    event_id = Column(String, primary_key=True)
+    event_type = Column(String, nullable=False)
+    occurred_at = Column(DateTime, nullable=False)
+    processed_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    outcome = Column(String, nullable=False, default="processed")
 
 
 class GPTUsage(Base):
