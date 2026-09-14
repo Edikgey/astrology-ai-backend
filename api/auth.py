@@ -18,6 +18,10 @@ import random
 import os
 from starlette import status
 from modules.migration import migrate_guest_data_to_user
+from models.user import GoogleLogin
+from services.google_identity import verify_google_credential
+from sqlalchemy import func
+import secrets
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")  # если ещё не определён
 
@@ -147,6 +151,63 @@ def login(
         db.rollback()
         raise
     return {"access_token": access_token, "token_type": "bearer", "guest_chart_migration": migration}
+@router.post("/google", response_model=Token)
+def google_login(credentials: GoogleLogin, request: Request, db: Session = Depends(get_db)):
+    # GIS popup callback sends JSON, not Google's form-post/redirect flow. Reject
+    # cross-site login CSRF explicitly; no cookies or application JWT are trusted here.
+    if request.headers.get("origin") not in {
+        "http://localhost:3000", "https://astrology-ai-frontend-production.up.railway.app",
+    }:
+        raise HTTPException(403, detail="Недопустимый источник входа Google.")
+    if request.headers.get("content-type", "").split(";")[0].strip() != "application/json":
+        raise HTTPException(415, detail="Требуется JSON.")
+    identity = verify_google_credential(credentials.credential, credentials.nonce)
+    try:
+        session_token = UUID(request.headers["X-Session-Token"]) if request.headers.get("X-Session-Token") else None
+    except ValueError:
+        raise HTTPException(400, detail="Некорректный X-Session-Token") from None
+
+    # Uniqueness handles concurrent first sign-ins. Retry the complete transaction
+    # once after a competing insert/link commits, re-reading the stable subject.
+    for attempt in range(2):
+        try:
+            user = db.query(User).filter(User.google_sub == identity['sub']).with_for_update().first()
+            if user is None:
+                matches = db.query(User).filter(func.lower(User.email) == identity['email']).with_for_update().all()
+                if len(matches) > 1:
+                    raise HTTPException(409, detail="Невозможно однозначно связать аккаунт. Используйте вход по email.")
+                user = matches[0] if matches else None
+                if user and user.google_sub not in (None, identity['sub']):
+                    raise HTTPException(409, detail="Этот аккаунт уже связан с другим Google-профилем. Используйте вход по email.")
+                if user and not identity['authoritative']:
+                    if not credentials.password:
+                        raise HTTPException(409, detail={"code": "google_link_confirmation_required", "message": "Подтвердите пароль существующего аккаунта, чтобы связать его с Google."})
+                    if not verify_password(credentials.password, user.password_hash):
+                        raise HTTPException(401, detail="Не удалось подтвердить пароль существующего аккаунта.")
+                if user is None:
+                    # Existing schema requires a password hash. Generate an unknown
+                    # random password; no password is exposed or assigned to the user.
+                    user = User(email=identity['email'], password_hash=get_password_hash(secrets.token_urlsafe(32)))
+                    db.add(user)
+                user.google_sub = identity['sub']
+                db.flush()
+            migration = migrate_guest_data_to_user(db=db, user_id=user.id, session_token=session_token,
+                                                  guest_chart_id=credentials.guest_chart_id)
+            access_token = create_access_token(data={"sub": str(user.id)})
+            db.commit()
+            return {"access_token": access_token, "token_type": "bearer", "guest_chart_migration": migration}
+        except IntegrityError:
+            db.rollback()
+            if attempt:
+                raise HTTPException(409, detail="Аккаунт изменился во время входа. Повторите вход Google.") from None
+        except HTTPException:
+            db.rollback()
+            raise
+        except Exception:
+            db.rollback()
+            raise HTTPException(503, detail="Не удалось завершить вход. Попробуйте снова.") from None
+
+
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])

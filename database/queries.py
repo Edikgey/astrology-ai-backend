@@ -11,6 +11,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
+    google_sub = Column(String(255), nullable=True, unique=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     plan = Column(String, nullable=False, default="free", server_default="free")
     current_period_start = Column(DateTime, nullable=True)  # UTC, as elsewhere in this schema

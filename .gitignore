@@ -183,6 +183,7 @@ astrology.db
 .env.*
 !.env.example
 !.env.paddle.example
+!.env.google.example
 
 # Windows
 Thumbs.db

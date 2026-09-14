@@ -104,3 +104,5 @@ watchfiles==1.0.4
 webencodings==0.5.1
 websockets==15.0.1
 yarl==1.18.3
+google-auth==2.58.0
+pyasn1-modules==0.2.8
