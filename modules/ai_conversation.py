@@ -1,5 +1,6 @@
 """Bounded rolling memory. Network work produces a candidate, never a DB commit."""
 from dataclasses import dataclass
+import json
 from fastapi import HTTPException
 from database.queries import GPTConversation, GPTMessage, NatalChart
 from modules.ai_chart_context import build_chart_context, compact_json
@@ -17,6 +18,24 @@ MAX_SUMMARY_CALLS = 2
 MAX_INPUT_BUDGET = 64000
 ANSWER_TOKENS = 1200
 SUMMARY_TOKENS = 650
+
+ANSWER_FORMAT = {
+    'type': 'json_schema',
+    'json_schema': {
+        'name': 'astrology_answer', 'strict': True,
+        'schema': {
+            'type': 'object', 'additionalProperties': False,
+            'properties': {
+                'answer': {'type': 'string'},
+                'follow_up_suggestions': {
+                    'type': 'array', 'items': {'type': 'string'},
+                    'minItems': 3, 'maxItems': 4,
+                },
+            },
+            'required': ['answer', 'follow_up_suggestions'],
+        },
+    },
+}
 
 
 def message_size(message):
@@ -36,11 +55,12 @@ class MemoryUpdate:
 
 class AIAnswer(str):
     """Keeps the interpreter's text contract and carries transaction-local metadata."""
-    def __new__(cls, text, *, metadata, memory_update=None, summary_usage=None):
+    def __new__(cls, text, *, metadata, memory_update=None, summary_usage=None, follow_up_suggestions=None):
         result = super().__new__(cls, text)
         result.metadata = metadata
         result.memory_update = memory_update
         result.summary_usage = summary_usage or []
+        result.follow_up_suggestions = follow_up_suggestions or []
         return result
 
 
@@ -62,6 +82,34 @@ def response_text(response):
     if not isinstance(content, str) or not content.strip():
         raise HTTPException(502, "AI не вернул ответ. Квота не списана.")
     return content.strip()
+
+
+def answer_parts(content, question):
+    """Suggestions are optional enrichment; never reject a valid answer for them."""
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        # Preserve legacy/plain-text answers, but never display a broken JSON envelope.
+        if content.startswith(('{', '[')):
+            raise HTTPException(502, "AI не завершил ответ. Квота не списана; повторите вопрос.")
+        return content, []
+    if not isinstance(payload, dict) or not isinstance(payload.get('answer'), str) or not payload['answer'].strip():
+        raise HTTPException(502, "AI не вернул ответ. Квота не списана.")
+    answer = payload['answer'].strip()
+    candidates = payload.get('follow_up_suggestions')
+    if not isinstance(candidates, list) or not 3 <= len(candidates) <= 4:
+        return answer, []
+    suggestions, seen = [], {question.strip().casefold().rstrip('?!., ')}
+    for item in candidates:
+        if not isinstance(item, str) or not item.strip() or len(item.strip()) > 100 or '\n' in item:
+            return answer, []
+        item = item.strip()
+        key = item.casefold().rstrip('?!., ')
+        if key in seen:
+            return answer, []
+        seen.add(key)
+        suggestions.append(item)
+    return answer, suggestions
 
 
 def history_query(db, user_id, chart_id):
@@ -144,10 +192,12 @@ def generate_answer(db, user_id, chart_id, question, client, params):
     messages += recent_messages + [current]
     if sum(map(message_size, messages)) > MAX_INPUT_BUDGET:
         raise HTTPException(422, "Вопрос и карта превышают бюджет контекста; сократите вопрос.")
-    response = client.chat.completions.create(**params, max_tokens=ANSWER_TOKENS, messages=messages)
-    answer = response_text(response)
+    response = client.chat.completions.create(**params, max_tokens=ANSWER_TOKENS, messages=messages,
+                                              response_format=ANSWER_FORMAT)
+    answer, suggestions = answer_parts(response_text(response), question)
     update = MemoryUpdate(original_cursor, cursor, summary) if cursor != original_cursor else None
-    return AIAnswer(answer, metadata=token_metadata(response, params['model']), memory_update=update, summary_usage=summary_usage)
+    return AIAnswer(answer, metadata=token_metadata(response, params['model']), memory_update=update,
+                    summary_usage=summary_usage, follow_up_suggestions=suggestions)
 
 
 def save_memory(db, user_id, chart_id, update):

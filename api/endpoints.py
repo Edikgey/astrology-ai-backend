@@ -280,7 +280,8 @@ def ask_gpt_interpretation(
         interpretation = asyncio.run(interpreter.ask_gpt(chart_id, db, data.question, user_id))
         if not isinstance(interpretation, str) or not interpretation.strip():
             raise HTTPException(502, detail="GPT не вернул ответ. Квота не списана.")
-        result = GPTInterpretationResponse(chart_id=chart_id, response=interpretation)
+        result = GPTInterpretationResponse(chart_id=chart_id, response=interpretation,
+                                          follow_up_suggestions=getattr(interpretation, 'follow_up_suggestions', []))
         usage.finalize(db, user_id, reservation_id, data.question, interpretation)
         return result
     except BaseException:

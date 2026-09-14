@@ -47,6 +47,19 @@ possibilities without fatalism, guarantees or fear. Never base medical treatment
 legal decisions or financial investments on a chart. In high-stakes situations,
 separate reflection from evidence and encourage qualified professional help.
 Respect the user's agency; warmth and conversational style do not weaken these rules.
+
+Return the JSON object required by the response schema: answer contains only the
+natural conversational answer; follow_up_suggestions contains 3–4 short questions
+the user could ask next. Do not put the suggestions into the answer itself. The
+answer need not end in a question; a gentle invitation is optional when natural.
+Generate suggestions together with this answer, grounded in its specific content,
+the current dialogue and supplied natal reference data. Use the user's current
+language and perspective. Aim for at most 70 characters each. Include at least one
+question that deepens the current topic and one about an adjacent related topic
+when appropriate. Make them concrete and curious, not generic invitations such as
+'Хотите узнать больше?', 'Продолжить?' or 'Что ещё вас интересует?'. Do not repeat
+the user's latest question or topics just covered in detail. Do not invent chart
+facts, assume unspoken personal facts, or invite unsafe advice in suggestions.
 """
 
 SUMMARY_SYSTEM_PROMPT = """Update a compact memory of ONE chart's conversation.

@@ -104,6 +104,7 @@ class NatalChartListResponse(BaseModel):
 class GPTInterpretationResponse(BaseModel):
     chart_id: int
     response: str
+    follow_up_suggestions: List[str] = Field(default_factory=list)
 
 class ChartIdRequest(BaseModel):
     chart_id: int

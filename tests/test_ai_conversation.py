@@ -22,6 +22,65 @@ class AIConversationTests(unittest.TestCase):
     tearDown = fixtures.MyChartsTests.tearDown
     chart = fixtures.MyChartsTests.chart
 
+    def test_structured_answer_suggestions_use_one_call_and_one_quota_unit(self):
+        chart_id = self.chart()
+        suggestions = ['Как проявляется моё лидерство?', 'Что мешает мне развиваться?', 'Как это связано с деньгами?']
+        before = self.client.get('/account/usage', headers=self.owner).json()['gpt_messages_used']
+        payload = {'answer': 'В работе важна самостоятельность.', 'follow_up_suggestions': suggestions}
+        with patch('modules.interpretation.client.chat.completions.create', return_value=reply(json.dumps(payload))) as api:
+            result = self.ask(chart_id, 'Что мне важно в карьере?')
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(result.json()['response'], payload['answer'])
+            self.assertEqual(result.json()['follow_up_suggestions'], suggestions)
+            api.assert_called_once()
+            self.assertEqual(api.call_args.kwargs['response_format'], ai.ANSWER_FORMAT)
+            self.assertTrue(api.call_args.kwargs['response_format']['json_schema']['strict'])
+        self.assertEqual(self.client.get('/account/usage', headers=self.owner).json()['gpt_messages_used'], before + 1)
+        history = self.client.get(f'/gpt-messages?chart_id={chart_id}', headers=self.owner).json()
+        self.assertEqual(history[-1]['content'], payload['answer'])
+        self.assertNotIn('follow_up_suggestions', history[-1])
+
+    def test_missing_or_malformed_suggestions_preserve_answer_without_retry(self):
+        chart_id = self.chart()
+        cases = [{}, {'follow_up_suggestions': None}, {'follow_up_suggestions': 'broken'},
+                 {'follow_up_suggestions': ['One?', 42, 'Three?']},
+                 {'follow_up_suggestions': ['Same?', 'same?', 'Next?']},
+                 {'follow_up_suggestions': ['Only one?']}]
+        before = self.client.get('/account/usage', headers=self.owner).json()['gpt_messages_used']
+        for extra in cases:
+            with self.subTest(extra=extra), patch('modules.interpretation.client.chat.completions.create',
+                    return_value=reply(json.dumps({'answer': 'Valid answer', **extra}))) as api:
+                result = self.ask(chart_id)
+                self.assertEqual(result.status_code, 200)
+                self.assertEqual(result.json()['response'], 'Valid answer')
+                self.assertEqual(result.json()['follow_up_suggestions'], [])
+                api.assert_called_once()
+        self.assertEqual(self.client.get('/account/usage', headers=self.owner).json()['gpt_messages_used'], before + len(cases))
+
+    def test_invalid_structured_answer_releases_reservation(self):
+        chart_id = self.chart()
+        before = self.client.get('/account/usage', headers=self.owner).json()['gpt_messages_used']
+        for content in ('{"follow_up_suggestions": []}', '{"answer": ""}', '{"answer":'):
+            with patch('modules.interpretation.client.chat.completions.create', return_value=reply(content)) as api:
+                self.assertEqual(self.ask(chart_id).status_code, 502)
+                api.assert_called_once()
+        state = self.client.get('/account/usage', headers=self.owner).json()
+        self.assertEqual(state['gpt_messages_used'], before)
+        self.assertEqual(state['gpt_messages_reserved'], 0)
+
+    def test_summary_remains_plain_and_receives_only_answer_history(self):
+        chart_id = self.chart()
+        self.long_chat(chart_id)
+        payload = {'answer': 'Continue the topic.', 'follow_up_suggestions': ['What helps me grow?', 'How can I lead?', 'How does this affect relationships?']}
+        with patch('modules.interpretation.client.chat.completions.create',
+                   side_effect=[reply('Existing memory'), reply(json.dumps(payload))]) as api:
+            result = self.ask(chart_id)
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(api.call_count, 2)  # Existing memory call + one answer, never a suggestions call.
+            self.assertNotIn('response_format', api.call_args_list[0].kwargs)
+            self.assertIn('Existing memory', str(api.call_args_list[1].kwargs['messages']))
+        self.assertEqual(self.snapshot(chart_id)[0][-1], ('gpt', payload['answer']))
+
     def ask(self, chart_id, question='А как это проявляется в отношениях?', headers=None):
         return self.client.post('/ask-gpt', headers=headers or self.owner, json={'chart_id':chart_id, 'question':question})
 
