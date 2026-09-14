@@ -253,9 +253,11 @@ def delete_natal_chart(
 
 from datetime import datetime
 
-@router.post("/ask-gpt", response_model=GPTInterpretationResponse, tags=["Natal Chart"])
+@router.post("/ask-gpt", response_model=GPTInterpretationResponse, tags=["Natal Chart"],
+             responses={200: {'content': {'text/event-stream': {}}}})
 def ask_gpt_interpretation(
     data: GPTInterpretationRequest,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -275,6 +277,11 @@ def ask_gpt_interpretation(
     chart_args = (chart.year, chart.month, chart.day, chart.hour, chart.lon, chart.lat)
     reservation_id = usage.reserve(db, user_id, chart_id)
     try:
+        if 'text/event-stream' in request.headers.get('accept', ''):
+            from modules.ai_stream import streaming_response
+            from modules.interpretation import client, OPENAI_PARAMS
+            return streaming_response(db.get_bind(), user_id, chart_id, data.question,
+                                      reservation_id, client, OPENAI_PARAMS)
         interpreter = ChartInterpreter(*chart_args, calculate=False)
         # Sync SQLAlchemy and lock waits stay in FastAPI's worker thread.
         interpretation = asyncio.run(interpreter.ask_gpt(chart_id, db, data.question, user_id))

@@ -1,6 +1,7 @@
 """Bounded rolling memory. Network work produces a candidate, never a DB commit."""
 from dataclasses import dataclass
 import json
+from jiter import from_json
 from fastapi import HTTPException
 from database.queries import GPTConversation, GPTMessage, NatalChart
 from modules.ai_chart_context import build_chart_context, compact_json
@@ -118,7 +119,7 @@ def history_query(db, user_id, chart_id):
         GPTMessage.role.in_(['user', 'gpt', 'assistant']))
 
 
-def generate_answer(db, user_id, chart_id, question, client, params):
+def prepare_answer(db, user_id, chart_id, question, client, params):
     # An explicit user ID from JWT is mandatory even when called outside the route.
     if user_id is None:
         raise HTTPException(401, "Войдите в аккаунт.")
@@ -192,12 +193,45 @@ def generate_answer(db, user_id, chart_id, question, client, params):
     messages += recent_messages + [current]
     if sum(map(message_size, messages)) > MAX_INPUT_BUDGET:
         raise HTTPException(422, "Вопрос и карта превышают бюджет контекста; сократите вопрос.")
+    update = MemoryUpdate(original_cursor, cursor, summary) if cursor != original_cursor else None
+    return messages, update, summary_usage
+
+
+def generate_answer(db, user_id, chart_id, question, client, params):
+    messages, update, summary_usage = prepare_answer(db, user_id, chart_id, question, client, params)
     response = client.chat.completions.create(**params, max_tokens=ANSWER_TOKENS, messages=messages,
                                               response_format=ANSWER_FORMAT)
     answer, suggestions = answer_parts(response_text(response), question)
-    update = MemoryUpdate(original_cursor, cursor, summary) if cursor != original_cursor else None
     return AIAnswer(answer, metadata=token_metadata(response, params['model']), memory_update=update,
                     summary_usage=summary_usage, follow_up_suggestions=suggestions)
+
+
+def stream_answer(db, user_id, chart_id, question, client, params):
+    """SDK network stream; partial JSON is decoded by the SDK's jiter dependency."""
+    messages, update, summary_usage = prepare_answer(db, user_id, chart_id, question, client, params)
+    emitted = ''
+    with client.beta.chat.completions.stream(
+            **params, max_tokens=ANSWER_TOKENS, messages=messages, response_format=ANSWER_FORMAT,
+            stream_options={'include_usage': True}) as stream:
+        for event in stream:
+            if event.type != 'content.delta':
+                continue
+            try:
+                # Unlike regex/string slicing, jiter handles escapes and incomplete
+                # strings. No suggestions leave the server until final validation.
+                partial = from_json(event.snapshot.encode('utf-8'), partial_mode='trailing-strings')
+            except ValueError:
+                continue
+            text = partial.get('answer') if isinstance(partial, dict) else None
+            if isinstance(text, str) and text.startswith(emitted) and len(text) > len(emitted):
+                delta, emitted = text[len(emitted):], text
+                yield delta
+        response = stream.get_final_completion()
+    if not response.choices or response.choices[0].finish_reason != 'stop':
+        raise HTTPException(502, "Ответ прервался. Квота не списана; повторите вопрос.")
+    answer, suggestions = answer_parts(response_text(response), question)
+    yield AIAnswer(answer, metadata=token_metadata(response, params['model']), memory_update=update,
+                   summary_usage=summary_usage, follow_up_suggestions=suggestions)
 
 
 def save_memory(db, user_id, chart_id, update):
