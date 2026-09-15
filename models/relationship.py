@@ -46,3 +46,23 @@ class RelationshipResponse(RelationshipSummary):
 class RelationshipListResponse(BaseModel):
     relationships: list[RelationshipSummary]
     count: int
+
+
+class RelationshipAsk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    question: str = Field(min_length=1, max_length=4000, pattern=r"\S")
+
+
+class RelationshipAnswer(BaseModel):
+    relationship_id: int
+    response: str
+    follow_up_suggestions: list[str] = Field(default_factory=list)
+
+
+class RelationshipMessageResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    relationship_id: int
+    role: str
+    content: str
+    created_at: datetime

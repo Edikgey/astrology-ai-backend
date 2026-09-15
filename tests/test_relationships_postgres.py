@@ -5,7 +5,7 @@ from uuid import uuid4
 from threading import Barrier
 from concurrent.futures import ThreadPoolExecutor
 import unittest
-from sqlalchemy import create_engine, text, inspect
+from sqlalchemy import create_engine, text, inspect, MetaData, Table, CheckConstraint, Index
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import IntegrityError, ProgrammingError
@@ -31,8 +31,21 @@ class RelationshipPostgresTests(unittest.TestCase):
             db.exec_driver_sql(f'CREATE SCHEMA "{self.schema}"')
         self.engine = create_engine(url, connect_args={'options': f'-csearch_path={self.schema}'})
         self.addCleanup(self.cleanup_schema)
-        self.tables = [t for t in fixtures.Base.metadata.sorted_tables if t.name != 'relationships']
-        fixtures.Base.metadata.create_all(self.engine, tables=self.tables)
+        legacy = MetaData()
+        for table in fixtures.Base.metadata.sorted_tables:
+            if table.name in ('relationships', 'relationship_messages', 'relationship_conversations'):
+                continue
+            if table.name == 'gpt_usage':
+                old = Table(table.name, legacy, *(c._copy() for c in table.columns
+                    if c.name not in ('relationship_id', 'source_relationship_message_id')))
+                old.c.chart_id.nullable = False
+                old.append_constraint(CheckConstraint("status IN ('reserved', 'succeeded', 'released')", name='ck_gpt_usage_status'))
+                old.append_constraint(CheckConstraint("plan IN ('free', 'premium')", name='ck_gpt_usage_plan'))
+                Index('ix_gpt_usage_account', old.c.user_id, old.c.status, old.c.period_start)
+            else:
+                table.to_metadata(legacy)
+        self.tables = legacy.sorted_tables
+        legacy.create_all(self.engine)
         self.sessions = sessionmaker(self.engine, autoflush=False)
         with self.sessions() as db:
             db.add_all([User(id=1, email='one@example.test', password_hash='unused'),
@@ -45,7 +58,7 @@ class RelationshipPostgresTests(unittest.TestCase):
                 db.add(ChartData(chart_id=identifier, bodies_for_circle=stored.bodies_for_circle,
                                  aspects_for_circle=[], houses=stored.houses, house_system='Placidus'))
                 db.add(GPTMessage(chart_id=identifier, role='gpt', content='Existing history'))
-            db.add(GPTUsage(user_id=1, chart_id=1, status='succeeded', plan='free'))
+            db.execute(legacy.tables['gpt_usage'].insert().values(user_id=1, chart_id=1, status='succeeded', plan='free'))
             db.commit()
         self.script = (Path(__file__).parents[1] / 'migrations/relationships.sql').read_text(encoding='utf-8')
         self.before = self.snapshot()
@@ -107,10 +120,17 @@ class RelationshipPostgresTests(unittest.TestCase):
 
     def test_failed_migration_rolls_back_all_new_objects(self):
         with self.engine.begin() as db:
+            db.exec_driver_sql('ALTER TABLE gpt_usage DROP COLUMN source_relationship_message_id, DROP COLUMN relationship_id')
+            db.exec_driver_sql('ALTER TABLE gpt_usage ALTER COLUMN chart_id SET NOT NULL')
+            db.exec_driver_sql('DROP TABLE relationship_messages, relationship_conversations')
             db.exec_driver_sql('DROP TABLE relationships')
         with self.assertRaises(ProgrammingError):
             self.apply(self.script.replace('COMMIT;', 'SELECT missing_relationship_test_column;\nCOMMIT;'))
         self.assertFalse(inspect(self.engine).has_table('relationships'))
+        self.assertFalse(inspect(self.engine).has_table('relationship_messages'))
+        columns = {c['name']: c for c in inspect(self.engine).get_columns('gpt_usage')}
+        self.assertNotIn('relationship_id', columns)
+        self.assertFalse(columns['chart_id']['nullable'])
         self.assertEqual(self.before, self.snapshot())
         self.apply(self.script)
 

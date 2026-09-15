@@ -37,7 +37,8 @@ class PostgreSQLUsageTests(unittest.TestCase):
         # Reconstruct the repository's pre-feature schema, then run the exact SQL.
         legacy = MetaData()
         for table in fixtures.Base.metadata.sorted_tables:
-            if table.name in ("gpt_usage", "paddle_checkouts", "paddle_events", "gpt_conversations", "relationships"):
+            if table.name in ("gpt_usage", "paddle_checkouts", "paddle_events", "gpt_conversations", "relationships",
+                              "relationship_messages", "relationship_conversations"):
                 continue
             if table.name == "users":
                 Table("users", legacy, *(col._copy() for col in table.columns if col.name not in
@@ -86,6 +87,7 @@ class PostgreSQLUsageTests(unittest.TestCase):
         self.apply_script(self.ai_script)
         self.birth_script = (Path(__file__).parents[1] / "migrations" / "birth_time_houses.sql").read_text(encoding="utf-8")
         self.apply_script(self.birth_script)
+        self.apply_script((Path(__file__).parents[1] / 'migrations/relationships.sql').read_text(encoding='utf-8'))
 
     def test_birth_migration_preserves_legacy_data_without_inventing_timezone(self):
         self.assertEqual(self.snapshot(), self.before)
@@ -202,8 +204,11 @@ class PostgreSQLUsageTests(unittest.TestCase):
         self.apply_script(self.script)
         self.apply_script(self.ai_script)
         self.assertEqual(self.snapshot(), self.before)
-        with self.sessions() as db:
-            self.assertEqual(usage.account_usage(db, 1)["gpt_messages_used"], 1)
+        # This deliberately reconstructed historical schema predates subject-aware ORM fields.
+        with self.engine.connect() as conn:
+            self.assertEqual(conn.execute(text(
+                "SELECT count(*) FROM gpt_usage WHERE user_id = 1 AND status = 'succeeded'"
+            )).scalar_one(), 1)
 
     def test_for_update_really_blocks_then_releases_the_waiting_reservation(self):
         ready = Event()

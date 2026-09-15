@@ -8,6 +8,7 @@ from uuid import uuid4
 from fastapi import HTTPException
 from sqlalchemy import exists
 from database.queries import User, NatalChart, GPTMessage, GPTUsage
+from modules.ai_subject import owned_subject, subject_fields, conversation_tables
 from modules.plans import plan_limits, effective_plan
 
 OPENAI_TIMEOUT_SECONDS = 60
@@ -88,12 +89,11 @@ def account_usage(db, user_id):
         raise
 
 
-def reserve(db, user_id, chart_id):
+def reserve(db, user_id, chart_id=None, *, relationship_id=None):
     try:
         user = locked_user(db, user_id)
-        chart = db.query(NatalChart).filter_by(id=chart_id).with_for_update().first()
-        if chart is None or chart.user_id != user_id:
-            raise HTTPException(404, detail="Карта больше недоступна.")
+        fields = subject_fields(chart_id, relationship_id)
+        owned_subject(db, user_id, chart_id, relationship_id, lock=True)
         backfill_user_history(db, user_id)
         now = utcnow()
         db.query(GPTUsage).filter(GPTUsage.user_id == user_id, GPTUsage.status == "reserved",
@@ -106,12 +106,12 @@ def reserve(db, user_id, chart_id):
             raise HTTPException(409, detail={"code": "GPT_LIMIT_REACHED", "plan": user.plan,
                 "used": state["gpt_messages_used"], "reserved": state["gpt_messages_reserved"],
                 "limit": state["gpt_messages_limit"], "message": "Достигнут лимит GPT-сообщений аккаунта."})
-        if db.query(GPTUsage).filter_by(user_id=user_id, chart_id=chart_id, status="reserved").filter(
+        if db.query(GPTUsage).filter_by(user_id=user_id, **fields, status="reserved").filter(
                 GPTUsage.expires_at > now).first():
             raise HTTPException(409, detail={"code": "GPT_REQUEST_IN_PROGRESS",
-                                            "message": "Дождитесь ответа на предыдущий вопрос этой карты."})
+                                            "message": "Дождитесь ответа на предыдущий вопрос этой карты." if relationship_id is None else "Дождитесь ответа на предыдущий вопрос этого анализа."})
         reservation_id = uuid4()
-        db.add(GPTUsage(id=reservation_id, user_id=user_id, chart_id=chart_id, status="reserved",
+        db.add(GPTUsage(id=reservation_id, user_id=user_id, **fields, status="reserved",
                         plan=user.plan, period_start=user.current_period_start if user.plan == "premium" else None,
                         period_end=user.current_period_end if user.plan == "premium" else None,
                         created_at=now, expires_at=now + RESERVATION_TTL))
@@ -125,24 +125,29 @@ def reserve(db, user_id, chart_id):
 def finalize(db, user_id, reservation_id, question, answer):
     try:
         locked_user(db, user_id)
-        item = db.query(GPTUsage).filter_by(id=reservation_id, user_id=user_id).with_for_update().one()
+        reservation = db.query(GPTUsage).filter_by(id=reservation_id, user_id=user_id)
+        item = reservation.populate_existing().one()
+        owned_subject(db, user_id, item.chart_id, item.relationship_id, lock=True)
+        item = reservation.populate_existing().with_for_update().one()
         if item.status != "reserved" or item.expires_at <= utcnow():
             raise HTTPException(409, detail={"code": "GPT_RESERVATION_EXPIRED",
                                             "message": "Запрос истёк. Квота не списана, повторите вопрос."})
-        chart = db.query(NatalChart).filter_by(id=item.chart_id, user_id=user_id).with_for_update().first()
-        if chart is None:
-            raise HTTPException(404, detail="Карта больше недоступна.")
-        user_message = GPTMessage(chart_id=chart.id, role="user", content=question, created_at=utcnow())
-        db.add_all([user_message, GPTMessage(chart_id=chart.id, role="gpt", content=answer, created_at=utcnow())])
+        fields = subject_fields(item.chart_id, item.relationship_id)
+        Message, _ = conversation_tables(item.relationship_id)
+        user_message = Message(**fields, role="user", content=question, created_at=utcnow())
+        db.add_all([user_message, Message(**fields, role="gpt", content=answer, created_at=utcnow())])
         db.flush()
         item.status = "succeeded"
-        item.source_message_id = user_message.id
+        if item.relationship_id is None:
+            item.source_message_id = user_message.id
+        else:
+            item.source_relationship_message_id = user_message.id
         from modules.ai_conversation import AIAnswer, save_memory
         if isinstance(answer, AIAnswer):
             for field, value in answer.metadata.items():
                 setattr(item, field, value)
             item.summary_usage = answer.summary_usage or None
-            save_memory(db, user_id, chart.id, answer.memory_update)
+            save_memory(db, user_id, item.chart_id, answer.memory_update, relationship_id=item.relationship_id)
         db.commit()
     except BaseException:
         db.rollback()

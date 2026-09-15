@@ -52,8 +52,10 @@ class GPTUsage(Base):
     __tablename__ = "gpt_usage"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    chart_id = Column(Integer, nullable=False)  # audit reference, not a cascading FK
+    chart_id = Column(Integer, nullable=True)  # durable subject references, not cascading FKs
+    relationship_id = Column(Integer, nullable=True)
     source_message_id = Column(Integer, ForeignKey("gpt_messages.id", ondelete="SET NULL"), unique=True, nullable=True)
+    source_relationship_message_id = Column(Integer, ForeignKey("relationship_messages.id", ondelete="SET NULL"), unique=True, nullable=True)
     status = Column(String, nullable=False)  # reserved / succeeded / released
     plan = Column(String, nullable=False)
     period_start = Column(DateTime, nullable=True)
@@ -66,9 +68,12 @@ class GPTUsage(Base):
     model = Column(String, nullable=True)
     summary_usage = Column(JSON, nullable=True)  # separate provider calls, never product quota
     __table_args__ = (
+        CheckConstraint("(chart_id IS NOT NULL AND relationship_id IS NULL) OR (chart_id IS NULL AND relationship_id IS NOT NULL)", name="ck_gpt_usage_subject"),
+        CheckConstraint("(source_message_id IS NULL OR chart_id IS NOT NULL) AND (source_relationship_message_id IS NULL OR relationship_id IS NOT NULL)", name="ck_gpt_usage_source_subject"),
         CheckConstraint("status IN ('reserved', 'succeeded', 'released')", name="ck_gpt_usage_status"),
         CheckConstraint("plan IN ('free', 'premium')", name="ck_gpt_usage_plan"),
         Index("ix_gpt_usage_account", "user_id", "status", "period_start"),
+        Index("ix_gpt_usage_relationship", "user_id", "relationship_id", "status"),
     )
 
 
@@ -187,3 +192,24 @@ class Relationship(Base):
               case((chart_a_id < chart_b_id, chart_a_id), else_=chart_b_id),
               case((chart_a_id < chart_b_id, chart_b_id), else_=chart_a_id), unique=True),
     )
+
+
+class RelationshipMessage(Base):
+    __tablename__ = "relationship_messages"
+    id = Column(Integer, primary_key=True)
+    relationship_id = Column(Integer, ForeignKey("relationships.id", ondelete="CASCADE"), nullable=False)
+    role = Column(String, nullable=False)
+    content = Column(String, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    __table_args__ = (
+        CheckConstraint("role IN ('user', 'gpt', 'assistant')", name="ck_relationship_messages_role"),
+        Index("ix_relationship_messages_subject_id", "relationship_id", "id"),
+    )
+
+
+class RelationshipConversation(Base):
+    __tablename__ = "relationship_conversations"
+    relationship_id = Column(Integer, ForeignKey("relationships.id", ondelete="CASCADE"), primary_key=True)
+    summary = Column(String, nullable=False)
+    through_message_id = Column(Integer, nullable=False)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)

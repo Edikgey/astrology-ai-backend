@@ -1,5 +1,5 @@
 """Authenticated saved-chart pairs. No quota or AI operations."""
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -8,6 +8,9 @@ from database.connection import get_db
 from database.queries import User, NatalChart, ChartData, Relationship
 from models.relationship import RelationshipCreate, RelationshipResponse, RelationshipListResponse
 from modules.synastry import build_synastry_snapshot, SynastryInputError
+from models.relationship import RelationshipAsk, RelationshipAnswer, RelationshipMessageResponse
+from modules.ai_subject import owned_subject
+from modules import usage
 
 router = APIRouter(prefix="/relationships", tags=["Relationships"])
 
@@ -105,3 +108,33 @@ def delete_relationship(relationship_id: int, current_user: User = Depends(get_c
         db.rollback()
         raise
     return Response(status_code=204)
+
+
+@router.get("/{relationship_id}/messages", response_model=list[RelationshipMessageResponse])
+def relationship_messages(relationship_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    from modules.ai_conversation import history_query
+    from database.queries import RelationshipMessage
+    return history_query(db, current_user.id, relationship_id=relationship_id).order_by(RelationshipMessage.id).all()
+
+
+@router.post("/{relationship_id}/ask", response_model=RelationshipAnswer,
+             responses={200: {"content": {"text/event-stream": {}}}})
+def ask_relationship(relationship_id: int, data: RelationshipAsk, request: Request,
+                     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    user_id = current_user.id
+    owned_subject(db, user_id, relationship_id=relationship_id)
+    reservation_id = usage.reserve(db, user_id, relationship_id=relationship_id)
+    try:
+        from modules.interpretation import client, OPENAI_PARAMS
+        if 'text/event-stream' in request.headers.get('accept', ''):
+            from modules.ai_stream import streaming_response
+            return streaming_response(db.get_bind(), user_id, None, data.question, reservation_id,
+                                      client, OPENAI_PARAMS, relationship_id=relationship_id)
+        from modules.ai_conversation import generate_answer
+        answer = generate_answer(db, user_id, None, data.question, client, OPENAI_PARAMS, relationship_id=relationship_id)
+        usage.finalize(db, user_id, reservation_id, data.question, answer)
+        return RelationshipAnswer(relationship_id=relationship_id, response=str(answer),
+                                  follow_up_suggestions=answer.follow_up_suggestions)
+    except BaseException:
+        usage.release(db, user_id, reservation_id)
+        raise

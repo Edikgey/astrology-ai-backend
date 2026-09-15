@@ -10,14 +10,14 @@ from modules import usage
 from modules.ai_conversation import AIAnswer, stream_answer
 
 
-def chat_events(bind, user_id, chart_id, question, reservation_id, client, params):
+def chat_events(bind, user_id, chart_id, question, reservation_id, client, params, *, relationship_id=None):
     # FastAPI may close its dependency session before the response is streamed.
     # This session belongs solely to the stream and is never used concurrently.
     with Session(bind=bind, autoflush=False) as db:
         settled = False
         try:
             yield {'type': 'start'}
-            with closing(stream_answer(db, user_id, chart_id, question, client, params)) as parts:
+            with closing(stream_answer(db, user_id, chart_id, question, client, params, **({"relationship_id": relationship_id} if relationship_id is not None else {}))) as parts:
                 for part in parts:
                     if isinstance(part, AIAnswer):
                         usage.finalize(db, user_id, reservation_id, question, part)
@@ -37,8 +37,8 @@ def chat_events(bind, user_id, chart_id, question, reservation_id, client, param
                 usage.release(db, user_id, reservation_id)
 
 
-def streaming_response(bind, user_id, chart_id, question, reservation_id, client, params):
-    worker = chat_events(bind, user_id, chart_id, question, reservation_id, client, params)
+def streaming_response(bind, user_id, chart_id, question, reservation_id, client, params, *, relationship_id=None):
+    worker = chat_events(bind, user_id, chart_id, question, reservation_id, client, params, relationship_id=relationship_id)
     # Prime the cleanup scope even if sending HTTP headers fails before iteration.
     start = next(worker)
 

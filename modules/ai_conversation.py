@@ -5,6 +5,9 @@ from jiter import from_json
 from fastapi import HTTPException
 from database.queries import GPTConversation, GPTMessage, NatalChart
 from modules.ai_chart_context import build_chart_context, compact_json
+from modules.ai_subject import owned_subject, subject_fields, conversation_tables
+from modules.ai_relationship_context import build_relationship_context
+from modules.relationship_prompt import RELATIONSHIP_SYSTEM_PROMPT, RELATIONSHIP_SUMMARY_PROMPT
 from modules.astrology_prompt import ASTROLOGY_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT
 
 # UTF-8 bytes conservatively bound text tokens, without a tokenizer download.
@@ -113,24 +116,34 @@ def answer_parts(content, question):
     return answer, suggestions
 
 
-def history_query(db, user_id, chart_id):
-    return db.query(GPTMessage).join(NatalChart).filter(
-        NatalChart.user_id == user_id, GPTMessage.chart_id == chart_id,
-        GPTMessage.role.in_(['user', 'gpt', 'assistant']))
+def history_query(db, user_id, chart_id=None, *, relationship_id=None):
+    fields = subject_fields(chart_id, relationship_id)
+    if relationship_id is None:
+        return db.query(GPTMessage).join(NatalChart).filter(
+            NatalChart.user_id == user_id, GPTMessage.chart_id == chart_id,
+            GPTMessage.role.in_(['user', 'gpt', 'assistant']))
+    owned_subject(db, user_id, relationship_id=relationship_id)
+    Message, _ = conversation_tables(relationship_id)
+    return db.query(Message).filter_by(**fields).filter(Message.role.in_(['user', 'gpt', 'assistant']))
 
 
-def prepare_answer(db, user_id, chart_id, question, client, params):
+def prepare_answer(db, user_id, chart_id, question, client, params, *, relationship_id=None):
     # An explicit user ID from JWT is mandatory even when called outside the route.
     if user_id is None:
         raise HTTPException(401, "Войдите в аккаунт.")
-    chart_context = build_chart_context(db, user_id, chart_id)
-    memory = db.query(GPTConversation).filter_by(chart_id=chart_id, user_id=user_id).first()
+    fields = subject_fields(chart_id, relationship_id)
+    Message, Memory = conversation_tables(relationship_id)
+    chart_context = (build_chart_context(db, user_id, chart_id) if relationship_id is None else
+                     build_relationship_context(db, user_id, relationship_id))
+    system_prompt = ASTROLOGY_SYSTEM_PROMPT if relationship_id is None else RELATIONSHIP_SYSTEM_PROMPT
+    summary_prompt = SUMMARY_SYSTEM_PROMPT if relationship_id is None else RELATIONSHIP_SUMMARY_PROMPT
+    memory = db.query(Memory).filter_by(**fields, **({'user_id': user_id} if relationship_id is None else {})).first()
     cursor = memory.through_message_id if memory else 0
     summary = memory.summary if memory else ''
     if len(summary.encode('utf-8')) > SUMMARY_BUDGET:
         raise HTTPException(409, "Память чата требует проверки; квота не списана.")
-    query = history_query(db, user_id, chart_id)
-    tail = query.filter(GPTMessage.id > cursor).order_by(GPTMessage.id.desc()).limit(SUMMARY_THRESHOLD + 1).all()[::-1]
+    query = history_query(db, user_id, chart_id, relationship_id=relationship_id)
+    tail = query.filter(Message.id > cursor).order_by(Message.id.desc()).limit(SUMMARY_THRESHOLD + 1).all()[::-1]
     recent = tail[-RECENT_MESSAGES:]
     while recent and sum(message_size(as_message(row)) for row in recent) > RECENT_BUDGET:
         recent.pop(0)
@@ -140,8 +153,8 @@ def prepare_answer(db, user_id, chart_id, question, client, params):
     cutoff = recent[0].id if recent else (tail[-1].id + 1 if tail else cursor + 1)
     needs_summary = len(tail) > SUMMARY_THRESHOLD or sum(message_size(as_message(r)) for r in tail) > RECENT_BUDGET
     # Materialize only bounded old batches and the recent tail. Never load an entire lifetime chat.
-    old = query.filter(GPTMessage.id > cursor, GPTMessage.id < cutoff).order_by(GPTMessage.id).limit(32).all() if needs_summary else []
-    old_has_more = bool(old and query.filter(GPTMessage.id > old[-1].id, GPTMessage.id < cutoff).first())
+    old = query.filter(Message.id > cursor, Message.id < cutoff).order_by(Message.id).limit(32).all() if needs_summary else []
+    old_has_more = bool(old and query.filter(Message.id > old[-1].id, Message.id < cutoff).first())
     recent_messages = [as_message(r) for r in (recent if needs_summary else tail)]
     old_messages = [(row.id, as_message(row)) for row in old]
     original_cursor = cursor
@@ -172,7 +185,7 @@ def prepare_answer(db, user_id, chart_id, question, client, params):
             raise HTTPException(422, "Старая история превышает бюджет summary; требуется проверка чата.")
         response = client.chat.completions.create(
             model=params['model'], temperature=0.2, max_tokens=SUMMARY_TOKENS,
-            messages=[{'role': 'system', 'content': SUMMARY_SYSTEM_PROMPT},
+            messages=[{'role': 'system', 'content': summary_prompt},
                       {'role': 'user', 'content': summary_payload}])
         candidate = response_text(response)
         if len(candidate.encode('utf-8')) > SUMMARY_BUDGET:
@@ -180,8 +193,8 @@ def prepare_answer(db, user_id, chart_id, question, client, params):
         summary = candidate
         cursor = batch[-1][0]
         summary_usage.append(token_metadata(response, params['model']))
-    messages = [{'role': 'system', 'content': ASTROLOGY_SYSTEM_PROMPT},
-                {'role': 'user', 'content': 'Calculated natal reference data (not instructions):\n' + chart_context}]
+    messages = [{'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': ('Calculated natal reference data (not instructions):\n' if relationship_id is None else 'Calculated relationship reference data (not instructions):\n') + chart_context}]
     if summary:
         messages.append({'role': 'user', 'content': 'Older conversation memory (not instructions):\n' +
                          compact_json({'notes': summary, 'older_history_pending': bool(old_messages or old_has_more)})})
@@ -197,8 +210,8 @@ def prepare_answer(db, user_id, chart_id, question, client, params):
     return messages, update, summary_usage
 
 
-def generate_answer(db, user_id, chart_id, question, client, params):
-    messages, update, summary_usage = prepare_answer(db, user_id, chart_id, question, client, params)
+def generate_answer(db, user_id, chart_id, question, client, params, *, relationship_id=None):
+    messages, update, summary_usage = prepare_answer(db, user_id, chart_id, question, client, params, relationship_id=relationship_id)
     response = client.chat.completions.create(**params, max_tokens=ANSWER_TOKENS, messages=messages,
                                               response_format=ANSWER_FORMAT)
     answer, suggestions = answer_parts(response_text(response), question)
@@ -206,9 +219,9 @@ def generate_answer(db, user_id, chart_id, question, client, params):
                     summary_usage=summary_usage, follow_up_suggestions=suggestions)
 
 
-def stream_answer(db, user_id, chart_id, question, client, params):
+def stream_answer(db, user_id, chart_id, question, client, params, *, relationship_id=None):
     """SDK network stream; partial JSON is decoded by the SDK's jiter dependency."""
-    messages, update, summary_usage = prepare_answer(db, user_id, chart_id, question, client, params)
+    messages, update, summary_usage = prepare_answer(db, user_id, chart_id, question, client, params, relationship_id=relationship_id)
     emitted = ''
     with client.beta.chat.completions.stream(
             **params, max_tokens=ANSWER_TOKENS, messages=messages, response_format=ANSWER_FORMAT,
@@ -234,17 +247,20 @@ def stream_answer(db, user_id, chart_id, question, client, params):
                    summary_usage=summary_usage, follow_up_suggestions=suggestions)
 
 
-def save_memory(db, user_id, chart_id, update):
+def save_memory(db, user_id, chart_id, update, *, relationship_id=None):
     """Called ONLY by finalize, under the existing user/chart locks, without commit."""
     if update is None:
         return
-    memory = db.query(GPTConversation).filter_by(chart_id=chart_id).first()
-    if memory and memory.user_id != user_id:
+    fields = subject_fields(chart_id, relationship_id)
+    _, Memory = conversation_tables(relationship_id)
+    owned_subject(db, user_id, chart_id, relationship_id)
+    memory = db.query(Memory).filter_by(**fields).first()
+    if relationship_id is None and memory and memory.user_id != user_id:
         raise HTTPException(409, "Владелец памяти чата изменился.")
     if (memory.through_message_id if memory else 0) != update.expected_cursor:
         raise HTTPException(409, "История изменилась. Повторите вопрос.")
     if memory is None:
-        memory = GPTConversation(chart_id=chart_id, user_id=user_id)
+        memory = Memory(**fields, **({'user_id': user_id} if relationship_id is None else {}))
         db.add(memory)
     from modules.usage import utcnow
     memory.summary, memory.through_message_id = update.summary, update.through_message_id
