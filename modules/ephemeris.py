@@ -4,6 +4,7 @@ import numpy as np
 import swisseph as swe
 from astroquery.jplhorizons import Horizons
 import ephem
+from modules.cusp_math import house_for_longitude
 
 
 
@@ -295,32 +296,8 @@ class Ephemeris:
 
             absolute_degree = base_degree + degree  # Убираем % 360
 
-        absolute_degree %= 360
-
-        # ✅ Получаем куспиды домов
         cusps = [houses[f"Дом {i}"] for i in range(1, 13)]
-        # Normalize wraparound without moving a value on a cusp into the preceding
-        # house due solely to floating-point modulo error (sub-microarcsecond).
-        for i, cusp in enumerate(cusps):
-            if abs((absolute_degree - cusp + 180) % 360 - 180) < 1e-10:
-                return i + 1
-
-        # ✅ Определяем дом по куспидам
-        for i in range(12):
-            start = cusps[i]
-            end = cusps[(i + 1) % 12]  # Следующий дом
-
-            # 📌 Корректный алгоритм для перехода через 360° → 0°
-            if start > end:  # Например, 330° → 20°
-                if start <= absolute_degree or absolute_degree < end:
-                   
-                    return i + 1  # Возвращаем номер дома
-            else:
-                if start <= absolute_degree < end:
-                    
-                    return i + 1
-
-        return 12  # Если не найден, считаем, что объект в 12 доме
+        return house_for_longitude(absolute_degree, cusps)
 
 
     def get_key_points(self):

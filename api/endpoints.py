@@ -15,6 +15,8 @@ from modules.interpretation import ChartInterpreter
 from uuid import UUID
 from modules.chart_limits import saved_chart_limit
 from modules import usage
+from database.queries import Relationship
+from sqlalchemy import or_
 import asyncio
 
 
@@ -238,6 +240,10 @@ def delete_natal_chart(
     if chart is None:
         raise HTTPException(status_code=404, detail="❌ Карта не найдена")
     try:
+        if db.query(Relationship.id).filter(or_(Relationship.chart_a_id == chart_id,
+                                                Relationship.chart_b_id == chart_id)).first():
+            raise HTTPException(409, detail={"code": "RELATIONSHIP_DEPENDENCIES_EXIST",
+                "message": "Карта используется в анализе отношений. Сначала удалите связанные анализы отношений."})
         usage.backfill_user_history(db, current_user.id)
         for model in (GPTConversation, GPTMessage, ChartInterpretationData, ChartData):
             db.query(model).filter(model.chart_id == chart_id).delete(synchronize_session=False)

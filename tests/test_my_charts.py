@@ -594,7 +594,8 @@ class MyChartsTests(unittest.TestCase):
             response = self.client.post("/ask-gpt", headers={**self.owner, "X-Session-Token": "ignored-invalid-token"},
                                         json={"chart_id": chart_id, "question": "Authenticated question"})
             self.assertEqual(response.status_code, 200, response.text)
-            self.assertEqual(response.json(), {"chart_id": chart_id, "response": "Mock OpenAI answer"})
+            self.assertEqual(response.json(), {"chart_id": chart_id, "response": "Mock OpenAI answer",
+                                               "follow_up_suggestions": []})
             openai.assert_called_once()
         history = self.client.get(f"/gpt-messages?chart_id={chart_id}", headers=self.owner)
         self.assertEqual(history.status_code, 200, history.text)

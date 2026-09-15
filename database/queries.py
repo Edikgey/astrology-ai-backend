@@ -1,8 +1,8 @@
-from sqlalchemy import JSON, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, CheckConstraint, Index
+from sqlalchemy import JSON, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, CheckConstraint, Index, case, text
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from database.connection import Base
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 import uuid
 
 class User(Base):
@@ -161,3 +161,29 @@ class ChartInterpretationData(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     chart = relationship("NatalChart", back_populates="interpretation_data")
+
+
+class Relationship(Base):
+    __tablename__ = "relationships"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    chart_a_id = Column(Integer, ForeignKey("natal_charts.id", ondelete="RESTRICT"), nullable=False)
+    chart_b_id = Column(Integer, ForeignKey("natal_charts.id", ondelete="RESTRICT"), nullable=False)
+    person_a_label = Column(String(100), nullable=False)
+    person_b_label = Column(String(100), nullable=False)
+    speaker_person = Column(String(1), nullable=True)
+    calculation = Column(JSON().with_variant(JSONB(), "postgresql"), nullable=False)
+    ruleset_version = Column(String(50), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=text("CURRENT_TIMESTAMP"))
+    __table_args__ = (
+        CheckConstraint("chart_a_id <> chart_b_id", name="ck_relationships_distinct_charts"),
+        CheckConstraint("speaker_person IN ('A', 'B')", name="ck_relationships_speaker"),
+        CheckConstraint("length(trim(person_a_label)) BETWEEN 1 AND 100 AND length(trim(person_b_label)) BETWEEN 1 AND 100",
+                        name="ck_relationships_labels"),
+        Index("ix_relationships_owner", "user_id", "id"),
+        Index("ix_relationships_chart_a", "chart_a_id"),
+        Index("ix_relationships_chart_b", "chart_b_id"),
+        Index("uq_relationships_owner_pair", user_id,
+              case((chart_a_id < chart_b_id, chart_a_id), else_=chart_b_id),
+              case((chart_a_id < chart_b_id, chart_b_id), else_=chart_a_id), unique=True),
+    )

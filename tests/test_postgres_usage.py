@@ -37,7 +37,7 @@ class PostgreSQLUsageTests(unittest.TestCase):
         # Reconstruct the repository's pre-feature schema, then run the exact SQL.
         legacy = MetaData()
         for table in fixtures.Base.metadata.sorted_tables:
-            if table.name in ("gpt_usage", "paddle_checkouts", "paddle_events", "gpt_conversations"):
+            if table.name in ("gpt_usage", "paddle_checkouts", "paddle_events", "gpt_conversations", "relationships"):
                 continue
             if table.name == "users":
                 Table("users", legacy, *(col._copy() for col in table.columns if col.name not in
