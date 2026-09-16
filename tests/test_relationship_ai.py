@@ -70,9 +70,11 @@ class RelationshipAITests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         provider.assert_called_once()
         self.assertEqual(response.json()['relationship_id'], rid)
+        self.assertEqual(response.json()['follow_up_suggestions'], SUGGESTIONS)
         history = self.client.get(f'/relationships/{rid}/messages', headers=self.owner).json()
         self.assertEqual([r['role'] for r in history], ['user', 'gpt'])
         self.assertTrue(all(r['relationship_id'] == rid and 'chart_id' not in r for r in history))
+        self.assertTrue(all('follow_up_suggestions' not in r for r in history))
         with self.sessions() as db:
             self.assertEqual(db.query(GPTMessage).count(), 0)
             row = db.query(GPTUsage).one()

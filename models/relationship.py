@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Literal
 import unicodedata
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from models.follow_up import FollowUpSuggestion
 
 
 class RelationshipCreate(BaseModel):
@@ -56,7 +57,7 @@ class RelationshipAsk(BaseModel):
 class RelationshipAnswer(BaseModel):
     relationship_id: int
     response: str
-    follow_up_suggestions: list[str] = Field(default_factory=list)
+    follow_up_suggestions: list[FollowUpSuggestion] = Field(default_factory=list)
 
 
 class RelationshipMessageResponse(BaseModel):

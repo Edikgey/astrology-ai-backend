@@ -24,7 +24,11 @@ class AIConversationTests(unittest.TestCase):
 
     def test_structured_answer_suggestions_use_one_call_and_one_quota_unit(self):
         chart_id = self.chart()
-        suggestions = ['Как проявляется моё лидерство?', 'Что мешает мне развиваться?', 'Как это связано с деньгами?']
+        suggestions = [
+            {'type': 'deepen', 'text': 'Что усиливает моё стремление к самостоятельности?'},
+            {'type': 'personalize', 'text': 'Как мне применять это в рабочих решениях?'},
+            {'type': 'explore', 'text': 'Как это связано с деньгами?'},
+        ]
         before = self.client.get('/account/usage', headers=self.owner).json()['gpt_messages_used']
         payload = {'answer': 'В работе важна самостоятельность.', 'follow_up_suggestions': suggestions}
         with patch('modules.interpretation.client.chat.completions.create', return_value=reply(json.dumps(payload))) as api:
@@ -71,7 +75,11 @@ class AIConversationTests(unittest.TestCase):
     def test_summary_remains_plain_and_receives_only_answer_history(self):
         chart_id = self.chart()
         self.long_chat(chart_id)
-        payload = {'answer': 'Continue the topic.', 'follow_up_suggestions': ['What helps me grow?', 'How can I lead?', 'How does this affect relationships?']}
+        payload = {'answer': 'Continue the topic.', 'follow_up_suggestions': [
+            {'type': 'deepen', 'text': 'What makes this pattern stronger?'},
+            {'type': 'personalize', 'text': 'How can I notice this at work?'},
+            {'type': 'explore', 'text': 'How does this affect relationships?'},
+        ]}
         with patch('modules.interpretation.client.chat.completions.create',
                    side_effect=[reply('Existing memory'), reply(json.dumps(payload))]) as api:
             result = self.ask(chart_id)
@@ -79,6 +87,7 @@ class AIConversationTests(unittest.TestCase):
             self.assertEqual(api.call_count, 2)  # Existing memory call + one answer, never a suggestions call.
             self.assertNotIn('response_format', api.call_args_list[0].kwargs)
             self.assertIn('Existing memory', str(api.call_args_list[1].kwargs['messages']))
+            self.assertEqual(result.json()['follow_up_suggestions'], payload['follow_up_suggestions'])
         self.assertEqual(self.snapshot(chart_id)[0][-1], ('gpt', payload['answer']))
 
     def ask(self, chart_id, question='А как это проявляется в отношениях?', headers=None):

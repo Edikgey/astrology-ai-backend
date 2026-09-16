@@ -3,6 +3,8 @@ from dataclasses import dataclass
 import json
 from jiter import from_json
 from fastapi import HTTPException
+from pydantic import ValidationError
+from models.follow_up import FOLLOW_UP_TYPES, FollowUpSuggestion
 from database.queries import GPTConversation, GPTMessage, NatalChart
 from modules.ai_chart_context import build_chart_context, compact_json
 from modules.ai_subject import owned_subject, subject_fields, conversation_tables
@@ -32,8 +34,8 @@ ANSWER_FORMAT = {
             'properties': {
                 'answer': {'type': 'string'},
                 'follow_up_suggestions': {
-                    'type': 'array', 'items': {'type': 'string'},
-                    'minItems': 3, 'maxItems': 4,
+                    'type': 'array', 'items': FollowUpSuggestion.model_json_schema(),
+                    'minItems': 3, 'maxItems': 3,
                 },
             },
             'required': ['answer', 'follow_up_suggestions'],
@@ -101,19 +103,21 @@ def answer_parts(content, question):
         raise HTTPException(502, "AI не вернул ответ. Квота не списана.")
     answer = payload['answer'].strip()
     candidates = payload.get('follow_up_suggestions')
-    if not isinstance(candidates, list) or not 3 <= len(candidates) <= 4:
+    if not isinstance(candidates, list) or len(candidates) != 3:
         return answer, []
-    suggestions, seen = [], {question.strip().casefold().rstrip('?!., ')}
+    suggestions, seen = {}, {question.strip().casefold().rstrip('?!., ')}
     for item in candidates:
-        if not isinstance(item, str) or not item.strip() or len(item.strip()) > 100 or '\n' in item:
+        try:
+            suggestion = FollowUpSuggestion.model_validate(item)
+        except ValidationError:
             return answer, []
-        item = item.strip()
-        key = item.casefold().rstrip('?!., ')
-        if key in seen:
+        key = suggestion.text.casefold().rstrip('?!., ')
+        if key in seen or suggestion.type in suggestions:
             return answer, []
         seen.add(key)
-        suggestions.append(item)
-    return answer, suggestions
+        suggestions[suggestion.type] = suggestion.model_dump()
+    # Every type must occur once. Canonical order keeps both chat UIs predictable.
+    return answer, [suggestions[kind] for kind in FOLLOW_UP_TYPES]
 
 
 def history_query(db, user_id, chart_id=None, *, relationship_id=None):

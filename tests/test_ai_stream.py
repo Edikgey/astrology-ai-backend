@@ -13,7 +13,11 @@ from modules.ai_stream import chat_events, streaming_response
 from modules.interpretation import client, OPENAI_PARAMS
 
 
-SUGGESTIONS = ['Как мне применить это в работе?', 'Как это влияет на мои отношения?', 'Что мне мешает развиваться?']
+SUGGESTIONS = [
+    {'type': 'deepen', 'text': 'Что усиливает эту реакцию?'},
+    {'type': 'personalize', 'text': 'Как мне заметить это в повседневной жизни?'},
+    {'type': 'explore', 'text': 'Как это связано с доверием?'},
+]
 
 
 class ProviderStream:

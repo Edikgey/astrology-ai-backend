@@ -2,6 +2,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field, model_validator
 from typing import List, Dict, Literal, Optional, Union
 from uuid import UUID
+from models.follow_up import FollowUpSuggestion
 
 
 class BodyData(BaseModel):
@@ -104,7 +105,7 @@ class NatalChartListResponse(BaseModel):
 class GPTInterpretationResponse(BaseModel):
     chart_id: int
     response: str
-    follow_up_suggestions: List[str] = Field(default_factory=list)
+    follow_up_suggestions: List[FollowUpSuggestion] = Field(default_factory=list)
 
 class ChartIdRequest(BaseModel):
     chart_id: int
