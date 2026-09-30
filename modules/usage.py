@@ -81,7 +81,13 @@ def account_usage(db, user_id):
                       subscription_status=user.subscription_status,
                       scheduled_cancel_at=user.scheduled_cancel_at,
                       cancel_at_period_end=user.scheduled_cancel_at is not None,
-                      can_manage_subscription=bool(user.payment_provider == "paddle" and user.provider_customer_id))
+                      can_manage_subscription=bool(user.payment_provider == "paddle" and user.provider_customer_id),
+                      payment_provider=user.payment_provider,
+                      can_cancel_subscription=bool(user.payment_provider == "lava" and user.provider_subscription_id
+                                                   and user.subscription_status in ("active", "past_due")
+                                                   and not user.scheduled_cancel_at))
+        from modules.lava_client import configured
+        result["lava_checkout_available"] = configured()
         db.commit()
         return result
     except BaseException:

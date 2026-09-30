@@ -62,7 +62,7 @@ class GoogleAuthTests(unittest.TestCase):
         hashed = get_password_hash('existing-password')
         with self.sessions() as db:
             user = db.get(User, 1); user.password_hash = hashed
-            user.plan = 'premium'; user.provider_customer_id = 'customer'; user.subscription_status = 'active'
+            user.plan = 'premium'; user.payment_provider = 'paddle'; user.provider_customer_id = 'customer'; user.subscription_status = 'active'
             db.commit()
         response = self.login(credential(email='a@example.com', hd='example.com'))
         self.assertEqual(response.status_code, 200, response.text)

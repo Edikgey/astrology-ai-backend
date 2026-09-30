@@ -1,12 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from api import endpoints, auth, payments, relationships
+from api import endpoints, auth, payments, relationships, lava_payments
 
 api_app = FastAPI()
 
 api_app.include_router(auth.router)
 api_app.include_router(endpoints.router)
 api_app.include_router(payments.router)
+api_app.include_router(lava_payments.router)
 api_app.include_router(relationships.router)
 
 # Wrap ServerErrorMiddleware too, so unhandled 500s retain CORS headers.

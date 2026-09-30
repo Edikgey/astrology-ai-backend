@@ -16,8 +16,9 @@ from paddle_billing.Resources.CustomerPortalSessions.Operations import CreateCus
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from database.queries import User, PaddleCheckout, PaddleEvent
-from modules.usage import locked_user, apply_plan
+from database.queries import User, PaddleCheckout, PaddleEvent, LavaCheckout
+from modules.usage import locked_user
+from modules.subscription_access import apply_subscription_access
 
 EVENTS = {"subscription." + suffix for suffix in
           ("created", "updated", "activated", "resumed", "past_due", "paused", "canceled")}
@@ -66,6 +67,12 @@ def create_checkout(db, user_id):
     price_id, client = premium_price_id(), paddle_client()
     try:
         user = locked_user(db, user_id)
+        # The current schema has one billing owner per account. Switching it
+        # needs an explicit migration policy, not an incidental checkout.
+        if user.payment_provider not in (None, "paddle"):
+            raise HTTPException(409, "Account billing is managed by another provider")
+        if db.query(LavaCheckout).filter_by(user_id=user_id).filter(LavaCheckout.state.in_(("creating", "ready"))).first():
+            raise HTTPException(409, "Уже начата оплата через Lava. Обратитесь в поддержку.")
         if user.plan == "premium" or user.subscription_status in ("active", "past_due", "paused", "trialing"):
             raise HTTPException(409, "Use Manage subscription for your existing subscription")
         checkout = db.query(PaddleCheckout).filter_by(user_id=user_id).order_by(PaddleCheckout.created_at.desc()).first()
@@ -125,9 +132,12 @@ def sync_subscription(db, event):
     if not re.fullmatch(r"sub_[a-z0-9]{26}", subscription_id) or not re.fullmatch(r"ctm_[a-z0-9]{26}", customer_id):
         raise ValueError("Invalid provider IDs")
     custom = data.get("custom_data") or {}
-    known = db.query(User).filter_by(provider_subscription_id=subscription_id).first()
+    known = db.query(User).filter_by(payment_provider="paddle", provider_subscription_id=subscription_id).first()
     if known:
         user = locked_user(db, known.id)
+        # Recheck after acquiring the lock: billing ownership may have changed.
+        if user.payment_provider != "paddle":
+            return "ignored_other_provider"
         if user.provider_customer_id != customer_id:
             raise ValueError("Customer ownership mismatch")
         if custom.get("user_id") is not None and str(custom["user_id"]) != str(user.id):
@@ -138,6 +148,8 @@ def sync_subscription(db, event):
         if not checkout or str(custom.get("user_id")) != str(checkout.user_id):
             raise ValueError("Unknown checkout owner")
         user = locked_user(db, checkout.user_id)
+        if user.payment_provider not in (None, "paddle"):
+            return "ignored_other_provider"
         # Refresh after the user lock: another event may have bound the checkout.
         db.refresh(checkout)
         if checkout.subscription_id and checkout.subscription_id != subscription_id:
@@ -148,7 +160,7 @@ def sync_subscription(db, event):
         if user.provider_customer_id and user.provider_customer_id != customer_id:
             raise ValueError("Customer ownership mismatch")
         # Do not associate this Paddle customer with a different local account.
-        owner = db.query(User).filter_by(provider_customer_id=customer_id).first()
+        owner = db.query(User).filter_by(payment_provider="paddle", provider_customer_id=customer_id).first()
         if owner and owner.id != user.id:
             raise ValueError("Customer already owned")
         checkout.subscription_id = subscription_id
@@ -162,19 +174,22 @@ def sync_subscription(db, event):
     items = data.get("items") or []
     eligible = len(items) == 1 and items[0].get("quantity") == 1 and (
         items[0].get("price", {}).get("id") == premium_price_id())
+    decision, start, end = "retain", None, None
     if status == "active" and eligible:
         period = data.get("current_billing_period") or {}
         start, end = utc_date(period.get("starts_at")), utc_date(period.get("ends_at"))
         cycle = data.get("billing_cycle") or {}
         if cycle != {"interval": "month", "frequency": 1}:
             raise ValueError("Unexpected billing cycle")
-        apply_plan(db, user, "premium", start, end)
+        decision = "grant"
     elif status in ("canceled", "paused") or not eligible or status == "trialing":
-        apply_plan(db, user, "free")
+        decision = "revoke"
     # past_due preserves the last confirmed period, never grants a new unpaid
     # period. Existing GPT_PERIOD_INVALID fail-safe applies after that period.
     change = data.get("scheduled_change") or {}
-    user.scheduled_cancel_at = utc_date(change["effective_at"]) if change.get("action") == "cancel" else None
+    cancel_at = utc_date(change["effective_at"]) if change.get("action") == "cancel" else None
+    apply_subscription_access(db, user, decision, period_start=start, period_end=end,
+                              scheduled_cancel_at=cancel_at)
     user.payment_provider = "paddle"
     user.provider_customer_id = customer_id
     user.provider_subscription_id = subscription_id
@@ -191,7 +206,7 @@ def process_event(db, event):
         occurred = utc_date(event["occurred_at"])
         insert = pg_insert if db.bind.dialect.name == "postgresql" else sqlite_insert
         result = db.execute(insert(PaddleEvent).values(event_id=event_id, event_type=event_type,
-            occurred_at=occurred, processed_at=datetime.utcnow(), outcome="processed"
+            provider="paddle", occurred_at=occurred, processed_at=datetime.utcnow(), outcome="processed"
         ).on_conflict_do_nothing(index_elements=["event_id"]))
         if result.rowcount == 0:
             db.commit()

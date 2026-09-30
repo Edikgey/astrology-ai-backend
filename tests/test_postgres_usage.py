@@ -37,7 +37,7 @@ class PostgreSQLUsageTests(unittest.TestCase):
         # Reconstruct the repository's pre-feature schema, then run the exact SQL.
         legacy = MetaData()
         for table in fixtures.Base.metadata.sorted_tables:
-            if table.name in ("gpt_usage", "paddle_checkouts", "paddle_events", "gpt_conversations", "relationships",
+            if table.name in ("gpt_usage", "paddle_checkouts", "paddle_events", "lava_checkouts", "gpt_conversations", "relationships",
                               "relationship_messages", "relationship_conversations"):
                 continue
             if table.name == "users":
@@ -83,6 +83,8 @@ class PostgreSQLUsageTests(unittest.TestCase):
         self.apply_script(self.script)
         self.paddle_script = (Path(__file__).parents[1] / "migrations" / "paddle_billing.sql").read_text(encoding="utf-8")
         self.apply_script(self.paddle_script)
+        self.lava_script = (Path(__file__).parents[1] / "migrations/lava_billing.sql").read_text(encoding="utf-8")
+        self.apply_script(self.lava_script)
         self.ai_script = (Path(__file__).parents[1] / "migrations" / "ai_conversation.sql").read_text(encoding="utf-8")
         self.apply_script(self.ai_script)
         self.birth_script = (Path(__file__).parents[1] / "migrations" / "birth_time_houses.sql").read_text(encoding="utf-8")

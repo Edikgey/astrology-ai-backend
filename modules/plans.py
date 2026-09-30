@@ -20,8 +20,7 @@ PLAN_LIMITS = {
 def effective_plan(user, now=None):
     # Enforce a confirmed scheduled end even when the final webhook is delayed.
     # Unscheduled expiry keeps the existing Premium-period fail-safe unchanged.
-    if (getattr(user, "payment_provider", None) == "paddle" and
-            getattr(user, "scheduled_cancel_at", None) and
+    if (getattr(user, "scheduled_cancel_at", None) and
             user.scheduled_cancel_at <= (now or datetime.utcnow())):
         return "free"
     return user.plan

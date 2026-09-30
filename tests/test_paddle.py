@@ -12,7 +12,7 @@ from unittest.mock import patch, Mock
 from uuid import uuid4
 from sqlalchemy import event as sql_event
 import test_my_charts as fixtures
-from database.queries import User, PaddleCheckout, PaddleEvent, GPTUsage
+from database.queries import User, PaddleCheckout, PaddleEvent, GPTUsage, LavaCheckout
 from modules import usage
 
 PRICE = "pri_01m2aaqxhr6prath62z1efsvvn"
@@ -206,6 +206,52 @@ class PaddleTests(unittest.TestCase):
     def test_live_key_fails_closed(self):
         with patch.dict(os.environ,{"PADDLE_SANDBOX_API_KEY":"pdl_live_apikey_not-real"}):
             self.assertEqual(self.client.post("/payments/paddle/checkout",headers=self.other).status_code,503)
+
+    def test_lava_pending_invoice_blocks_paddle_creation(self):
+        with self.sessions() as db:
+            db.add(LavaCheckout(user_id=2, offer_id=str(uuid4()), product_id=str(uuid4()),
+                                buyer_email="b@example.test", state="creating")); db.commit()
+        sdk = Mock()
+        with patch("modules.paddle_billing.paddle_client", return_value=sdk):
+            self.assertEqual(self.client.post("/payments/paddle/checkout", headers=self.other).status_code, 409)
+            sdk.transactions.create.assert_not_called()
+
+    def test_other_provider_cannot_be_overwritten_by_paddle_or_open_checkout(self):
+        # IDs deliberately collide: a provider name, not an ID shape, owns billing.
+        with self.sessions() as db:
+            user = db.get(User, 1)
+            user.payment_provider = "test-provider"
+            user.provider_customer_id = CUSTOMER
+            user.provider_subscription_id = SUB
+            user.subscription_status = "canceled"
+            usage.apply_plan(db, user, "premium", self.start, self.end)
+            db.commit()
+        event = self.payload("canceled")
+        self.assertEqual(self.send(event).json()["outcome"], "ignored_other_provider")
+        self.assertEqual(self.send(event).json()["outcome"], "duplicate")
+        with self.sessions() as db:
+            user = db.get(User, 1)
+            self.assertEqual((user.plan, user.payment_provider), ("premium", "test-provider"))
+            self.assertIsNone(user.paddle_updated_at)
+            self.assertEqual(db.get(PaddleCheckout, self.binding).state, "ready")
+        sdk = Mock()
+        with patch("modules.paddle_billing.paddle_client", return_value=sdk):
+            self.assertEqual(self.client.post("/payments/paddle/checkout", headers=self.owner).status_code, 409)
+            self.assertEqual(self.client.post("/payments/paddle/portal", headers=self.owner).status_code, 409)
+            sdk.transactions.create.assert_not_called()
+            sdk.customer_portal_sessions.create.assert_not_called()
+
+    def test_other_provider_matching_subscription_without_binding_is_not_an_owner(self):
+        with self.sessions() as db:
+            user = db.get(User, 1)
+            user.payment_provider = "test-provider"
+            user.provider_customer_id = CUSTOMER
+            user.provider_subscription_id = SUB
+            db.commit()
+        self.assertEqual(self.send(self.payload(custom_data={})).status_code, 400)
+        with self.sessions() as db:
+            self.assertEqual(db.get(User, 1).plan, "free")
+            self.assertEqual(db.query(PaddleEvent).count(), 0)
 
     def test_second_subscription_and_conflicting_customer_cannot_replace_owner(self):
         self.send(self.payload())

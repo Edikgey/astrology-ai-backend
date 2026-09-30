@@ -1,4 +1,4 @@
-from sqlalchemy import JSON, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, CheckConstraint, Index, case, text
+from sqlalchemy import JSON, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, CheckConstraint, Index, UniqueConstraint, case, text
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from database.connection import Base
@@ -17,12 +17,15 @@ class User(Base):
     current_period_start = Column(DateTime, nullable=True)  # UTC, as elsewhere in this schema
     current_period_end = Column(DateTime, nullable=True)
     payment_provider = Column(String, nullable=True)
-    provider_customer_id = Column(String, unique=True, nullable=True)
-    provider_subscription_id = Column(String, unique=True, nullable=True)
+    provider_customer_id = Column(String, nullable=True)
+    provider_subscription_id = Column(String, nullable=True)
     subscription_status = Column(String, nullable=True)
     paddle_updated_at = Column(DateTime, nullable=True)
     scheduled_cancel_at = Column(DateTime, nullable=True)
-    __table_args__ = (CheckConstraint("plan IN ('free', 'premium')", name="ck_users_plan"),)
+    __table_args__ = (CheckConstraint("plan IN ('free', 'premium')", name="ck_users_plan"),
+        CheckConstraint("payment_provider IS NOT NULL OR (provider_customer_id IS NULL AND provider_subscription_id IS NULL)", name="ck_users_billing_provider"),
+        UniqueConstraint("payment_provider", "provider_customer_id", name="uq_users_provider_customer"),
+        UniqueConstraint("payment_provider", "provider_subscription_id", name="uq_users_provider_subscription"))
 
     natal_charts = relationship("NatalChart", back_populates="user")
 
@@ -39,12 +42,32 @@ class PaddleCheckout(Base):
 
 
 class PaddleEvent(Base):
+    # Physical table name retained for compatibility; shared provider event ledger.
     __tablename__ = "paddle_events"
+    provider = Column(String, nullable=False, default="paddle", server_default="paddle")
     event_id = Column(String, primary_key=True)
     event_type = Column(String, nullable=False)
     occurred_at = Column(DateTime, nullable=False)
     processed_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     outcome = Column(String, nullable=False, default="processed")
+    details = Column(JSON, nullable=True)  # minimal refund/dispute audit, no buyer or raw payload
+
+
+class LavaCheckout(Base):
+    """Immutable server-owned offer/buyer binding; no raw payment payloads."""
+    __tablename__ = "lava_checkouts"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    contract_id = Column(String, unique=True, nullable=True)
+    offer_id = Column(String, nullable=False)
+    product_id = Column(String, nullable=False)
+    buyer_email = Column(String, nullable=False)
+    payment_url = Column(String, nullable=True)
+    state = Column(String, nullable=False, default="creating")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=True)  # provider lifecycle timestamp
+    paid_at = Column(DateTime, nullable=True)
+    cancel_requested = Column(Boolean, nullable=False, default=False, server_default="false")
 
 
 class GPTUsage(Base):
