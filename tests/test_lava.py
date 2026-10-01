@@ -297,6 +297,60 @@ class LavaTests(unittest.TestCase):
 
 
 class LavaHttpTests(unittest.TestCase):
+    def test_failure_diagnostics_exclude_provider_data_and_do_not_retry(self):
+        import json
+        original = httpx.Client
+        secret = "sensitive-key-email-signature-body"
+        cases = [
+            (httpx.ReadTimeout(secret), "request", "ReadTimeout", None),
+            (httpx.Response(200, content=secret.encode()), "decode_response", "JSONDecodeError", 200),
+            (httpx.Response(500, content=secret.encode()), "http_status", "HTTPException", 500),
+            (httpx.Response(429, content=secret.encode()), "http_status", "HTTPException", 429),
+        ]
+        for response, stage, exception, status in cases:
+            with self.subTest(status=status, stage=stage), patch.dict(os.environ, {**ENV, "LAVA_API_KEY": secret}):
+                handler = Mock(side_effect=response) if isinstance(response, Exception) else Mock(return_value=response)
+                client = original(transport=httpx.MockTransport(handler))
+                with patch("modules.lava_client.httpx.Client", return_value=client), self.assertLogs("modules.lava_client", level="WARNING") as logs:
+                    with self.assertRaises(HTTPException) as caught:
+                        api.request("POST", "/api/v3/invoice", json={"email": secret})
+                self.assertEqual(caught.exception.status_code, 503 if status == 429 else 502)
+                self.assertEqual(handler.call_count, 1)
+                self.assertEqual(len(logs.records), 1)
+                record = logs.records[0]
+                data = json.loads(record.getMessage().split("Lava request failed ", 1)[1])
+                self.assertEqual(set(data), {"operation", "stage", "exception_class", "duration_ms", "http_status"})
+                self.assertEqual((data["operation"], data["stage"], data["exception_class"], data["http_status"]),
+                                 ("invoice_create", stage, exception, status))
+                self.assertGreaterEqual(data["duration_ms"], 0)
+                self.assertIsNone(record.exc_info)
+                self.assertNotIn(secret, str(logs.output) + caught.exception.detail)
+
+    def test_invoice_timeout_is_extended_without_changing_other_operations(self):
+        original = httpx.Client
+        for method, path, read, connect in (("POST", "/api/v3/invoice", 30, 10),
+                                           ("GET", "/api/v2/products", 4, 2),
+                                           ("DELETE", "/api/v1/subscriptions", 4, 2)):
+            with self.subTest(method=method), patch.dict(os.environ, ENV):
+                handler = Mock(return_value=httpx.Response(200, json={}))
+                client = original(transport=httpx.MockTransport(handler))
+                with patch("modules.lava_client.httpx.Client", return_value=client) as factory:
+                    api.request(method, path)
+                timeout = factory.call_args.kwargs["timeout"]
+                self.assertEqual((timeout.read, timeout.connect), (read, connect))
+                self.assertFalse(factory.call_args.kwargs["follow_redirects"])
+                self.assertEqual(handler.call_count, 1)
+
+    def test_new_domain_returns_pass_through_configuration(self):
+        target = "https://mylunariaai.com/my-charts?billing=lava"
+        values = {**ENV, **{name: target for name in (
+            "LAVA_SUCCESS_RETURN_URL", "LAVA_FAILURE_RETURN_URL", "LAVA_CANCEL_RETURN_URL")}}
+        with patch.dict(os.environ, values):
+            offer, returns = api.config()
+        self.assertEqual(offer, OFFER)
+        self.assertEqual(returns, {name: target for name in (
+            "successful_return_url", "failure_return_url", "cancel_return_url")})
+
     def test_http_201_invoice_response_is_accepted(self):
         original = httpx.Client
         with patch.dict(os.environ, ENV):

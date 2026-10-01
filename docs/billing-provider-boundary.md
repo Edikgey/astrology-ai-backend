@@ -22,6 +22,11 @@ Paddle continues to send exactly one item with quantity 1.
 Direct HTTP uses existing httpx. Current SDK wrappers lack return-URL fields.
 The API host is fixed, redirects disabled, timeouts explicit, and errors sanitized.
 There are no automatic invoice/cancellation retries; 429 returns a retry-later error.
+Invoice creation allows 10 seconds to connect, 30 seconds per read, 10 seconds
+per write and 5 seconds for the connection pool. Other API timeouts are unchanged.
+Failures log only fixed operation/stage labels, exception class, elapsed milliseconds
+and HTTP status when available. URLs/IDs, headers, bodies and exception text are
+never logged. A timeout remains ambiguous: it does not prove no invoice was created.
 
 A controlled real invoice POST returned **HTTP 201**, without payment. The prior
 example.invalid attempt failed; read-only search found no technical invoice
@@ -160,7 +165,7 @@ Backend only; see `.env.lava.example`. No new frontend env variables.
 - `LAVA_WEBHOOK_SECRET`: separate random webhook secret, 32–80 characters.
 - `LAVA_OFFER_ID`: verified offer UUID above, public configuration.
 - `LAVA_SUCCESS_RETURN_URL`, `LAVA_FAILURE_RETURN_URL`, `LAVA_CANCEL_RETURN_URL`:
-  all may use `https://astrology-ai-frontend-production.up.railway.app/my-charts?billing=lava`.
+  all use `https://mylunariaai.com/my-charts?billing=lava`.
   Each must be absolute HTTPS, at most 512 characters.
 
 Generate the webhook secret with a secure password manager or locally with
