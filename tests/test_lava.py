@@ -54,7 +54,9 @@ class LavaTests(unittest.TestCase):
         if method == "POST": return copy.deepcopy(self.invoice)
         if method == "DELETE": return None
         if path.startswith("/api/v2/invoices/"):
-            return {"parentInvoice": {"id": CONTRACT}}
+            return {"id": path.rsplit("/", 1)[1], "buyer": {"email": "a@example.test" if path.endswith(CONTRACT) else "b@example.test"},
+                    "status": "FAILED" if self.snapshot["status"] == "FAILED" else "NEW",
+                    "parentInvoice": {"id": CONTRACT}}
         return copy.deepcopy(self.snapshot)
 
     def event(self, kind="payment.success", at=None):
@@ -148,6 +150,82 @@ class LavaTests(unittest.TestCase):
         self.snapshot.update(status="FAILED", subscriptionStatus="FAILED", expiredAt=None)
         r = self.send(self.event("payment.failed")); self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(self.state()["plan"], "free")
+        with self.sessions() as db:
+            self.assertIsNone(db.get(User, 1).payment_provider)
+
+    def test_pending_reopen_reuses_url_without_invoice(self):
+        with self.sessions() as db:
+            db.get(LavaCheckout, "bound").payment_url = "https://pay.example.test/existing"
+            db.commit()
+        for _ in range(2):
+            r = self.client.post("/payments/lava/checkout", headers=self.owner)
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json()["url"], "https://pay.example.test/existing")
+        self.assertFalse(any(c.args[0] == "POST" for c in self.network.call_args_list))
+
+    def test_failed_checkout_allows_retry_and_paddle_switch(self):
+        from modules import paddle_billing
+        self.snapshot.update(status="FAILED", subscriptionStatus="FAILED", expiredAt=None)
+        self.assertEqual(self.send(self.event("payment.failed")).status_code, 200)
+        with patch.object(paddle_billing, "premium_price_id", return_value="price"), patch.object(paddle_billing, "paddle_client") as client:
+            client.return_value.transactions.create.return_value.id = "txn_test"
+            r = self.client.post("/payments/paddle/checkout", headers=self.owner)
+            self.assertEqual(r.status_code, 200, r.text)
+            client.return_value.transactions.create.assert_called_once()
+        with self.sessions() as db:
+            self.assertEqual(db.get(LavaCheckout, "bound").state, "superseded")
+        late = self.event("payment.failed", datetime.utcnow())
+        self.assertEqual(self.send(late).json()["outcome"], "ignored_other_subscription")
+        with self.sessions() as db:
+            self.assertEqual(db.get(LavaCheckout, "bound").state, "superseded")
+
+    def test_unconfirmed_failure_does_not_release_pending_checkout(self):
+        self.snapshot.update(status="IN_PROGRESS", subscriptionStatus="ACTIVE")
+        self.assertEqual(self.send(self.event("payment.failed")).status_code, 503)
+        with self.sessions() as db:
+            self.assertEqual(db.get(LavaCheckout, "bound").state, "ready")
+
+    def test_confirmed_failed_pending_is_reconciled_before_retry(self):
+        self.snapshot.update(status="FAILED", subscriptionStatus="FAILED", expiredAt=None)
+        r = self.client.post("/payments/lava/checkout", headers=self.owner)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(len([c for c in self.network.call_args_list if c.args[0] == "POST"]), 1)
+
+    def test_failed_webhook_then_retry(self):
+        self.snapshot.update(status="FAILED", subscriptionStatus="FAILED", expiredAt=None)
+        self.assertEqual(self.send(self.event("payment.failed")).status_code, 200)
+        self.assertEqual(self.client.post("/payments/lava/checkout", headers=self.owner).status_code, 200)
+        self.assertEqual(len([c for c in self.network.call_args_list if c.args[0] == "POST"]), 1)
+
+    def test_legacy_failed_billing_owner_is_released_on_verified_switch(self):
+        from modules import paddle_billing
+        self.snapshot.update(status="FAILED", subscriptionStatus="FAILED", expiredAt=None)
+        with self.sessions() as db:
+            u = db.get(User, 1)
+            u.payment_provider, u.provider_subscription_id, u.subscription_status = "lava", CONTRACT, "failed"
+            db.get(LavaCheckout, "bound").state = "failed"
+            db.commit()
+        with patch.object(paddle_billing, "premium_price_id", return_value="price"), patch.object(paddle_billing, "paddle_client") as client:
+            client.return_value.transactions.create.return_value.id = "txn_test"
+            r = self.client.post("/payments/paddle/checkout", headers=self.owner)
+            self.assertEqual(r.status_code, 200, r.text)
+
+    def test_reconciliation_failure_keeps_intent_and_never_creates_invoice(self):
+        self.network.side_effect = HTTPException(502, "unavailable")
+        self.assertEqual(self.client.post("/payments/lava/checkout", headers=self.owner).status_code, 502)
+        with self.sessions() as db:
+            self.assertEqual(db.get(LavaCheckout, "bound").state, "ready")
+            self.assertEqual(db.query(LavaCheckout).count(), 1)
+        self.assertFalse(any(c.args[0] == "POST" for c in self.network.call_args_list))
+
+    def test_open_or_paid_lava_cannot_create_parallel_paddle_invoice(self):
+        from modules import paddle_billing
+        with patch.object(paddle_billing, "premium_price_id", return_value="price"), patch.object(paddle_billing, "paddle_client") as client:
+            self.assertEqual(self.client.post("/payments/paddle/checkout", headers=self.owner).status_code, 409)
+            self.send(self.event())
+            self.assertEqual(self.client.post("/payments/paddle/checkout", headers=self.owner).status_code, 409)
+            self.assertEqual(self.client.post("/payments/lava/checkout", headers=self.owner).status_code, 409)
+            client.return_value.transactions.create.assert_not_called()
 
     def test_renewal_uses_exact_api_period_duplicate_and_old_failure_safe(self):
         self.send(self.event())

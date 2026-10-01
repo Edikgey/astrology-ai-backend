@@ -23,6 +23,8 @@ FINANCIAL = {"refund.success", "chargeback.initiated"}
 
 
 def owns_checkout(user, checkout):
+    if checkout.state == "superseded":
+        return False
     if user.payment_provider not in (None, "lava"):
         return False
     if user.provider_subscription_id in (None, checkout.contract_id):
@@ -54,9 +56,67 @@ def verify(headers):
         raise HTTPException(401, "Invalid webhook authentication")
 
 
+def reconcile_checkout(db, user_id, *, switching=False):
+    """Refresh an unpaid attempt before reuse/switch; never infer expiry from age.
+
+    A NEW/IN_PROGRESS invoice cannot safely be abandoned locally: Lava has no
+    documented invoice cancellation API. Only a confirmed FAILED contract may
+    release the provider guard. Network calls run outside the user lock.
+    """
+    user = locked_user(db, user_id)
+    if user.plan == "premium" or user.subscription_status in ("active", "past_due", "paused", "trialing"):
+        db.rollback()
+        return
+    checkout = db.query(LavaCheckout).filter_by(user_id=user_id).filter(
+        LavaCheckout.state.in_(("creating", "ready", "failed"))).order_by(LavaCheckout.created_at.desc()).first()
+    if not checkout:
+        db.rollback()
+        return
+    binding, contract, buyer = checkout.id, checkout.contract_id, checkout.buyer_email
+    db.rollback()
+    if not contract:
+        raise HTTPException(409, "Lava ещё не подтвердила создание оплаты. Повторная оплата пока недоступна.")
+    invoice = api.request("GET", "/api/v2/invoices/" + contract)
+    try:
+        if api.external_id(invoice["id"]) != contract or invoice["buyer"]["email"] != buyer:
+            raise ValueError()
+        status = invoice["status"]
+        if status not in ("NEW", "IN_PROGRESS", "COMPLETED", "FAILED"):
+            raise ValueError()
+        state = snapshot(SimpleNamespace(contract_id=contract, buyer_email=buyer)) if status == "FAILED" else None
+    except (ValueError, KeyError, TypeError, AttributeError, InvalidOperation):
+        raise HTTPException(502, "Не удалось проверить состояние оплаты Lava. Попробуйте позже.") from None
+    user = locked_user(db, user_id)
+    checkout = db.get(LavaCheckout, binding)
+    db.refresh(checkout)
+    if user.plan == "premium" or checkout.paid_at or checkout.state == "completed":
+        db.rollback()
+        raise HTTPException(409, "Подписка уже оплачена. Обновите лимиты аккаунта.")
+    if checkout.state not in ("creating", "ready", "failed"):
+        db.rollback()
+        return
+    if status == "FAILED" and state and not state["paid"] and state["status"] == "FAILED":
+        checkout.state = "superseded" if switching else "failed"
+        # Older deployments assigned billing ownership even for an unpaid failure.
+        if (user.payment_provider == "lava" and user.provider_subscription_id == contract
+                and user.subscription_status == "failed"):
+            user.payment_provider = user.provider_subscription_id = user.provider_customer_id = None
+            user.subscription_status = None
+        db.commit()
+        return
+    db.rollback()
+    if status == "COMPLETED" or (state and state["paid"]):
+        raise HTTPException(409, "Оплата Lava подтверждается. Обновите лимиты аккаунта перед новой покупкой.")
+    if checkout.state == "failed" or status == "FAILED":
+        raise HTTPException(409, "Lava ещё подтверждает результат оплаты. Попробуйте снова позже.")
+    if switching:
+        raise HTTPException(409, "Оплата Lava ещё открыта. Вернитесь к ней; Paddle станет доступен после подтверждённой неуспешной оплаты. Закрытие вкладки не отменяет счёт.")
+
+
 def create_checkout(db, user_id):
     offer, returns = api.config()
     try:
+        reconcile_checkout(db, user_id)
         user = locked_user(db, user_id)
         if user.payment_provider not in (None, "lava") or user.plan == "premium" or user.subscription_status in ("active", "past_due", "paused", "trialing"):
             raise HTTPException(409, "У аккаунта уже есть подписка. Смена провайдера пока недоступна.")
@@ -192,7 +252,12 @@ def apply_snapshot(db, user, checkout, state):
         raise ValueError("Missing paid period")
     else:
         apply_subscription_access(db, user, "retain", scheduled_cancel_at=user.scheduled_cancel_at)
-        user.subscription_status = "failed"
+        # An unpaid attempt is not a subscription and must not claim billing ownership.
+        checkout.state = "failed"
+        if user.payment_provider == "lava" and user.provider_subscription_id == checkout.contract_id:
+            user.payment_provider = user.provider_customer_id = user.provider_subscription_id = None
+            user.subscription_status = None
+        return "processed"
     # Lava does not expose a customer ID; email is a cross-check, never identity.
     user.payment_provider = "lava"
     user.provider_customer_id = None
@@ -244,6 +309,8 @@ def process_event(db, body):
                 db.rollback()
                 state = snapshot(saved)
                 if event["kind"] not in FINANCIAL:
+                    if event["kind"] == "payment.failed" and not state["paid"] and state["status"] != "FAILED":
+                        raise HTTPException(503, "Payment failure confirmation is pending")
                     if event["kind"].endswith(".success") and event["contract"] not in state["completed_ids"]:
                         raise HTTPException(503, "Payment confirmation is pending")
                     if event["kind"] == "subscription.cancelled" and not (state["cancelled"] or state["terminated"] or state["status"] == "CANCELLED"):

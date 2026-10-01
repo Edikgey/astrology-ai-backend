@@ -66,6 +66,8 @@ def utc_date(value):
 def create_checkout(db, user_id):
     price_id, client = premium_price_id(), paddle_client()
     try:
+        from modules.lava_billing import reconcile_checkout
+        reconcile_checkout(db, user_id, switching=True)
         user = locked_user(db, user_id)
         # The current schema has one billing owner per account. Switching it
         # needs an explicit migration policy, not an incidental checkout.
