@@ -30,6 +30,8 @@ class PaddleTests(unittest.TestCase):
         fixtures.MyChartsTests.setUp(self)
         env = patch.dict(os.environ, {"PADDLE_WEBHOOK_SECRET": SECRET, "PADDLE_PREMIUM_PRICE_ID": PRICE})
         env.start(); self.addCleanup(env.stop)
+        verified = patch("modules.paddle_billing.confirm_initial_payment")
+        verified.start(); self.addCleanup(verified.stop)
         self.start = datetime.utcnow() - timedelta(days=1)
         self.end = self.start + timedelta(days=30)
         self.binding = str(uuid4())
@@ -207,14 +209,15 @@ class PaddleTests(unittest.TestCase):
         with patch.dict(os.environ,{"PADDLE_SANDBOX_API_KEY":"pdl_live_apikey_not-real"}):
             self.assertEqual(self.client.post("/payments/paddle/checkout",headers=self.other).status_code,503)
 
-    def test_lava_pending_invoice_blocks_paddle_creation(self):
+    def test_lava_pending_invoice_allows_paddle_creation(self):
         with self.sessions() as db:
             db.add(LavaCheckout(user_id=2, offer_id=str(uuid4()), product_id=str(uuid4()),
                                 buyer_email="b@example.test", state="creating")); db.commit()
         sdk = Mock()
+        sdk.transactions.create.return_value.id = "txn_" + "b" * 26
         with patch("modules.paddle_billing.paddle_client", return_value=sdk):
-            self.assertEqual(self.client.post("/payments/paddle/checkout", headers=self.other).status_code, 409)
-            sdk.transactions.create.assert_not_called()
+            self.assertEqual(self.client.post("/payments/paddle/checkout", headers=self.other).status_code, 200)
+            sdk.transactions.create.assert_called_once()
 
     def test_other_provider_cannot_be_overwritten_by_paddle_or_open_checkout(self):
         # IDs deliberately collide: a provider name, not an ID shape, owns billing.

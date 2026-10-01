@@ -70,6 +70,27 @@ class LavaCheckout(Base):
     cancel_requested = Column(Boolean, nullable=False, default=False, server_default="false")
 
 
+class BillingConflict(Base):
+    """Manual review only: one durable case per extra external subscription."""
+    __tablename__ = "billing_conflicts"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    provider = Column(String, nullable=False)
+    subscription_id = Column(String, nullable=False)
+    checkout_id = Column(String, nullable=False)
+    payment_id = Column(String, nullable=True)
+    primary_provider = Column(String, nullable=False)
+    primary_subscription_id = Column(String, nullable=False)
+    first_event_id = Column(String, nullable=False)
+    last_event_id = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="open", server_default="open")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("provider", "subscription_id", name="uq_billing_conflict_subscription"),
+        CheckConstraint("provider IN ('lava', 'paddle')", name="ck_billing_conflict_provider"),
+        CheckConstraint("status IN ('open', 'resolved')", name="ck_billing_conflict_status"))
+
+
 class GPTUsage(Base):
     """Durable quota ledger. Deleting messages clears the link, not the usage."""
     __tablename__ = "gpt_usage"

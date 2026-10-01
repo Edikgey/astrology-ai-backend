@@ -173,11 +173,11 @@ class LavaTests(unittest.TestCase):
             self.assertEqual(r.status_code, 200, r.text)
             client.return_value.transactions.create.assert_called_once()
         with self.sessions() as db:
-            self.assertEqual(db.get(LavaCheckout, "bound").state, "superseded")
+            self.assertEqual(db.get(LavaCheckout, "bound").state, "failed")
         late = self.event("payment.failed", datetime.utcnow())
-        self.assertEqual(self.send(late).json()["outcome"], "ignored_other_subscription")
+        self.assertEqual(self.send(late).json()["outcome"], "processed")
         with self.sessions() as db:
-            self.assertEqual(db.get(LavaCheckout, "bound").state, "superseded")
+            self.assertEqual(db.get(LavaCheckout, "bound").state, "failed")
 
     def test_unconfirmed_failure_does_not_release_pending_checkout(self):
         self.snapshot.update(status="IN_PROGRESS", subscriptionStatus="ACTIVE")
@@ -218,14 +218,15 @@ class LavaTests(unittest.TestCase):
             self.assertEqual(db.query(LavaCheckout).count(), 1)
         self.assertFalse(any(c.args[0] == "POST" for c in self.network.call_args_list))
 
-    def test_open_or_paid_lava_cannot_create_parallel_paddle_invoice(self):
+    def test_pending_lava_allows_paddle_but_paid_lava_blocks_new_checkout(self):
         from modules import paddle_billing
         with patch.object(paddle_billing, "premium_price_id", return_value="price"), patch.object(paddle_billing, "paddle_client") as client:
-            self.assertEqual(self.client.post("/payments/paddle/checkout", headers=self.owner).status_code, 409)
+            client.return_value.transactions.create.return_value.id = "txn_test"
+            self.assertEqual(self.client.post("/payments/paddle/checkout", headers=self.owner).status_code, 200)
             self.send(self.event())
             self.assertEqual(self.client.post("/payments/paddle/checkout", headers=self.owner).status_code, 409)
             self.assertEqual(self.client.post("/payments/lava/checkout", headers=self.owner).status_code, 409)
-            client.return_value.transactions.create.assert_not_called()
+            client.return_value.transactions.create.assert_called_once()
 
     def test_renewal_uses_exact_api_period_duplicate_and_old_failure_safe(self):
         self.send(self.event())
@@ -296,7 +297,7 @@ class LavaTests(unittest.TestCase):
             user = db.get(User, 1)
             user.payment_provider = "paddle"; user.provider_subscription_id = CONTRACT
             usage.apply_plan(db, user, "premium", self.start, self.end); db.commit()
-        self.assertEqual(self.send(self.event()).json()["outcome"], "ignored_other_subscription")
+        self.assertEqual(self.send(self.event()).json()["outcome"], "billing_conflict")
         self.assertEqual(self.client.post("/payments/lava/checkout", headers=self.owner).status_code, 409)
         self.assertEqual(self.client.post("/payments/lava/cancel", headers=self.owner).status_code, 409)
         with self.sessions() as db: self.assertEqual(db.get(User, 1).payment_provider, "paddle")
@@ -344,11 +345,11 @@ class LavaTests(unittest.TestCase):
         self.assertEqual(self.send(value).status_code, 200)
         self.assertEqual(self.state()["plan"], "premium")
 
-    def test_paddle_pending_checkout_blocks_lava_before_network(self):
+    def test_paddle_pending_checkout_allows_lava(self):
         with self.sessions() as db:
             db.add(PaddleCheckout(user_id=2, state="creating")); db.commit()
-        self.assertEqual(self.client.post("/payments/lava/checkout", headers=self.other).status_code, 409)
-        self.network.assert_not_called()
+        self.assertEqual(self.client.post("/payments/lava/checkout", headers=self.other).status_code, 200)
+        self.assertTrue(any(c.args[0] == "POST" for c in self.network.call_args_list))
 
     def test_terminal_cancel_cannot_be_undone_by_same_payment_active_snapshot(self):
         self.send(self.event())
