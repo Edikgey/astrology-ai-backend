@@ -17,6 +17,7 @@ app = CORSMiddleware(
     allow_origins=[
         "http://localhost:3000",
         "https://astrology-ai-frontend-production.up.railway.app",
+        "https://mylunariaai.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],

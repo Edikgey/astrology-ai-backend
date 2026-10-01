@@ -13,8 +13,7 @@ from database.connection import get_db
 from database.queries import User
 from sqlalchemy.exc import IntegrityError
 from fastapi.security import OAuth2PasswordBearer
-from services.email_service import send_confirmation_email
-import random
+from services.email_service import send_confirmation_email, EmailDeliveryError
 import os
 from starlette import status
 from modules.migration import migrate_guest_data_to_user
@@ -67,7 +66,7 @@ async def request_register(
         raise HTTPException(status_code=400, detail="❌ Пользователь с таким email уже зарегистрирован. Попробуйте войти.")
 
     # 📩 Генерация и сохранение кода
-    code = str(random.randint(100000, 999999))
+    code = str(100000 + secrets.randbelow(900000))
     expires_at = datetime.utcnow() + timedelta(minutes=10)
 
     # Удаляем предыдущие коды
@@ -79,7 +78,17 @@ async def request_register(
     ))
     db.commit()
 
-    await send_confirmation_email(user_data.email, code)
+    try:
+        await send_confirmation_email(user_data.email, code)
+    except EmailDeliveryError:
+        # Do not leave an undelivered code usable, or remove a newer request's code.
+        db.query(EmailVerificationCode).filter(
+            EmailVerificationCode.email == user_data.email,
+            EmailVerificationCode.code == code,
+            EmailVerificationCode.expires_at == expires_at,
+        ).delete()
+        db.commit()
+        raise HTTPException(503, detail="Не удалось отправить код подтверждения. Попробуйте позже.") from None
     return {"message": "Код отправлен на почту"}
 
 
@@ -157,6 +166,7 @@ def google_login(credentials: GoogleLogin, request: Request, db: Session = Depen
     # cross-site login CSRF explicitly; no cookies or application JWT are trusted here.
     if request.headers.get("origin") not in {
         "http://localhost:3000", "https://astrology-ai-frontend-production.up.railway.app",
+        "https://mylunariaai.com",
     }:
         raise HTTPException(403, detail="Недопустимый источник входа Google.")
     if request.headers.get("content-type", "").split(";")[0].strip() != "application/json":

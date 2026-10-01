@@ -57,6 +57,11 @@ class GoogleAuthTests(unittest.TestCase):
             user = db.get(User, user_id)
             self.assertEqual((user.google_sub, user.plan), ('google-123', 'free'))
 
+    def test_custom_production_domain_origin_is_allowed(self):
+        response = self.client.post('/auth/google', json={'credential': credential(), 'nonce': NONCE},
+                                    headers={'Origin': 'https://mylunariaai.com'})
+        self.assertEqual(response.status_code, 200, response.text)
+
     def test_verified_workspace_links_same_premium_user_preserves_password_and_data(self):
         saved = self.chart()
         hashed = get_password_hash('existing-password')

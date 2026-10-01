@@ -185,6 +185,7 @@ astrology.db
 !.env.paddle.example
 !.env.google.example
 !.env.lava.example
+!.env.mail.example
 
 # Windows
 Thumbs.db
