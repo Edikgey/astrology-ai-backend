@@ -9,7 +9,7 @@ from unittest.mock import patch
 from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError
 import test_postgres_usage as pg
-from database.queries import User, PaddleEvent, LavaCheckout, GPTUsage
+from database.queries import User, BillingEvent, LavaCheckout, GPTUsage
 from modules import lava_billing as billing
 from test_lava import OFFER, PRODUCT, CONTRACT, ENV, iso
 
@@ -20,7 +20,7 @@ class LavaPostgresTests(unittest.TestCase):
     cleanup_schema = pg.PostgreSQLUsageTests.cleanup_schema
 
     def apply_script(self, script):
-        if "CREATE TABLE lava_checkouts" in script:
+        if "CREATE TABLE lava_checkouts" in script or "RENAME TO billing_events" in script:
             return  # Test the exact migration with pre-existing Paddle rows below.
         pg.PostgreSQLUsageTests.apply_script(self, script)
 
@@ -32,6 +32,7 @@ class LavaPostgresTests(unittest.TestCase):
 
     def migrate(self, script=None):
         pg.PostgreSQLUsageTests.apply_script(self, script or self.lava_script)
+        pg.PostgreSQLUsageTests.apply_script(self, self.stripe_script)
 
     def test_migration_preserves_paddle_and_scopes_constraints_and_event_ids(self):
         self.migrate()
@@ -39,10 +40,10 @@ class LavaPostgresTests(unittest.TestCase):
         with self.sessions() as db:
             u = db.get(User, 1)
             self.assertEqual((u.payment_provider, u.provider_customer_id, u.provider_subscription_id), ("paddle", "customer", "subscription"))
-            self.assertEqual(db.get(PaddleEvent, "old-event").outcome, "processed")
+            self.assertEqual(db.get(BillingEvent, "old-event").outcome, "processed")
             u2 = db.get(User, 2); u2.payment_provider = "lava"
             u2.provider_customer_id, u2.provider_subscription_id = "customer", "subscription"
-            db.add(PaddleEvent(provider="lava", event_id="lava:old-event", event_type="test", occurred_at=datetime.utcnow()))
+            db.add(BillingEvent(provider="lava", event_id="lava:old-event", event_type="test", occurred_at=datetime.utcnow()))
             db.commit()
             u2.payment_provider = "paddle"
             with self.assertRaises(IntegrityError): db.commit()
@@ -52,8 +53,8 @@ class LavaPostgresTests(unittest.TestCase):
             self.assertIn("uq_users_provider_subscription", constraints)
             self.assertNotIn("users_provider_subscription_id_key", constraints)
         with self.engine.begin() as conn:
-            # Previous deployed adapter can still insert/deduplicate after migration.
-            conn.exec_driver_sql("INSERT INTO paddle_events (event_id,event_type,occurred_at,processed_at,outcome) VALUES ('old-event','test',now(),now(),'processed') ON CONFLICT(event_id) DO NOTHING")
+            # Retained historical event IDs still deduplicate after the rename.
+            conn.exec_driver_sql("INSERT INTO billing_events (provider,event_id,event_type,occurred_at,processed_at,outcome) VALUES ('paddle','old-event','test',now(),now(),'processed') ON CONFLICT(event_id) DO NOTHING")
         with self.assertRaises(Exception): self.migrate()
 
     def test_failed_migration_rolls_back_constraints_and_keeps_paddle(self):
@@ -98,7 +99,7 @@ class LavaPostgresTests(unittest.TestCase):
             results = list(pool.map(run, range(2)))
         self.assertEqual(sorted(results), ["duplicate", "processed"])
         with self.sessions() as db:
-            self.assertEqual(db.query(PaddleEvent).filter_by(provider="lava").count(), 1)
+            self.assertEqual(db.query(BillingEvent).filter_by(provider="lava").count(), 1)
             self.assertEqual(db.get(User, 1).current_period_start, self.start)
             self.assertEqual(db.query(GPTUsage).count(), 2)  # existing natal quota preserved
 

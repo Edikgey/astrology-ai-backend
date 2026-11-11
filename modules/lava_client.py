@@ -15,6 +15,12 @@ PREMIUM_RUB = Decimal("799")
 logger = logging.getLogger(__name__)
 
 
+class InvoiceEmailRejected(HTTPException):
+    """Definitive provider validation rejection; no invoice was created."""
+    def __init__(self):
+        super().__init__(422, "Lava отклонила email этого аккаунта для покупки. Обратитесь в поддержку Lunaria: lunariaai.support@gmail.com. Оплата не создана.")
+
+
 def request_operation(method, path):
     # Fixed labels only: never log a URL, query string or external identifier.
     if method == "POST" and path == "/api/v3/invoice":
@@ -90,6 +96,14 @@ def request(method, path, **kwargs):
             response = client.request(method, BASE_URL + path,
                                       headers={"X-Api-Key": key, "Accept": "application/json"}, **kwargs)
         stage = "http_status"
+        if response.status_code == 400 and operation == "invoice_create":
+            try:
+                error_body = response.json()
+            except ValueError:
+                error_body = None
+            if (isinstance(error_body, dict) and error_body.get("error") == "Incorrect email to purchase"
+                    and not error_body.get("id") and not error_body.get("paymentUrl")):
+                raise InvoiceEmailRejected()
         if response.status_code == 429:
             raise HTTPException(503, "Платёжный сервис занят. Попробуйте позже.", headers={"Retry-After": "60"})
         if not 200 <= response.status_code < 300:

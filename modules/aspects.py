@@ -6,8 +6,8 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 class Aspects:
-    def __init__(self, year, month, day, hour, lon, lat):
-        ephemeris = Ephemeris(year, month, day, hour, lon, lat)
+    def __init__(self, year, month, day, hour, lon, lat, *, ephemeris=None):
+        ephemeris = ephemeris if ephemeris is not None else Ephemeris(year, month, day, hour, lon, lat)
         self.planets = ephemeris.get_planet_longitudes()
         self.asteroids = ephemeris.get_asteroid_longitudes()
         self.key_points = ephemeris.get_key_point_longitudes()

@@ -182,7 +182,7 @@ astrology.db
 # Local secrets
 .env.*
 !.env.example
-!.env.paddle.example
+!.env.stripe.example
 !.env.google.example
 !.env.lava.example
 !.env.mail.example

@@ -3,7 +3,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request, Response
 from sqlalchemy.orm import Session
 from database.connection import get_db
-from modules.ephemeris import Ephemeris, HOUSE_SYSTEM_NAME
+from modules.ephemeris import Ephemeris, HOUSE_SYSTEM_NAME, UnsupportedHouseSystemError, calculation_warnings
 from modules.birth_time import calculator_args, resolve_birth_time
 from modules.aspects import Aspects
 from modules.patterns import AstrologicalPatterns
@@ -17,6 +17,7 @@ from modules.chart_limits import saved_chart_limit
 from modules import usage
 from database.queries import Relationship
 from sqlalchemy import or_
+from modules.security_limits import enforce
 import asyncio
 
 
@@ -50,7 +51,12 @@ def create_natal_chart(
     # FastAPI runs sync endpoints in its thread pool, including database lock waits.
     # End failed transactions here, before dependency cleanup releases the session.
     try:
+        if identity['user'] is None:
+            enforce(db, request, 'guest_chart', guest=identity['session_token'])
         return _create_natal_chart(chart_data, identity, db)
+    except UnsupportedHouseSystemError as error:
+        db.rollback()
+        raise HTTPException(422, detail={"code": "UNSUPPORTED_HOUSE_SYSTEM", "message": str(error)}) from None
     except Exception:
         db.rollback()
         raise
@@ -63,7 +69,7 @@ def _create_natal_chart(chart_data: NatalChartCreate, identity: dict, db: Sessio
         user = usage.locked_user(db, user_id)
         limit = saved_chart_limit(user)
         used = db.query(NatalChart).filter(NatalChart.user_id == user_id).count()
-        if used >= limit:
+        if limit is not None and used >= limit:
             raise HTTPException(status_code=409, detail={
                 "code": "CHART_LIMIT_REACHED",
                 "message": f"Можно сохранить максимум {limit} карт. Удалите одну из карт, чтобы создать новую.",
@@ -97,7 +103,7 @@ def _create_natal_chart(chart_data: NatalChartCreate, identity: dict, db: Sessio
         raise HTTPException(status_code=400, detail="❌ Ошибка: не получены данные по телам")
 
     # 2. Аспекты
-    aspects_module = Aspects(*calculation)
+    aspects_module = Aspects(*calculation, ephemeris=ephem)
     raw_aspect_list = aspects_module.get_all_aspects_flat().split("\n")
     raw_aspect_list = [line.strip() for line in raw_aspect_list if line.strip()]
     aspects_for_chart = aspects_module.convert_aspects_for_chart(raw_aspect_list)
@@ -161,7 +167,8 @@ def _create_natal_chart(chart_data: NatalChartCreate, identity: dict, db: Sessio
         "patterns_data": patterns,
         "aspects_structured": aspects_structured,
         "houses": houses, "timezone": chart_data.timezone, "birth_utc": birth_utc,
-        "house_system": HOUSE_SYSTEM_NAME, "time_provenance": "local_iana"
+        "house_system": HOUSE_SYSTEM_NAME, "time_provenance": "local_iana",
+        "calculation_warnings": calculation_warnings(body_data),
     }
 @router.get("/natal-chart/{chart_id}", response_model=NatalChartResponse, tags=["Natal Chart"])
 def get_natal_chart_by_id(
@@ -196,6 +203,7 @@ def get_natal_chart_by_id(
     return {
         "chart_id": chart.id,
         "bodies_for_circle": chart_data.bodies_for_circle,
+        "calculation_warnings": calculation_warnings(chart_data.bodies_for_circle or {}),
         "aspects_for_circle": chart_data.aspects_for_circle,
         "points_data": chart_data.points_data,
         "patterns_data": chart_data.patterns_data,

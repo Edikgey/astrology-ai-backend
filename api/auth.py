@@ -1,6 +1,7 @@
+from modules.product_analytics import capture_business, context as analytics_context
 from typing import Optional
-from uuid import UUID
-from fastapi import APIRouter, HTTPException, Depends, Header, Request
+from uuid import UUID, uuid4
+from fastapi import APIRouter, HTTPException, Depends, Header, Request, Response, BackgroundTasks
 from fastapi.security.utils import get_authorization_scheme_param
 from sqlalchemy.orm import Session
 from passlib.context import CryptContext
@@ -10,7 +11,7 @@ from models.user import UserCreate, UserVerify, UserLogin, Token, UserResponse
 from models.natal_chart import NatalChartCreate
 from database.queries import EmailVerificationCode, NatalChart
 from database.connection import get_db
-from database.queries import User
+from database.queries import User, PasswordReset
 from sqlalchemy.exc import IntegrityError
 from fastapi.security import OAuth2PasswordBearer
 from services.email_service import send_confirmation_email, EmailDeliveryError
@@ -19,8 +20,12 @@ from starlette import status
 from modules.migration import migrate_guest_data_to_user
 from models.user import GoogleLogin
 from services.google_identity import verify_google_credential
-from sqlalchemy import func
+from sqlalchemy import func, inspect
 import secrets
+from modules.auth_origins import AUTH_ORIGINS
+from modules.security_limits import enforce
+from modules.password_recovery import RESET_MESSAGE, deliver_reset, digest
+from models.user import PasswordResetRequest, PasswordResetConfirm
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")  # если ещё не определён
 
@@ -58,8 +63,10 @@ def create_access_token(data: dict, expires_delta=None):
 @router.post("/request-register")
 async def request_register(
     user_data: UserCreate,
+    request: Request,
     db: Session = Depends(get_db)
 ):
+    enforce(db, request, 'register', email=str(user_data.email))
     # 🔒 Проверяем, существует ли пользователь
     existing_user = db.query(User).filter(User.email == user_data.email).first()
     if existing_user:
@@ -95,10 +102,13 @@ async def request_register(
 @router.post("/verify-code", response_model=Token)
 def verify_code(
     user_data: UserVerify,
-    code: str,
+    request: Request,
+    code: Optional[str] = None,  # Compatibility with old clients; new UI sends JSON.
     db: Session = Depends(get_db),
     session_token: Optional[UUID] = Header(None, alias="X-Session-Token")
 ):
+    enforce(db, request, 'verify', email=str(user_data.email))
+    code = user_data.code if user_data.code is not None else code
     record = db.query(EmailVerificationCode).filter(
         EmailVerificationCode.email == user_data.email
     ).first()
@@ -116,7 +126,7 @@ def verify_code(
             db=db, user_id=user.id, session_token=session_token,
             guest_chart_id=user_data.guest_chart_id,
         )
-        access_token = create_access_token(data={"sub": str(user.id)})
+        access_token = create_access_token(data={"sub": str(user.id), "ver": user.auth_version})
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -125,6 +135,9 @@ def verify_code(
         db.rollback()
         raise
 
+    capture_business(db.get_bind(), inspect(user).identity[0], 'login_succeeded',
+        {'method': (analytics_context.get() or {}).get('auth') or 'email'},
+        'login:' + str(uuid4()), analytics_context.get())
     return {"access_token": access_token, "token_type": "bearer", "guest_chart_migration": migration}
 
 # === Авторизация с миграцией гостевых данных ===
@@ -134,6 +147,7 @@ def login(
     request: Request,
     db: Session = Depends(get_db)
 ):
+    enforce(db, request, 'login', email=str(credentials.email))
     user = db.query(User).filter(User.email == credentials.email).first()
     if not user or not verify_password(credentials.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Неверный email или пароль")
@@ -154,23 +168,24 @@ def login(
             db=db, user_id=user.id, session_token=session_token_uuid,
             guest_chart_id=credentials.guest_chart_id,
         )
-        access_token = create_access_token(data={"sub": str(user.id)})
+        access_token = create_access_token(data={"sub": str(user.id), "ver": user.auth_version})
         db.commit()
     except Exception:
         db.rollback()
         raise
+    capture_business(db.get_bind(), inspect(user).identity[0], 'login_succeeded',
+        {'method': (analytics_context.get() or {}).get('auth') or 'email'},
+        'login:' + str(uuid4()), analytics_context.get())
     return {"access_token": access_token, "token_type": "bearer", "guest_chart_migration": migration}
 @router.post("/google", response_model=Token)
 def google_login(credentials: GoogleLogin, request: Request, db: Session = Depends(get_db)):
     # GIS popup callback sends JSON, not Google's form-post/redirect flow. Reject
     # cross-site login CSRF explicitly; no cookies or application JWT are trusted here.
-    if request.headers.get("origin") not in {
-        "http://localhost:3000", "https://astrology-ai-frontend-production.up.railway.app",
-        "https://mylunariaai.com",
-    }:
+    if request.headers.get("origin") not in AUTH_ORIGINS:
         raise HTTPException(403, detail="Недопустимый источник входа Google.")
     if request.headers.get("content-type", "").split(";")[0].strip() != "application/json":
         raise HTTPException(415, detail="Требуется JSON.")
+    enforce(db, request, 'google')
     identity = verify_google_credential(credentials.credential, credentials.nonce)
     try:
         session_token = UUID(request.headers["X-Session-Token"]) if request.headers.get("X-Session-Token") else None
@@ -203,8 +218,11 @@ def google_login(credentials: GoogleLogin, request: Request, db: Session = Depen
                 db.flush()
             migration = migrate_guest_data_to_user(db=db, user_id=user.id, session_token=session_token,
                                                   guest_chart_id=credentials.guest_chart_id)
-            access_token = create_access_token(data={"sub": str(user.id)})
+            access_token = create_access_token(data={"sub": str(user.id), "ver": user.auth_version})
             db.commit()
+            capture_business(db.get_bind(), inspect(user).identity[0], 'login_succeeded',
+                {'method': (analytics_context.get() or {}).get('auth') or 'email'},
+                'login:' + str(uuid4()), analytics_context.get())
             return {"access_token": access_token, "token_type": "bearer", "guest_chart_migration": migration}
         except IntegrityError:
             db.rollback()
@@ -218,6 +236,11 @@ def google_login(credentials: GoogleLogin, request: Request, db: Session = Depen
             raise HTTPException(503, detail="Не удалось завершить вход. Попробуйте снова.") from None
 
 
+def current_session(payload, user):
+    version = payload.get('ver', 0)  # Existing JWTs remain valid until a reset.
+    return type(version) is int and version == user.auth_version
+
+
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -228,6 +251,8 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
+    if not current_session(payload, user):
+        raise HTTPException(401, detail='Сессия завершена. Войдите в аккаунт заново.')
     return user
 optional_oauth2_scheme = OptionalOAuth2Scheme()
 
@@ -242,7 +267,7 @@ async def get_current_user_or_guest(
             payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
             user_id = int(payload.get("sub"))
             user = db.query(User).filter(User.id == user_id).first()
-            if user:
+            if user and current_session(payload, user):
                 return {"user": user, "session_token": None}
         except Exception:
             pass  # если JWT плохой — идем дальше
@@ -270,3 +295,39 @@ def get_me(current_user: User = Depends(get_current_user)):
         "id": current_user.id,
         "email": current_user.email
     }
+
+
+@router.post('/request-password-reset')
+def request_password_reset(body: PasswordResetRequest, request: Request, response: Response,
+                           background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    response.headers['Cache-Control'] = 'no-store'
+    enforce(db, request, 'reset_request', email=str(body.email))
+    background_tasks.add_task(deliver_reset, db.get_bind(), str(body.email))
+    return {'message': RESET_MESSAGE}
+
+
+@router.post('/reset-password')
+def reset_password(body: PasswordResetConfirm, request: Request, response: Response,
+                   db: Session = Depends(get_db)):
+    response.headers['Cache-Control'] = 'no-store'
+    enforce(db, request, 'reset_confirm')
+    invalid = 'Ссылка недействительна или срок её действия истёк. Запросите новую ссылку.'
+    try:
+        token_hash = digest(body.token)
+        record = db.query(PasswordReset).filter_by(token_hash=token_hash).first()
+        if record is None:
+            raise HTTPException(400, invalid)
+        # Lock the user before any token: resets with different tokens serialize too.
+        user = db.query(User).filter_by(id=record.user_id).with_for_update().first()
+        record = db.query(PasswordReset).filter_by(token_hash=token_hash).populate_existing().with_for_update().first()
+        if (not user or record is None or record.expires_at <= datetime.utcnow()
+                or record.auth_version != user.auth_version):
+            raise HTTPException(400, invalid)
+        user.password_hash = get_password_hash(body.password)
+        user.auth_version += 1
+        db.query(PasswordReset).filter_by(user_id=user.id).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {'message': 'Пароль изменён. Войдите в аккаунт с новым паролем.'}

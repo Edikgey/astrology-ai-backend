@@ -48,6 +48,7 @@ class NatalChartResponse(BaseModel):
     birth_utc: Optional[datetime] = None
     house_system: Optional[str] = None
     time_provenance: str = 'legacy_unverified'
+    calculation_warnings: List[str] = Field(default_factory=list)
 class SelectedLocation(BaseModel):
     city: str = Field(..., min_length=1)
     region: str
@@ -100,7 +101,7 @@ class NatalChartSummary(BaseModel):
 class NatalChartListResponse(BaseModel):
     charts: List[NatalChartSummary]
     count: int
-    limit: int
+    limit: Optional[int]
 
 class GPTInterpretationResponse(BaseModel):
     chart_id: int

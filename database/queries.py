@@ -1,5 +1,6 @@
-from sqlalchemy import JSON, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, CheckConstraint, Index, UniqueConstraint, case, text
+from sqlalchemy import JSON, Column, Integer, String, Text, Float, Boolean, ForeignKey, DateTime, CheckConstraint, Index, UniqueConstraint, case, text
 from sqlalchemy.orm import relationship
+from sqlalchemy.sql.expression import Grouping
 from datetime import datetime
 from database.connection import Base
 from sqlalchemy.dialects.postgresql import UUID, JSONB
@@ -12,6 +13,7 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
     google_sub = Column(String(255), nullable=True, unique=True)
+    auth_version = Column(Integer, nullable=False, default=0, server_default="0")
     created_at = Column(DateTime, default=datetime.utcnow)
     plan = Column(String, nullable=False, default="free", server_default="free")
     current_period_start = Column(DateTime, nullable=True)  # UTC, as elsewhere in this schema
@@ -20,7 +22,6 @@ class User(Base):
     provider_customer_id = Column(String, nullable=True)
     provider_subscription_id = Column(String, nullable=True)
     subscription_status = Column(String, nullable=True)
-    paddle_updated_at = Column(DateTime, nullable=True)
     scheduled_cancel_at = Column(DateTime, nullable=True)
     __table_args__ = (CheckConstraint("plan IN ('free', 'premium')", name="ck_users_plan"),
         CheckConstraint("payment_provider IS NOT NULL OR (provider_customer_id IS NULL AND provider_subscription_id IS NULL)", name="ck_users_billing_provider"),
@@ -30,21 +31,90 @@ class User(Base):
     natal_charts = relationship("NatalChart", back_populates="user")
 
 
-class PaddleCheckout(Base):
-    """Server-created ownership binding and reusable checkout; no payment payloads."""
-    __tablename__ = "paddle_checkouts"
+class SecurityRateLimit(Base):
+    __tablename__ = "security_rate_limits"
+    bucket_key = Column(String(64), primary_key=True)
+    hits = Column(Integer, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+
+
+class PasswordReset(Base):
+    __tablename__ = "password_resets"
+    token_hash = Column(String(64), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    auth_version = Column(Integer, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+
+
+class Feedback(Base):
+    __tablename__ = "feedback"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    request_id = Column(String(36), nullable=False)
+    category = Column(String(16), nullable=False)
+    message = Column(Text, nullable=False)
+    page_path = Column(String(200), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint("user_id", "request_id", name="uq_feedback_request"),
+        CheckConstraint("category IN ('idea', 'bug', 'feedback')", name="ck_feedback_category"),
+        CheckConstraint("length(trim(message)) BETWEEN 1 AND 2000", name="ck_feedback_message"),
+        Index("ix_feedback_user_created", "user_id", "created_at"),
+        Index("ix_feedback_created_at", "created_at"),
+    )
+
+
+class StripeCheckout(Base):
+    """Durable server-owned intent, including ambiguous network results."""
+    __tablename__ = "stripe_checkouts"
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    transaction_id = Column(String, unique=True, nullable=True)
+    account_id = Column(String, nullable=False)
+    livemode = Column(Boolean, nullable=False)
+    customer_id = Column(String, nullable=True)
+    session_id = Column(String, unique=True, nullable=True)
     subscription_id = Column(String, unique=True, nullable=True)
     state = Column(String, nullable=False, default="creating")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=True)
+    revision = Column(Integer, nullable=False, default=0, server_default="0")
+    subscription_status = Column(String, nullable=True)
+    ended_at = Column(DateTime, nullable=True)
 
 
-class PaddleEvent(Base):
-    # Physical table name retained for compatibility; shared provider event ledger.
-    __tablename__ = "paddle_events"
-    provider = Column(String, nullable=False, default="paddle", server_default="paddle")
+class BillingCustomer(Base):
+    __tablename__ = "billing_customers"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    provider = Column(String, nullable=False)
+    account_id = Column(String, nullable=False)
+    livemode = Column(Boolean, nullable=False)
+    customer_id = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("provider", "account_id", "livemode", "user_id", name="uq_billing_customer_user"),
+        UniqueConstraint("provider", "account_id", "livemode", "customer_id", name="uq_billing_customer_external"))
+
+
+class BillingPeriod(Base):
+    __tablename__ = "billing_periods"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    provider = Column(String, nullable=False)
+    account_id = Column(String, nullable=False)
+    livemode = Column(Boolean, nullable=False)
+    subscription_id = Column(String, nullable=False)
+    invoice_id = Column(String, nullable=False)
+    period_start = Column(DateTime, nullable=False)
+    period_end = Column(DateTime, nullable=False)
+    applied = Column(Boolean, nullable=False, default=False)
+    __table_args__ = (UniqueConstraint("provider", "account_id", "livemode", "invoice_id", name="uq_billing_period_invoice"),
+        UniqueConstraint("provider", "account_id", "livemode", "subscription_id", "period_start", name="uq_billing_period_start"),
+        CheckConstraint("period_start < period_end", name="ck_billing_period_dates"))
+
+
+class BillingEvent(Base):
+    __tablename__ = "billing_events"
+    provider = Column(String, nullable=False)
     event_id = Column(String, primary_key=True)
     event_type = Column(String, nullable=False)
     occurred_at = Column(DateTime, nullable=False)
@@ -87,7 +157,7 @@ class BillingConflict(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     last_seen_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     __table_args__ = (UniqueConstraint("provider", "subscription_id", name="uq_billing_conflict_subscription"),
-        CheckConstraint("provider IN ('lava', 'paddle')", name="ck_billing_conflict_provider"),
+        CheckConstraint("provider IN ('lava', 'stripe')", name="ck_billing_conflict_provider"),
         CheckConstraint("status IN ('open', 'resolved')", name="ck_billing_conflict_status"))
 
 
@@ -233,8 +303,8 @@ class Relationship(Base):
         Index("ix_relationships_chart_a", "chart_a_id"),
         Index("ix_relationships_chart_b", "chart_b_id"),
         Index("uq_relationships_owner_pair", user_id,
-              case((chart_a_id < chart_b_id, chart_a_id), else_=chart_b_id),
-              case((chart_a_id < chart_b_id, chart_b_id), else_=chart_a_id), unique=True),
+              Grouping(case((chart_a_id < chart_b_id, chart_a_id), else_=chart_b_id)),
+              Grouping(case((chart_a_id < chart_b_id, chart_b_id), else_=chart_a_id)), unique=True),
     )
 
 

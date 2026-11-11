@@ -10,7 +10,7 @@ import httpx
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 import test_my_charts as fixtures
-from database.queries import User, LavaCheckout, PaddleCheckout, PaddleEvent, GPTUsage
+from database.queries import User, LavaCheckout, StripeCheckout, BillingEvent, GPTUsage
 from modules import lava_billing as billing, lava_client as api, usage
 
 OFFER, PRODUCT, CONTRACT, RENEWAL = [str(uuid4()) for _ in range(4)]
@@ -99,6 +99,26 @@ class LavaTests(unittest.TestCase):
         self.assertEqual(self.client.post("/payments/lava/checkout", headers=self.other).json(), r.json())
         self.assertEqual(len([c for c in self.network.call_args_list if c.args[0] == "POST"]), 1)
 
+    def test_definitive_email_rejection_does_not_leave_attempt_in_progress(self):
+        provider=self.provider
+        def rejected(method,path,**kwargs):
+            if method=='POST':raise api.InvoiceEmailRejected()
+            return provider(method,path,**kwargs)
+        self.network.side_effect=rejected
+        for _ in range(2):
+            r=self.client.post('/payments/lava/checkout',headers=self.other)
+            self.assertEqual(r.status_code,422)
+            self.assertIn('Lava отклонила email',r.json()['detail'])
+        with self.sessions() as db:
+            attempts=db.query(LavaCheckout).filter_by(user_id=2).all()
+            self.assertEqual(len(attempts),2)
+            self.assertTrue(all(c.state=='rejected' and not c.contract_id and not c.payment_url for c in attempts))
+            self.assertEqual(db.get(User,2).plan,'free')
+        self.network.side_effect=provider
+        r=self.client.post('/payments/lava/checkout',headers=self.other)
+        self.assertEqual(r.status_code,200)
+        self.assertEqual(self.client.post('/payments/lava/checkout',headers=self.other).json(),r.json())
+
     def test_missing_config_and_wrong_catalog_price_fail_before_invoice(self):
         with patch.dict(os.environ, {"LAVA_API_KEY": ""}):
             self.assertEqual(self.client.post("/payments/lava/checkout", headers=self.other).status_code, 503)
@@ -163,15 +183,20 @@ class LavaTests(unittest.TestCase):
             self.assertEqual(r.json()["url"], "https://pay.example.test/existing")
         self.assertFalse(any(c.args[0] == "POST" for c in self.network.call_args_list))
 
-    def test_failed_checkout_allows_retry_and_paddle_switch(self):
-        from modules import paddle_billing
+    def test_failed_checkout_allows_retry_and_stripe_switch(self):
+        from modules import stripe_billing
+        from test_stripe import ENV as STRIPE_ENV
         self.snapshot.update(status="FAILED", subscriptionStatus="FAILED", expiredAt=None)
         self.assertEqual(self.send(self.event("payment.failed")).status_code, 200)
-        with patch.object(paddle_billing, "premium_price_id", return_value="price"), patch.object(paddle_billing, "paddle_client") as client:
-            client.return_value.transactions.create.return_value.id = "txn_test"
-            r = self.client.post("/payments/paddle/checkout", headers=self.owner)
+        with patch.dict(os.environ, STRIPE_ENV), patch.object(stripe_billing, "create_checkout", wraps=stripe_billing.create_checkout), patch.object(stripe_billing, "api") as client:
+            from test_stripe import price, CUSTOMER
+            import time
+            client.return_value.prices.retrieve.return_value = price()
+            client.return_value.customers.create.return_value = {"id": CUSTOMER, "livemode": True}
+            client.return_value.checkout.sessions.create.return_value = {"id": "cs_live_test", "livemode": True, "status": "open", "client_secret": "cs_live_test_secret_test", "expires_at": int(time.time()) + 3600}
+            r = self.client.post("/payments/stripe/checkout", headers=self.owner)
             self.assertEqual(r.status_code, 200, r.text)
-            client.return_value.transactions.create.assert_called_once()
+            client.return_value.checkout.sessions.create.assert_called_once()
         with self.sessions() as db:
             self.assertEqual(db.get(LavaCheckout, "bound").state, "failed")
         late = self.event("payment.failed", datetime.utcnow())
@@ -198,16 +223,21 @@ class LavaTests(unittest.TestCase):
         self.assertEqual(len([c for c in self.network.call_args_list if c.args[0] == "POST"]), 1)
 
     def test_legacy_failed_billing_owner_is_released_on_verified_switch(self):
-        from modules import paddle_billing
+        from modules import stripe_billing
+        from test_stripe import ENV as STRIPE_ENV
         self.snapshot.update(status="FAILED", subscriptionStatus="FAILED", expiredAt=None)
         with self.sessions() as db:
             u = db.get(User, 1)
             u.payment_provider, u.provider_subscription_id, u.subscription_status = "lava", CONTRACT, "failed"
             db.get(LavaCheckout, "bound").state = "failed"
             db.commit()
-        with patch.object(paddle_billing, "premium_price_id", return_value="price"), patch.object(paddle_billing, "paddle_client") as client:
-            client.return_value.transactions.create.return_value.id = "txn_test"
-            r = self.client.post("/payments/paddle/checkout", headers=self.owner)
+        with patch.dict(os.environ, STRIPE_ENV), patch.object(stripe_billing, "create_checkout", wraps=stripe_billing.create_checkout), patch.object(stripe_billing, "api") as client:
+            from test_stripe import price, CUSTOMER
+            import time
+            client.return_value.prices.retrieve.return_value = price()
+            client.return_value.customers.create.return_value = {"id": CUSTOMER, "livemode": True}
+            client.return_value.checkout.sessions.create.return_value = {"id": "cs_live_test", "livemode": True, "status": "open", "client_secret": "cs_live_test_secret_test", "expires_at": int(time.time()) + 3600}
+            r = self.client.post("/payments/stripe/checkout", headers=self.owner)
             self.assertEqual(r.status_code, 200, r.text)
 
     def test_reconciliation_failure_keeps_intent_and_never_creates_invoice(self):
@@ -218,15 +248,20 @@ class LavaTests(unittest.TestCase):
             self.assertEqual(db.query(LavaCheckout).count(), 1)
         self.assertFalse(any(c.args[0] == "POST" for c in self.network.call_args_list))
 
-    def test_pending_lava_allows_paddle_but_paid_lava_blocks_new_checkout(self):
-        from modules import paddle_billing
-        with patch.object(paddle_billing, "premium_price_id", return_value="price"), patch.object(paddle_billing, "paddle_client") as client:
-            client.return_value.transactions.create.return_value.id = "txn_test"
-            self.assertEqual(self.client.post("/payments/paddle/checkout", headers=self.owner).status_code, 200)
+    def test_pending_lava_allows_stripe_but_paid_lava_blocks_new_checkout(self):
+        from modules import stripe_billing
+        from test_stripe import ENV as STRIPE_ENV
+        with patch.dict(os.environ, STRIPE_ENV), patch.object(stripe_billing, "create_checkout", wraps=stripe_billing.create_checkout), patch.object(stripe_billing, "api") as client:
+            from test_stripe import price, CUSTOMER
+            import time
+            client.return_value.prices.retrieve.return_value = price()
+            client.return_value.customers.create.return_value = {"id": CUSTOMER, "livemode": True}
+            client.return_value.checkout.sessions.create.return_value = {"id": "cs_live_test", "livemode": True, "status": "open", "client_secret": "cs_live_test_secret_test", "expires_at": int(time.time()) + 3600}
+            self.assertEqual(self.client.post("/payments/stripe/checkout", headers=self.owner).status_code, 200)
             self.send(self.event())
-            self.assertEqual(self.client.post("/payments/paddle/checkout", headers=self.owner).status_code, 409)
+            self.assertEqual(self.client.post("/payments/stripe/checkout", headers=self.owner).status_code, 409)
             self.assertEqual(self.client.post("/payments/lava/checkout", headers=self.owner).status_code, 409)
-            client.return_value.transactions.create.assert_called_once()
+            client.return_value.checkout.sessions.create.assert_called_once()
 
     def test_renewal_uses_exact_api_period_duplicate_and_old_failure_safe(self):
         self.send(self.event())
@@ -271,7 +306,7 @@ class LavaTests(unittest.TestCase):
             self.assertEqual(self.send(value).json()["outcome"], "duplicate")
             self.assertEqual(self.state()["plan"], "premium")
             with self.sessions() as db:
-                self.assertFalse(db.get(PaddleEvent, "lava:" + value["event_id"]).details["subscription_cancelled"])
+                self.assertFalse(db.get(BillingEvent, "lava:" + value["event_id"]).details["subscription_cancelled"])
 
     def test_refund_and_chargeback_cancel_only_after_contract_state_verified(self):
         self.send(self.event())
@@ -295,24 +330,24 @@ class LavaTests(unittest.TestCase):
     def test_provider_owned_ids_and_checkout_isolation(self):
         with self.sessions() as db:
             user = db.get(User, 1)
-            user.payment_provider = "paddle"; user.provider_subscription_id = CONTRACT
+            user.payment_provider = "stripe"; user.provider_subscription_id = CONTRACT
             usage.apply_plan(db, user, "premium", self.start, self.end); db.commit()
         self.assertEqual(self.send(self.event()).json()["outcome"], "billing_conflict")
         self.assertEqual(self.client.post("/payments/lava/checkout", headers=self.owner).status_code, 409)
         self.assertEqual(self.client.post("/payments/lava/cancel", headers=self.owner).status_code, 409)
-        with self.sessions() as db: self.assertEqual(db.get(User, 1).payment_provider, "paddle")
+        with self.sessions() as db: self.assertEqual(db.get(User, 1).payment_provider, "stripe")
 
     def test_unique_ids_scoped_and_same_provider_duplicate_denied(self):
         with self.sessions() as db:
-            for uid, provider in ((1, "paddle"), (2, "lava")):
+            for uid, provider in ((1, "stripe"), (2, "lava")):
                 user = db.get(User, uid); user.payment_provider = provider
                 user.provider_customer_id = "same"; user.provider_subscription_id = CONTRACT
             db.commit()
-            db.get(User, 2).payment_provider = "paddle"
+            db.get(User, 2).payment_provider = "stripe"
             with self.assertRaises(IntegrityError): db.commit()
             db.rollback()
-            for provider in ("paddle", "lava"):
-                db.add(PaddleEvent(provider=provider, event_id="same" if provider == "paddle" else "lava:same", event_type="test", occurred_at=self.start))
+            for provider in ("stripe", "lava"):
+                db.add(BillingEvent(provider=provider, event_id="same" if provider == "stripe" else "lava:same", event_type="test", occurred_at=self.start))
             db.commit()
 
     def test_cancel_uses_bound_contract_and_email_once_waits_for_webhook(self):
@@ -335,7 +370,7 @@ class LavaTests(unittest.TestCase):
         self.network.side_effect = HTTPException(502, "unavailable")
         self.assertEqual(self.send(self.event()).status_code, 502)
         self.assertEqual(self.state()["plan"], "free")
-        with self.sessions() as db: self.assertEqual(db.query(PaddleEvent).count(), 0)
+        with self.sessions() as db: self.assertEqual(db.query(BillingEvent).count(), 0)
 
     def test_api_eventual_consistency_does_not_acknowledge_unconfirmed_payment(self):
         self.snapshot["status"] = "IN_PROGRESS"
@@ -345,9 +380,9 @@ class LavaTests(unittest.TestCase):
         self.assertEqual(self.send(value).status_code, 200)
         self.assertEqual(self.state()["plan"], "premium")
 
-    def test_paddle_pending_checkout_allows_lava(self):
+    def test_stripe_pending_checkout_allows_lava(self):
         with self.sessions() as db:
-            db.add(PaddleCheckout(user_id=2, state="creating")); db.commit()
+            db.add(StripeCheckout(user_id=2, state="creating", account_id="acct_test", livemode=True)); db.commit()
         self.assertEqual(self.client.post("/payments/lava/checkout", headers=self.other).status_code, 200)
         self.assertTrue(any(c.args[0] == "POST" for c in self.network.call_args_list))
 
@@ -376,6 +411,23 @@ class LavaTests(unittest.TestCase):
 
 
 class LavaHttpTests(unittest.TestCase):
+    def test_only_exact_invoice_email_rejection_is_safe_to_release(self):
+        original=httpx.Client
+        cases=[(400,{'error':'Incorrect email to purchase'},True),
+               (400,{'error':'Other validation failure'},False),
+               (400,{'error':'Incorrect email to purchase','id':CONTRACT},False),
+               (500,{'error':'Incorrect email to purchase'},False)]
+        for status,body,rejected in cases:
+            with self.subTest(status=status,body=body),patch.dict(os.environ,ENV):
+                handler=Mock(return_value=httpx.Response(status,json={**body,'details':'sensitive-provider-data'}))
+                client=original(transport=httpx.MockTransport(handler))
+                with patch('modules.lava_client.httpx.Client',return_value=client), self.assertLogs('modules.lava_client',level='WARNING') as logs:
+                    with self.assertRaises(HTTPException) as caught:api.request('POST','/api/v3/invoice',json={})
+                self.assertEqual(isinstance(caught.exception,api.InvoiceEmailRejected),rejected)
+                self.assertEqual(caught.exception.status_code,422 if rejected else 502)
+                self.assertEqual(handler.call_count,1)
+                self.assertNotIn('sensitive-provider-data',str(logs.output)+str(caught.exception.detail))
+
     def test_failure_diagnostics_exclude_provider_data_and_do_not_retry(self):
         import json
         original = httpx.Client

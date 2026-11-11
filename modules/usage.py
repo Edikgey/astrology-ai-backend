@@ -52,14 +52,16 @@ def valid_period(user, now):
 def quota_state(db, user, now):
     limits = plan_limits(user)
     rows = db.query(GPTUsage).filter(GPTUsage.user_id == user.id)
-    if limits.gpt_limit_type == "billing_period":
+    if user.plan == "premium":
         # The start is the period identity; extending the end must not reset usage.
         rows = rows.filter(GPTUsage.plan == "premium", GPTUsage.period_start == user.current_period_start)
     used = rows.filter(GPTUsage.status == "succeeded").count()
     reserved = rows.filter(GPTUsage.status == "reserved", GPTUsage.expires_at > now).count()
-    period_ok = user.plan == "free" or valid_period(user, now)
+    beta = limits.gpt_limit_type == "unlimited"
+    period_ok = beta or user.plan == "free" or valid_period(user, now)
     return {
         "plan": user.plan,
+        "free_beta_enabled": beta,
         "gpt_messages_used": used,
         "gpt_messages_reserved": reserved,
         "gpt_messages_limit": limits.gpt_message_limit,
@@ -67,11 +69,12 @@ def quota_state(db, user, now):
         "current_period_start": user.current_period_start,
         "current_period_end": user.current_period_end,
         "gpt_period_valid": period_ok,
-        "gpt_messages_available": max(0, limits.gpt_message_limit - used - reserved) if period_ok else 0,
+        "gpt_messages_available": None if beta else max(0, limits.gpt_message_limit - used - reserved) if period_ok else 0,
     }
 
 
 def account_usage(db, user_id):
+    from modules.stripe_billing import portal_customer_id
     try:
         user = locked_user(db, user_id)
         backfill_user_history(db, user_id)
@@ -81,13 +84,15 @@ def account_usage(db, user_id):
                       subscription_status=user.subscription_status,
                       scheduled_cancel_at=user.scheduled_cancel_at,
                       cancel_at_period_end=user.scheduled_cancel_at is not None,
-                      can_manage_subscription=bool(user.payment_provider == "paddle" and user.provider_customer_id),
+                      can_manage_subscription=portal_customer_id(db, user) is not None,
                       payment_provider=user.payment_provider,
                       can_cancel_subscription=bool(user.payment_provider == "lava" and user.provider_subscription_id
                                                    and user.subscription_status in ("active", "past_due")
                                                    and not user.scheduled_cancel_at))
         from modules.lava_client import configured
         result["lava_checkout_available"] = configured()
+        from modules.stripe_billing import configured as stripe_configured
+        result["stripe_checkout_available"] = stripe_configured()
         db.commit()
         return result
     except BaseException:
@@ -108,7 +113,7 @@ def reserve(db, user_id, chart_id=None, *, relationship_id=None):
         if not state["gpt_period_valid"]:
             raise HTTPException(409, detail={"code": "GPT_PERIOD_INVALID", "plan": user.plan,
                                             "message": "Нет действующего периода Premium."})
-        if not state["gpt_messages_available"]:
+        if state["gpt_messages_limit"] is not None and not state["gpt_messages_available"]:
             raise HTTPException(409, detail={"code": "GPT_LIMIT_REACHED", "plan": user.plan,
                 "used": state["gpt_messages_used"], "reserved": state["gpt_messages_reserved"],
                 "limit": state["gpt_messages_limit"], "message": "Достигнут лимит GPT-сообщений аккаунта."})

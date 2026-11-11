@@ -334,7 +334,7 @@ class MyChartsTests(unittest.TestCase):
         history_before = self.legacy_history(chart_id)
         self.verification_code()
         response = self.client.post("/auth/verify-code?code=123456", headers=self.guest,
-                                    json={"email": "new@example.com", "password": "test-password-only", "guest_chart_id": chart_id})
+                                    json={"email": "new@example.com", "password": "Test-password1!", "guest_chart_id": chart_id})
         self.assertEqual(response.status_code, 200, response.text)
         registered = {"Authorization": "Bearer " + response.json()["access_token"]}
         new_user_id = self.client.get("/auth/me", headers=registered).json()["id"]
@@ -357,13 +357,13 @@ class MyChartsTests(unittest.TestCase):
     def test_verification_without_guest_header_still_works(self):
         self.verification_code()
         response = self.client.post("/auth/verify-code?code=123456",
-                                    json={"email": "new@example.com", "password": "test-password-only"})
+                                    json={"email": "new@example.com", "password": "Test-password1!"})
         self.assertEqual(response.status_code, 200, response.text)
 
     def test_invalid_guest_header_does_not_create_user_or_consume_code(self):
         self.verification_code()
         response = self.client.post("/auth/verify-code?code=123456", headers={"X-Session-Token": "invalid"},
-                                    json={"email": "new@example.com", "password": "test-password-only"})
+                                    json={"email": "new@example.com", "password": "Test-password1!"})
         self.assertEqual(response.status_code, 422)
         with self.sessions() as session:
             self.assertIsNone(session.query(User).filter_by(email="new@example.com").first())
@@ -373,7 +373,7 @@ class MyChartsTests(unittest.TestCase):
         chart_id = self.chart(user_id=None, session_token=self.guest_token)
         self.verification_code()
         response = self.client.post("/auth/verify-code?code=000000", headers=self.guest,
-                                    json={"email": "new@example.com", "password": "test-password-only"})
+                                    json={"email": "new@example.com", "password": "Test-password1!"})
         self.assertEqual(response.status_code, 400)
         self.assertEqual(self.client.get(f"/natal-chart/{chart_id}", headers=self.guest).status_code, 200)
 
@@ -381,12 +381,12 @@ class MyChartsTests(unittest.TestCase):
         with self.sessions() as session:
             user = session.get(User, 1)
             user.email = "existing@example.com"
-            user.password_hash = get_password_hash("test-password-only")
+            user.password_hash = get_password_hash("Test-password1!")
             session.commit()
         chart_id = self.chart(user_id=None, session_token=self.guest_token)
         history_before = self.legacy_history(chart_id)
         response = self.client.post("/auth/login", headers=self.guest,
-                                    json={"email": "existing@example.com", "password": "test-password-only", "guest_chart_id": chart_id})
+                                    json={"email": "existing@example.com", "password": "Test-password1!", "guest_chart_id": chart_id})
         self.assertEqual(response.status_code, 200, response.text)
         headers = {"Authorization": "Bearer " + response.json()["access_token"]}
         self.assertEqual(self.client.get(f"/natal-chart/{chart_id}", headers=headers).status_code, 200)
@@ -398,7 +398,7 @@ class MyChartsTests(unittest.TestCase):
 
     def migration_auth(self, flow, chart_id=None, headers=None, saved_count=0, fail_token=False):
         email = f"migration-{uuid4().hex}@example.com"
-        password = "test-password-only"
+        password = "Test-password1!"
         if flow == "login":
             with self.sessions() as db:
                 user = User(email=email, password_hash=get_password_hash(password))

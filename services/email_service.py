@@ -10,6 +10,20 @@ class EmailDeliveryError(Exception):
 
 
 async def send_confirmation_email(email: str, code: str):
+    await send_email(email, 'Код подтверждения регистрации в Lunaria',
+                     f'Ваш код подтверждения: {code}\n\nКод действует 10 минут.\nЕсли вы не запрашивали регистрацию, проигнорируйте это письмо.')
+
+
+async def send_password_reset_email(email: str, token: str):
+    # Fixed trusted origin; fragment never reaches frontend/proxy access logs.
+    link = 'https://mylunariaai.com/reset-password#token=' + token
+    await send_email(email, 'Восстановление пароля Lunaria',
+                     f'Чтобы задать новый пароль, откройте ссылку:\n{link}\n\n'
+                     'Ссылка действует 30 минут и может быть использована один раз.\n'
+                     'Если вы не запрашивали восстановление, проигнорируйте это письмо. Ваш пароль не изменится.')
+
+
+async def send_email(email: str, subject: str, body: str):
     try:
         username, password = os.environ["MAIL_USERNAME"], os.environ["MAIL_PASSWORD"]
         if not username.strip() or not password.strip():
@@ -33,13 +47,13 @@ async def send_confirmation_email(email: str, code: str):
             TIMEOUT=20,
         )
         message = MessageSchema(
-            subject="Код подтверждения регистрации в Lunaria",
+            subject=subject,
             recipients=[email],
-            body=f"Ваш код подтверждения: {code}\n\nКод действует 10 минут.\nЕсли вы не запрашивали регистрацию, проигнорируйте это письмо.",
+            body=body,
             subtype="plain",
         )
         await FastMail(conf).send_message(message)
     except Exception as error:
         # SMTP exceptions can contain credentials, addresses or provider replies.
-        logger.warning("Confirmation email delivery failed (%s)", type(error).__name__)
+        logger.warning("Email delivery failed (%s)", type(error).__name__)
         raise EmailDeliveryError("Email delivery failed") from None

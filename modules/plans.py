@@ -2,12 +2,14 @@
 from dataclasses import dataclass
 from datetime import datetime
 from fastapi import HTTPException
+from typing import Optional
+from modules.free_beta import free_beta_enabled
 
 
 @dataclass(frozen=True)
 class PlanLimits:
-    max_saved_charts: int
-    gpt_message_limit: int
+    max_saved_charts: Optional[int]
+    gpt_message_limit: Optional[int]
     gpt_limit_type: str
 
 
@@ -29,4 +31,6 @@ def effective_plan(user, now=None):
 def plan_limits(user):
     if user.plan not in PLAN_LIMITS:
         raise HTTPException(409, detail={"code": "PLAN_INVALID", "message": "План аккаунта требует проверки."})
+    if free_beta_enabled():
+        return PlanLimits(None, None, "unlimited")
     return PLAN_LIMITS[effective_plan(user)]

@@ -1,207 +1,86 @@
-# Paddle + Lava billing
+# Stripe and Lava billing
 
-## Verified contract (2026-09-29)
+Stripe is the international provider: MyLunaria AI Premium costs USD 9.99 per
+calendar billing month, quantity one, with 300 successful AI questions and ten
+saved natal charts. Free remains three charts and ten lifetime successful AI
+questions. Questions across natal and relationship conversations share the
+account quota. There is no trial, metered usage, promotion code or plan switching.
 
-Sources: [official docs](https://developers.lava.top/en),
-[Swagger](https://gate.lava.top/docs),
-[OpenAPI](https://gate.lava.top/docs/documentation.yaml).
+Lava remains RUB 799/month. Its offer verification, hosted checkout, signed
+events, reconciliation, refund/chargeback handling, cancellation, ownership
+checks and access policy are unchanged. Only its event model/table has been
+renamed to BillingEvent/billing_events. Both adapters use the same user-row lock
+and the existing subscription-access and usage implementation.
 
-Authenticated read-only catalog verification found subscription product
-`915df4a1-b764-490a-8437-c6acaf3e02f7`, offer **Lunaria Premium**
-`ef8fea7a-31fc-453a-ae6f-900abf979a2c`, fixed **799 RUB / MONTHLY**.
-The creator corrected the initial USD-denominated price. These are deployment
-values, not hardcoded application IDs. Live catalog items are flat; Swagger also
-describes an `items[].data` wrapper. Both formats are supported.
+Stripe routes are POST /payments/stripe/checkout, GET
+/payments/stripe/checkout/{session_id}, POST /payments/stripe/portal and POST
+/payments/stripe/webhook. The first three require the account JWT. Browser-supplied
+prices, customer IDs, subscription IDs and user IDs cannot select another account.
 
-Checkout needs `offerId`; product ID is derived from its catalog entry.
-Before creating an invoice, the backend verifies price, currency, interval and
-subscription type. No browser amount, quantity, offer or identity is accepted.
-Lava does not have a quantity field in this request: one invoice buys one offer.
-Paddle continues to send exactly one item with quantity 1.
+Checkout persists an intent and a user/account/live-scoped customer binding before
+external writes. Stable idempotency keys recover ambiguous requests. Intents older
+than 23 hours without a confirmed response require support reconciliation before
+a new attempt (Stripe idempotency retention is not indefinite). A confirmed
+expired session permits a new attempt. Pending attempts at both providers can
+coexist; paid ownership is chosen only by the webhook transaction.
 
-Direct HTTP uses existing httpx. Current SDK wrappers lack return-URL fields.
-The API host is fixed, redirects disabled, timeouts explicit, and errors sanitized.
-There are no automatic invoice/cancellation retries; 429 returns a retry-later error.
-Invoice creation allows 10 seconds to connect, 30 seconds per read, 10 seconds
-per write and 5 seconds for the connection pool. Other API timeouts are unchanged.
-Failures log only fixed operation/stage labels, exception class, elapsed milliseconds
-and HTTP status when available. URLs/IDs, headers, bodies and exception text are
-never logged. A timeout remains ambiguous: it does not prove no invoice was created.
+The pinned stack is stripe-python 16.0.0 / API 2026-09-30.endive, stripe-js 10.0.0
+and react-stripe-js 7.0.0. Checkout uses ui_mode=embedded_page and flexible
+subscription billing. Only card is requested; supported wallets are displayed by
+Stripe according to account, domain, device and browser eligibility. The browser
+passes the server-returned client secret directly to EmbeddedCheckoutProvider.
+Raw card data never traverses Lunaria's backend. Browser completion and return
+URLs only start polling authenticated /account/usage.
 
-A controlled real invoice POST returned **HTTP 201**, without payment. The prior
-example.invalid attempt failed; read-only search found no technical invoice
-before the example.com attempt. The accepted unpaid invoice was not returned by
-the subsequent list query. Its response details and paid lifecycle still require
-the controlled E2E procedure below. Do not create duplicates simply to obtain
-another response. No live refund, cancellation or product edit was performed.
+STRIPE_CHECKOUT_ENABLED defaults false and stops new checkout creation without
+stopping signed webhooks or the authenticated portal. Backend credentials must
+be LIVE keys for the configured account; /v1/account is checked before each
+operation. Account, environment, API version and fixed price are verified.
+Stripe API reads run outside the user lock with a 10-second transport timeout.
+The checkout revision rejects concurrent stale snapshots with retryable 503.
 
-## Architecture
+Webhook bodies are bounded to 256 KiB. The official SDK verifies the exact raw
+body and endpoint secret; signatures outside a five-minute window are rejected.
+The endpoint retrieves authoritative current subscription/invoice/payment
+objects. A paid, bound, USD invoice for the configured recurring item, with a
+successful matching PaymentIntent, is required for allocation. Manual,
+out-of-band, zero-value, unrelated, prorated or unexpected line items cannot
+grant Premium. Future periods are not granted early.
 
-Paddle remains the default international flow (the existing repository uses
-Sandbox); Lava adds the RUB option for the **same Premium entitlement**.
+A billing_periods row uniquely identifies a paid invoice and subscription period.
+Within one transaction the user lock arbitrates primary ownership, records the
+event/period/conflict and applies the entitlement. Repeated events or invoices
+do not reset usage. Old periods cannot replace newer periods; overlapping periods
+fail closed. Recovery from unpaid/paused to a verified active paid period restores
+access without resetting counters. Terminal subscriptions cannot resurrect.
 
-Both adapters call `apply_subscription_access` under the User-row lock. Its
-grant/revoke/retain decisions use the existing `apply_plan`, preserving period
-overlap safeguards, account-wide quota, reservations and chart limits. No second
-Premium/quota system exists. Scheduled cancellation is provider-independent.
-Unscheduled expiry keeps existing behavior: Premium chart limits remain, while
-GPT fails closed without a valid paid period.
+Failed first payment grants nothing. Failed renewal retains the existing paid
+period; AI usage is blocked when it expires. Scheduled cancellation retains access
+until the confirmed end. Current canceled/unpaid/paused terminal access is revoked.
+Archived prices still allow lifecycle reconciliation; new sales require an active price.
 
-User has one billing owner. Customer/subscription uniqueness is now
-`(payment_provider, provider_customer_id)` and
-`(payment_provider, provider_subscription_id)`; non-null IDs require a provider.
-Lava uses the parent contract ID as subscription identity. No stable customer ID
-is exposed by these APIs, so Lava's customer ID remains NULL. Email is an immutable
-checkout cross-check, never an account identity lookup.
+Refund and dispute events record minimal references/status/amounts after provider
+verification. They do not automatically refund, cancel, grant quota or revoke
+access: subscription lifecycle controls access. Ambiguous financial ownership
+is recorded as unmatched without guessing by email. Support must resolve refund
+or dispute access policy and concurrent paid subscriptions manually. See
+[billing conflicts](billing-conflicts.md).
 
-`lava_checkouts` persists User FK, local intent ID, unique returned contract ID,
-verified offer/product, buyer email, URL, lifecycle watermark, last paid timestamp
-and cancellation-request flag. Completed bindings stay for late-event protection.
-Paddle/Lava transaction IDs are in separate provider-exclusive tables.
+The customer portal only uses the current user's scoped Stripe customer and a
+locally bound subscription. The portal configuration permits payment-method
+updates, invoices and end-of-period cancellation, with plan/quantity changes disabled.
+Its return URL is server-configured and Stripe-hosted destination is checked.
 
-## Migration and rollout compatibility
+Apply migrations/stripe_billing.sql after the existing billing migrations while
+all old backend workers are drained. This is a coordinated cutover, not a rolling
+rename. It preserves every user, usage record, Lava record and event ID. See
+[implementation report and approval gates](STRIPE_MIGRATION_REPORT.md) for the
+LIVE inventory, exact configuration, rollout and rollback.
 
-Apply `migrations/lava_billing.sql` once after `paddle_billing.sql`. It uses one
-transaction and a 5-second lock timeout. Preflight rejects unowned billing IDs.
-Composite uniqueness is added before old global constraints are dropped.
-The migration adds Lava checkout storage and extends the existing event ledger.
-It does not rewrite Paddle IDs, plans, periods, users, charts, messages or quota.
-
-The physical `paddle_events` table, `event_id` PK and all existing Paddle IDs
-remain intact. Old `ON CONFLICT(event_id)` works after migration. Added
-`provider` defaults to paddle; nullable `details` stores minimal financial audit.
-New Lava IDs use `lava:` + stable external event ID or legacy-event hash.
-Paddle validates `evt_*`, which cannot collide with this namespace.
-There is one shared event ledger, not a competing Lava ledger.
-
-Safe operator sequence: migrate, deploy **all backend workers** and frontend,
-then configure/enable Lava. Keep Lava configuration absent until that completes:
-old binaries' provider-unscoped queries must not process a mixed-provider
-population. Reapplication fails atomically. This project has no SQL downgrade
-convention; transactional failure rollback is tested. After mixed-provider data
-exists, do not restore global uniqueness or roll back to the old billing binary.
-No production migration/deployment was performed in this task.
-
-## Checkout and returns
-
-`POST /payments/lava/checkout` requires the existing app JWT. Under the User lock
-it rejects another provider, active subscription or pending checkout. Catalog
-HTTP happens outside a transaction; state is rechecked under lock before saving
-an intent. Then `POST /api/v3/invoice` receives server-owned email/offer, RUB,
-MONTHLY and return URLs. The result must contain a UUID contract, HTTPS payment URL
-and 799 RUB amount. Only the URL is returned to React.
-
-Pending verified URLs are reused. Ambiguous HTTP/storage failures preserve the
-intent and block automatic second creation; support must reconcile the invoice.
-A webhook arriving before the contract binding commits returns 503 for retry.
-There is no email-based fallback or client-provided custom identity.
-
-The existing upgrade modal retains Paddle and adds Lava 799 RUB/month when backend
-configuration is present. A separate tab preserves the current question/draft.
-No unverified MIR/SBP claims are made. Return navigation uses existing
-`/my-charts?billing=lava`. Query `status`/`invoiceId` never grants access;
-bounded polling reads authoritative `/account/usage`.
-
-## Webhook and event semantics
-
-`POST /payments/lava/webhook` checks `X-Api-Key` in constant time against
-`LAVA_WEBHOOK_SECRET`. Missing/invalid authentication -> 401; unconfigured -> 503.
-Flat camelCase and envelope snake_case payloads have separate validated parsers.
-Malformed known events -> 400 without access changes; unknown future types -> 200.
-Successful acknowledgement follows the atomic ledger/access commit.
-
-Legacy idempotency hashes type, contract, parent contract and normalized provider
-timestamp; financial events use stable `event_id`. All Lava keys are namespaced.
-A retried renewal never adds duration relative to local time or resets quota.
-
-HTTP reads precede row locking. `GET /api/v1/subscriptions/{parentContractId}`
-supplies exact expiry, completed payments, cancellation and termination dates.
-A cancellation with a child contract is resolved using
-`GET /api/v2/invoices/{id}`. No 30-day approximation is used. A success event
-must appear in the API's completed payments before acknowledgement; API lag -> 503.
-Older events cannot overwrite newer lifecycle state. Monotonic paid timestamps
-and cancellation guards also reject stale API snapshots fetched concurrently.
-
-| Event | Access effect |
-| --- | --- |
-| payment.success | Verify bound contract and completed API payment; grant shared Premium period. |
-| payment.failed | No grant from the event, no unpaid extension; reconcile authenticated provider state. |
-| subscription.recurring.payment.success | Reconcile latest completed payment and exact expiry once. |
-| subscription.recurring.payment.failed | Preserve paid period; past_due when API reports failure, GPT closes after expiry. |
-| subscription.cancelled | Schedule confirmed paid expiry, or revoke for confirmed termination. |
-| refund.success | Audit full/partial amount, reference and cancellation flag; false does not revoke. |
-| chargeback.initiated | Audit disputed amount/reference independently of refunds; no invented final outcome. |
-
-Financial envelopes have product/tier/email but **no contract ID**. When
-subscription_cancelled=true, a single known local binding may trigger an API read
-of that contract. Access changes only on confirmed cancellation/termination.
-Ambiguous/unmatched events become `recorded_unmatched` for operator review;
-the separately selected subscription.cancelled event remains authoritative.
-Refunds never call cancel. Partial refunds remain separate audit events.
-Separate cancellation delivery is safe and cannot reset quota.
-
-## Ownership and management
-
-Neither provider can mutate the other's billing state, even with colliding IDs.
-Provider-specific queries use provider scope or provider-exclusive checkout tables.
-Pending invoices block concurrent cross-provider checkout. Switching, even from
-an old canceled provider, is blocked; no automatic takeover/cancellation.
-Same-provider repurchase is permitted after confirmed ended/failed access, while
-completed old contracts cannot reclaim a newer subscription.
-
-Paddle portal remains Paddle-only. Lava users get explicit cancellation confirmation
-before `POST /payments/lava/cancel`. It calls documented
-`DELETE /api/v1/subscriptions?contractId=...&email=...` with saved server values.
-The intent is persisted before HTTP to suppress concurrent/ambiguous repeats.
-The webhook supplies the effective end; HTTP success does not guess expiry.
-An ambiguous/failed cancellation needs support verification and, if appropriate,
-resetting the intent after checking provider state. It is not confirmed cancellation.
-
-## Configuration and manual setup
-
-Backend only; see `.env.lava.example`. No new frontend env variables.
-
-- `LAVA_API_KEY`: creator API secret.
-- `LAVA_WEBHOOK_SECRET`: separate random webhook secret, 32–80 characters.
-- `LAVA_OFFER_ID`: verified offer UUID above, public configuration.
-- `LAVA_SUCCESS_RETURN_URL`, `LAVA_FAILURE_RETURN_URL`, `LAVA_CANCEL_RETURN_URL`:
-  all use `https://mylunariaai.com/my-charts?billing=lava`.
-  Each must be absolute HTTPS, at most 512 characters.
-
-Generate the webhook secret with a secure password manager or locally with
-`python -c "import secrets; print(secrets.token_urlsafe(32))"`.
-Copy directly to Railway and Lava, never chat/Git/logs. It is not the creator key.
-Existing Paddle variables/configuration stay unchanged.
-
-After separate rollout authorization:
-
-1. Verify the existing offer remains fixed at 799 RUB monthly. No new product or
-   Paddle price is needed. Verify hosted payment methods before advertising them.
-2. Apply migration once. Deploy backend/frontend with Lava still unconfigured;
-   wait for every backend worker to run the new version and verify Paddle.
-3. Add the six backend variables in Railway, then redeploy backend. Never prefix
-   secrets with REACT_APP_; leave frontend API URL/Paddle variables unchanged.
-4. Lava **Integrations -> API**: choose the same creator key and **Add Webhook**.
-   URL: `https://astrology-ai-backend-production.up.railway.app/payments/lava/webhook`.
-5. Authentication: **Your service's API key**, value = LAVA_WEBHOOK_SECRET.
-   Select all seven events from the table above. Current docs support one
-   destination with all events, replacing the old two-destination instructions.
-6. Inspect **Integrations -> API -> Webhook history**. Endpoint must be reachable
-   over HTTPS; docs list sender 158.160.60.174. Retain header authentication even
-   if adding an IP allowlist. Monitor recorded_unmatched and failed deliveries.
-
-## Controlled verification after deployment
-
-Use a dedicated Free account without a provider/pending checkout. Open RUB checkout
-once and verify **799 RUB/month on the actual hosted page before paying**.
-Closing/returning without payment must leave Free. Only an explicitly authorized,
-human-completed payment should activate Premium. Verify one bound subscription,
-exact API period and shared 300-per-period quota; replay its webhook and check that
-usage does not reset. Only with separate authorization, cancel that test subscription
-and verify paid-period access followed by expiry. Refunds/chargebacks stay mocked
-unless real-funds testing is separately authorized. Verify Paddle quantity 1/portal.
-
-Tests use fake credentials and isolated SQLite/PostgreSQL; the existing disposable
-PostgreSQL runner is outside both repositories under .pg-rehearsal-20260912.
-Use PYTHONIOENCODING=utf-8 for Windows astrology test output. This task does not
-commit, push, deploy, apply production SQL or perform real payments.
+Reproduce: backend .venv/Scripts/python -m unittest discover -s tests -q.
+Set USAGE_TEST_POSTGRES_URL only to a disposable localhost test_* database to
+include PostgreSQL suites; they create/drop random schemas. The workspace runner
+.pg-rehearsal-20260912/run-stripe-postgres-check.ps1 starts/stops a disposable
+cluster on 127.0.0.1:55487 and runs all tests. Frontend: CI=true npm test --
+--watchAll=false --runInBand, followed by npm run build. SDK tests use an in-memory
+transport with fake credentials; no Stripe objects or charges are created.

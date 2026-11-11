@@ -23,7 +23,8 @@ def migrate_guest_data_to_user(
     if chart is None:
         return {"status": "not_found", "chart_id": guest_chart_id}
 
-    if db.query(NatalChart).filter(NatalChart.user_id == user_id).count() >= saved_chart_limit(user):
+    limit = saved_chart_limit(user)
+    if limit is not None and db.query(NatalChart).filter(NatalChart.user_id == user_id).count() >= limit:
         return {"status": "limit_reached", "chart_id": guest_chart_id}
 
     chart.user_id = user_id

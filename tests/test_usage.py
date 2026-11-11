@@ -42,7 +42,7 @@ class UsageTests(unittest.TestCase):
     def test_new_users_are_free_and_client_cannot_select_plan(self):
         self.verification_code()
         response = self.client.post("/auth/verify-code?code=123456", json={
-            "email": "new@example.com", "password": "test-password-only", "plan": "premium"})
+            "email": "new@example.com", "password": "Test-password1!", "plan": "premium"})
         self.assertEqual(response.status_code, 200, response.text)
         with self.sessions() as db:
             user = db.query(User).filter_by(email="new@example.com").one()
@@ -79,14 +79,14 @@ class UsageTests(unittest.TestCase):
         with self.sessions() as db:
             user = db.get(User, 1)
             user.email = "existing@example.com"
-            user.password_hash = get_password_hash("test-password-only")
+            user.password_hash = get_password_hash("Test-password1!")
             db.commit()
         for _ in range(9):
             self.chart(related=False)
         guests = [self.chart(user_id=None, session_token=self.guest_token) for _ in range(2)]
         for chart_id, expected in zip(guests, ["migrated", "limit_reached"]):
             response = self.client.post("/auth/login", headers=self.guest, json={
-                "email": "existing@example.com", "password": "test-password-only", "guest_chart_id": chart_id})
+                "email": "existing@example.com", "password": "Test-password1!", "guest_chart_id": chart_id})
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["guest_chart_migration"], {"status": expected, "chart_id": chart_id})
         with self.sessions() as db:

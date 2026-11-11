@@ -1,5 +1,7 @@
 import datetime
 import math
+import logging
+import time
 import numpy as np
 import swisseph as swe
 from astroquery.jplhorizons import Horizons
@@ -10,6 +12,24 @@ from modules.cusp_math import house_for_longitude
 
 HOUSE_SYSTEM_CODE = b'P'
 HOUSE_SYSTEM_NAME = "Placidus"
+JPL_BUDGET_SECONDS = 12.0
+JPL_REQUEST_TIMEOUT_SECONDS = 3.0
+JPL_ASTEROIDS = {
+    "Церера": "1", "Паллада": "2", "Юнона": "3", "Веста": "4",
+    "Хирон": "2060", "Фол": "5145",
+}
+ASTEROID_SYMBOLS = dict(zip(JPL_ASTEROIDS, ("⚳", "⚴", "⚵", "⚶", "⚷", "φ")))
+logger = logging.getLogger(__name__)
+
+
+class UnsupportedHouseSystemError(ValueError):
+    """Placidus is undefined beyond the polar circle; never silently substitute."""
+
+
+def calculation_warnings(bodies):
+    missing = [name for name, symbol in ASTEROID_SYMBOLS.items() if symbol not in bodies]
+    return (["Карта рассчитана без следующих астероидов: " + ", ".join(missing) +
+             ". Их положения и аспекты не включены в расчёт."] if missing else [])
 
 ZODIAC_SIGNS = [
     "Овен", "Телец", "Близнецы", "Рак", "Лев", "Дева",
@@ -34,6 +54,51 @@ class Ephemeris:
         self.jd = swe.julday(year, month, day, hour)  # Получаем Юлианскую дату
         self.lon, self.lat = lon, lat  # Сохраняем координаты
         self.flags = swe.FLG_SWIEPH | swe.FLG_SPEED  # Флаги для расчётов
+        self._houses = None
+        self._jpl_snapshot = None
+
+    def _house_data(self):
+        if self._houses is None:
+            try:
+                self._houses = swe.houses(self.jd, self.lat, self.lon, HOUSE_SYSTEM_CODE)
+            except swe.Error:
+                obliquity = swe.calc_ut(self.jd, swe.ECL_NUT)[0][0]
+                if abs(self.lat) >= 90 - obliquity:
+                    raise UnsupportedHouseSystemError(
+                        "Для этой широты система домов Плацидуса недоступна. "
+                        "Lunaria пока не поддерживает создание карт для полярных широт."
+                    ) from None
+                raise
+        return self._houses
+
+    def _asteroid_snapshot(self):
+        """One snapshot (including missing bodies) per calculation, never per user cache."""
+        if self._jpl_snapshot is not None:
+            return self._jpl_snapshot
+        results = {}
+        deadline = time.monotonic() + JPL_BUDGET_SECONDS
+        for name, identifier in JPL_ASTEROIDS.items():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning('JPL asteroid calculation budget exhausted')
+                break
+            try:
+                obj = Horizons(id=identifier, location='500', epochs=self.jd, id_type='smallbody')
+                # requests applies the timeout to connection and read separately.
+                # Reserve half the remaining budget for each; do not change global config.
+                obj.TIMEOUT = min(JPL_REQUEST_TIMEOUT_SECONDS, remaining / 2)
+                eph = obj.ephemerides()
+                longitude, rate = float(eph['ObsEclLon'][0]), float(eph['RA_rate'][0])
+                if not math.isfinite(longitude) or not math.isfinite(rate):
+                    raise ValueError('Invalid asteroid position')
+                if time.monotonic() > deadline:
+                    break
+                results[name] = {'longitude': longitude % 360, 'retrograde': rate < 0}
+            except Exception as error:
+                # Provider exceptions may contain an epoch/URL; keep them out of logs.
+                logger.warning('JPL asteroid unavailable: %s (%s)', name, type(error).__name__)
+        self._jpl_snapshot = results
+        return results
     
 
     def get_planets(self):
@@ -124,45 +189,17 @@ class Ephemeris:
     def get_asteroids(self):
         """ Получает координаты астероидов (⚸ ⚳ ⚵ ⚴ ⚶ ⚷ φ W) + знаки и дома по системе Плацидуса """
         
-        # 🔹 **Используем JPL Horizons для астероидов**
-        jpl_asteroids = {
-            "Церера": "1", "Паллада": "2", "Юнона": "3", "Веста": "4",
-            "Хирон": "2060", "Фол": "5145"
-        }
-
         results = {}
-        houses = self.get_houses()  # Загружаем границы домов Плацидуса
-
-        for name, spk_id in jpl_asteroids.items():
-            try:
-                obj = Horizons(id=spk_id, location='500', epochs=self.jd, id_type='smallbody')
-                eph = obj.ephemerides()
-
-                sign, degree_str = self._get_sign_and_degree(eph["ObsEclLon"][0])  # Определяем знак
-                parts = degree_str.split("°")
-
-                if len(parts) < 2:
-                    raise ValueError(f"Ошибка в разборе градуса: {degree_str}")
-
-                degree = float(parts[0]) + float(parts[1].strip("'")) / 60
-                lat = eph["ObsEclLat"][0]  # Эклиптическая широта
-
-                # ✅ Определяем дом
-                house = self._find_house(eph["ObsEclLon"][0], sign, houses, is_key_point=True)
-
-                # 🔹 **Корректно извлекаем скорость**
-                retrograde = eph["RA_rate"][0] < 0  # Используем правильный индекс
-
-                results[name] = {
-                    "знак": sign,
-                    "градус": degree_str,
-                    "ретроградный": retrograde,
-                    "дом": house,
-                    "абс_долгота": eph["ObsEclLon"][0]
-
-                }
-            except Exception as e:
-                print(f"⚠️ Ошибка при получении {name} через JPL Horizons: {e}")
+        houses = self.get_houses()
+        for name, position in self._asteroid_snapshot().items():
+            longitude = position['longitude']
+            sign, degree = self._get_sign_and_degree(longitude)
+            results[name] = {
+                "знак": sign, "градус": degree,
+                "ретроградный": position['retrograde'],
+                "дом": self._find_house(longitude, sign, houses, is_key_point=True),
+                "абс_долгота": longitude,
+            }
          # 🔹 **Рассчитываем Черную Луну Лилит (Средний Лунный Апогей)**
         lilith_pos, _ = swe.calc_ut(self.jd, swe.MEAN_APOG, self.flags)
         # 🔹 **Простой расчёт Белой Луны Селены как антипод Лилит**
@@ -210,33 +247,9 @@ class Ephemeris:
         return results
     
     def get_asteroid_longitudes(self):
-        """ Получает долготу (эклиптические координаты) астероидов напрямую из JPL Horizons """
-        
-        # 🔹 **Список астероидов с их SPK ID**
-        jpl_asteroids = {
-            "Церера": "1", "Паллада": "2", "Юнона": "3", "Веста": "4",
-            "Хирон": "2060", "Фол": "5145"
-        }
+        """Use the same JPL snapshot as placements, symbols and chart aspects."""
+        return {name: position['longitude'] for name, position in self._asteroid_snapshot().items()}
 
-        longitudes = {}
-
-        for name, spk_id in jpl_asteroids.items():
-            try:
-                obj = Horizons(id=spk_id, location='500', epochs=self.jd, id_type='smallbody')
-                eph = obj.ephemerides()
-
-                longitude = eph["ObsEclLon"][0]  # Эклиптическая долгота
-
-                longitudes[name] = longitude  # Сохраняем чистое значение долготы
-
-            except Exception as e:
-                print(f"⚠️ Ошибка при получении долготы {name} через JPL Horizons: {e}")
-
-        return longitudes
-
-
-
-    
     def _get_sign_and_degree(self, degree):
         """ Определяет знак Зодиака и градусы """
         sign_index = int(degree // 30)
@@ -250,7 +263,7 @@ class Ephemeris:
 
     def get_houses(self):
         """ Вычисляет границы домов по системе Плацидуса и ключевые точки """
-        cusps, ascmc = swe.houses(self.jd, self.lat, self.lon, HOUSE_SYSTEM_CODE)  # 'P' = Плацидус
+        cusps, ascmc = self._house_data()  # 'P' = Плацидус
 
         houses = {
             "Дом 1": cusps[0],
@@ -304,7 +317,7 @@ class Ephemeris:
         """ Получает ключевые точки гороскопа с их знаками, градусами, домами и абсолютной долготой """
 
         # ✅ Используем систему домов **Placidus**
-        cusps, ascmc = swe.houses(self.jd, self.lat, self.lon, HOUSE_SYSTEM_CODE)
+        cusps, ascmc = self._house_data()
         houses = self.get_houses()  
 
         # ✅ Пересчитываем Солнце и Луну
@@ -347,7 +360,7 @@ class Ephemeris:
         """ Получает долготу ключевых точек гороскопа (только числа) """
 
         # Основные оси (Асцендент, Десцендент, МС, IC)
-        ascmc = swe.houses(self.jd, self.lat, self.lon, HOUSE_SYSTEM_CODE)[1]  # Асцендент и МС
+        ascmc = self._house_data()[1]  # Асцендент и МС
         asc, mc, desc, ic = ascmc[0], ascmc[1], (ascmc[0] + 180) % 360, (ascmc[1] + 180) % 360
 
         # Долгота Солнца и Луны
@@ -381,19 +394,16 @@ class Ephemeris:
 
         return key_longitudes
 
-    def is_daytime(self, sun_pos, ascmc):
-        """ Определяет дневное или ночное рождение, основываясь на положении Солнца относительно MC """
+    def is_daytime(self, sun_pos, ascmc=None):
+        """Day sect: Sun's centre at/above the geometric horizon, without refraction.
 
-        asc = ascmc[0]  # Асцендент (горизонт)
-        mc = ascmc[1]  # MC (Средина неба)
-        ic = (mc + 180) % 360  # Надир (IC)
-        
-        # Дневное рождение: если Солнце между MC и IC (верхняя полусфера)
-        is_day = mc <= sun_pos[0] < ic
-
-        return is_day
-
-
+        MC/IC ecliptic longitude intervals cannot determine the upper hemisphere.
+        Keep the optional second argument for existing callers.
+        """
+        _, true_altitude, _ = swe.azalt(
+            self.jd, swe.ECL2HOR, (self.lon, self.lat, 0), 0, 15, sun_pos[:3]
+        )
+        return true_altitude >= 0
 
     def calculate_vertex(self):
         """Swiss Ephemeris returns Vertex at ascmc[3] for the actual birthplace.
@@ -401,7 +411,7 @@ class Ephemeris:
         Do not replace latitude with 90-lat: that creates polar/out-of-range
         coordinates near the equator and throughout the southern hemisphere.
         """
-        _, ascmc = swe.houses(self.jd, self.lat, self.lon, HOUSE_SYSTEM_CODE)
+        _, ascmc = self._house_data()
         return ascmc[3]
 
 
@@ -517,7 +527,6 @@ class Ephemeris:
 
         return result
     def get_all_bodies_with_degrees(self) -> dict:
-        print("🟢 Вызван метод get_all_bodies_with_degrees()")
 
         body_symbols = {
             "Солнце": "☉", "Луна": "☽", "Меркурий": "☿", "Венера": "♀", "Марс": "♂",
@@ -535,7 +544,6 @@ class Ephemeris:
             **self.get_key_points()
         }
 
-        print(f"📊 Всего тел в all_bodies: {len(all_bodies)}")
 
         result = {}
 
@@ -547,7 +555,6 @@ class Ephemeris:
             if absolute_degree is None:
                 absolute_degree = data.get("degree")
             if absolute_degree is None:
-                print(f"⚠️ Нет градуса у тела: {name}")
                 continue
 
             sign, _ = self._get_sign_and_degree(absolute_degree)
@@ -568,8 +575,6 @@ class Ephemeris:
                 "roundedDegree": rounded_degree
             }
 
-            retro_text = " (R)" if retro else ""
-            print(f"✅ {symbol}{retro_text} — {absolute_degree:.2f}° ({sign}, {rounded_degree}), дом {house}")
 
         return result
 

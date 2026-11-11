@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from database.queries import User, PaddleCheckout, PaddleEvent, LavaCheckout
+from database.queries import User, BillingEvent, LavaCheckout
 from modules import lava_client as api
 from modules.subscription_access import apply_subscription_access
 from modules.usage import locked_user
@@ -110,6 +110,7 @@ def reconcile_checkout(db, user_id):
 
 def create_checkout(db, user_id):
     offer, returns = api.config()
+    binding = None
     try:
         reconcile_checkout(db, user_id)
         user = locked_user(db, user_id)
@@ -145,6 +146,16 @@ def create_checkout(db, user_id):
         checkout.contract_id, checkout.payment_url, checkout.state = contract, url, "ready"
         db.commit()
         return {"url": url}
+    except api.InvoiceEmailRejected:
+        db.rollback()
+        if binding:
+            locked_user(db, user_id)
+            checkout = db.get(LavaCheckout, binding)
+            if checkout.state == "creating" and not checkout.contract_id and not checkout.payment_url:
+                # No provider invoice exists; unlike a failed payment, this needs no reconciliation.
+                checkout.state = "rejected"
+            db.commit()
+        raise
     except HTTPException:
         db.rollback(); raise
     except (ValueError, KeyError, TypeError, AttributeError, InvalidOperation):
@@ -261,10 +272,9 @@ def process_event(db, body):
         event = parse_event(body)
         if event is None:
             return "ignored_event_type"
-        # Namespace only new provider IDs. Legacy Paddle evt_* IDs and its old
-        # ON CONFLICT(event_id) remain compatible across migration/deployment.
+        # Provider namespaces preserve event identity across migration/deployment.
         event["key"] = "lava:" + event["key"]
-        if db.get(PaddleEvent, event["key"]):
+        if db.get(BillingEvent, event["key"]):
             db.rollback(); return "duplicate"
         if event["kind"] in FINANCIAL:
             candidates = db.query(LavaCheckout).filter_by(offer_id=event["offer"], product_id=event["product"],
@@ -313,7 +323,7 @@ def process_event(db, body):
         db.rollback()
         user = locked_billing_user(db, user_id) if user_id else None
         insert = pg_insert if db.bind.dialect.name == "postgresql" else sqlite_insert
-        result = db.execute(insert(PaddleEvent).values(provider="lava", event_id=event["key"],
+        result = db.execute(insert(BillingEvent).values(provider="lava", event_id=event["key"],
             event_type=event["kind"], occurred_at=event["at"], processed_at=datetime.utcnow(),
             details=event["details"], outcome="processed").on_conflict_do_nothing(index_elements=["event_id"]))
         if result.rowcount == 0:
@@ -324,7 +334,7 @@ def process_event(db, body):
             db.refresh(checkout)
             existing_conflict = conflict_for(db, "lava", checkout.contract_id)
             if existing_conflict or not owns_checkout(db, user, checkout):
-                db.get(PaddleEvent, event["key"]).details = {**(event["details"] or {}),
+                db.get(BillingEvent, event["key"]).details = {**(event["details"] or {}),
                     "checkout_id": checkout.id, "subscription_id": checkout.contract_id,
                     "payment_id": event.get("contract")}
                 if event["kind"] in ("payment.success", "subscription.recurring.payment.success") and state:
@@ -346,7 +356,7 @@ def process_event(db, body):
             elif state:
                 outcome = apply_snapshot(db, user, checkout, state)
                 checkout.updated_at = max(filter(None, (checkout.updated_at, event["at"], state["paid"], state["cancelled"], state["terminated"])))
-        db.get(PaddleEvent, event["key"]).outcome = outcome
+        db.get(BillingEvent, event["key"]).outcome = outcome
         db.commit()
         return outcome
     except HTTPException:

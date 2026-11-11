@@ -1,3 +1,6 @@
+from uuid import uuid4
+from sqlalchemy import inspect
+from modules.product_analytics import capture_business, context as analytics_context
 import json
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from starlette.concurrency import run_in_threadpool
@@ -13,7 +16,10 @@ router = APIRouter(prefix="/payments/lava", tags=["Payments"])
 @router.post("/checkout")
 def checkout(response: Response, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     response.headers["Cache-Control"] = "no-store"
-    return lava_billing.create_checkout(db, user.id)
+    result = lava_billing.create_checkout(db, user.id)
+    capture_business(db.get_bind(), inspect(user).identity[0], 'checkout_initiated',
+        {'provider': 'lava'}, 'checkout:' + str(uuid4()), analytics_context.get())
+    return result
 
 
 @router.post("/cancel")

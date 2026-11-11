@@ -37,7 +37,7 @@ class PostgreSQLUsageTests(unittest.TestCase):
         # Reconstruct the repository's pre-feature schema, then run the exact SQL.
         legacy = MetaData()
         for table in fixtures.Base.metadata.sorted_tables:
-            if table.name in ("billing_conflicts", "gpt_usage", "paddle_checkouts", "paddle_events", "lava_checkouts", "gpt_conversations", "relationships",
+            if table.name in ("analytics_consents", "analytics_account_preferences", "analytics_outbox", "analytics_monthly_budget", "feedback", "stripe_checkouts", "billing_customers", "billing_periods", "billing_events", "billing_conflicts", "gpt_usage", "paddle_checkouts", "paddle_events", "lava_checkouts", "gpt_conversations", "relationships",
                               "relationship_messages", "relationship_conversations"):
                 continue
             if table.name == "users":
@@ -91,6 +91,8 @@ class PostgreSQLUsageTests(unittest.TestCase):
         self.birth_script = (Path(__file__).parents[1] / "migrations" / "birth_time_houses.sql").read_text(encoding="utf-8")
         self.apply_script(self.birth_script)
         self.apply_script((Path(__file__).parents[1] / 'migrations/relationships.sql').read_text(encoding='utf-8'))
+        self.stripe_script = (Path(__file__).parents[1] / 'migrations/stripe_billing.sql').read_text(encoding='utf-8')
+        self.apply_script(self.stripe_script)
 
     def test_birth_migration_preserves_legacy_data_without_inventing_timezone(self):
         self.assertEqual(self.snapshot(), self.before)

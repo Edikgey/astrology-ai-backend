@@ -61,13 +61,30 @@ class GoogleAuthTests(unittest.TestCase):
         response = self.client.post('/auth/google', json={'credential': credential(), 'nonce': NONCE},
                                     headers={'Origin': 'https://mylunariaai.com'})
         self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers['access-control-allow-origin'], 'https://mylunariaai.com')
+
+    def test_cors_for_every_required_origin_and_failure_path(self):
+        from modules.auth_origins import AUTH_ORIGINS
+        for origin in AUTH_ORIGINS:
+            headers={'Origin':origin}
+            preflight=self.client.options('/auth/google',headers={**headers,'Access-Control-Request-Method':'POST','Access-Control-Request-Headers':'content-type,x-session-token'})
+            self.assertEqual(preflight.status_code,200)
+            self.assertEqual(preflight.headers['access-control-allow-origin'],origin)
+            for body,expected in [({'credential':'invalid-token','nonce':NONCE},401),({},422)]:
+                response=self.client.post('/auth/google',headers=headers,json=body)
+                self.assertEqual(response.status_code,expected)
+                self.assertEqual(response.headers['access-control-allow-origin'],origin)
+            with patch('api.auth.verify_google_credential',side_effect=RuntimeError('internal failure')):
+                response=self.client.post('/auth/google',headers=headers,json={'credential':'invalid-token','nonce':NONCE})
+                self.assertEqual(response.status_code,500)
+                self.assertEqual(response.headers['access-control-allow-origin'],origin)
 
     def test_verified_workspace_links_same_premium_user_preserves_password_and_data(self):
         saved = self.chart()
         hashed = get_password_hash('existing-password')
         with self.sessions() as db:
             user = db.get(User, 1); user.password_hash = hashed
-            user.plan = 'premium'; user.payment_provider = 'paddle'; user.provider_customer_id = 'customer'; user.subscription_status = 'active'
+            user.plan = 'premium'; user.payment_provider = 'stripe'; user.provider_customer_id = 'customer'; user.subscription_status = 'active'
             db.commit()
         response = self.login(credential(email='a@example.com', hd='example.com'))
         self.assertEqual(response.status_code, 200, response.text)

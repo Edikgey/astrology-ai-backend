@@ -13,7 +13,7 @@ ENV = {
     'MAIL_FROM': 'noreply@mylunariaai.com', 'MAIL_FROM_NAME': 'Lunaria',
     'DEV_MODE': 'true',  # Must never silently suppress production registration mail.
 }
-BODY = {'email': 'registration@example.com', 'password': 'test-password-only'}
+BODY = {'email': 'registration@example.com', 'password': 'Test-password1!'}
 ORIGIN = 'https://mylunariaai.com'
 
 
@@ -56,7 +56,7 @@ class EmailAuthTests(unittest.TestCase):
         self.assertRegex(code, r'^\d{6}$')
         self.assertIn(code, message.body)
         self.assertNotIn(code, response.text)
-        self.assertEqual([str(v) for v in message.recipients], [BODY['email']])
+        self.assertEqual([str(v.email) for v in message.recipients], [BODY['email']])
         with self.sessions() as db:
             self.assertIsNone(db.query(User).filter_by(email=BODY['email']).first())
         self.assertEqual(self.client.post('/auth/login', json=BODY).status_code, 401)
@@ -79,7 +79,8 @@ class EmailAuthTests(unittest.TestCase):
             self.assertIsNone(db.query(EmailVerificationCode).filter_by(email=BODY['email']).first())
             self.assertIsNone(db.query(User).filter_by(email=BODY['email']).first())
         self.send.side_effect = None
-        self.assertEqual(self.register().status_code, 200)
+        with patch('modules.security_limits.server_now', return_value=datetime.utcnow()+timedelta(seconds=61)):
+            self.assertEqual(self.register().status_code, 200)
 
     def test_missing_smtp_credentials_fails_closed_without_dev_bypass(self):
         with patch.dict(os.environ, {'MAIL_PASSWORD': ''}):
@@ -90,7 +91,8 @@ class EmailAuthTests(unittest.TestCase):
         with patch('api.auth.secrets.randbelow', side_effect=[123456, 654321]):
             self.assertEqual(self.register().status_code, 200)
             old = self.code()
-            self.assertEqual(self.register().status_code, 200)
+            with patch('modules.security_limits.server_now', return_value=datetime.utcnow()+timedelta(seconds=61)):
+                self.assertEqual(self.register().status_code, 200)
         current = self.code()
         self.assertNotEqual(old, current)
         self.assertEqual(self.verify(old).status_code, 400)
@@ -117,7 +119,7 @@ class EmailAuthTests(unittest.TestCase):
         with self.sessions() as db:
             db.get(User, 1).email = 'existing@example.com'
             db.commit()
-        response = self.client.post('/auth/request-register', json={'email':'existing@example.com', 'password':'unused'})
+        response = self.client.post('/auth/request-register', json={'email':'existing@example.com', 'password':'Test-password1!'})
         self.assertEqual(response.status_code, 400)
         self.send.assert_not_awaited()
 
