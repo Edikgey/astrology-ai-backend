@@ -11,6 +11,7 @@ from modules.synastry import build_synastry_snapshot, SynastryInputError
 from models.relationship import RelationshipAsk, RelationshipAnswer, RelationshipMessageResponse
 from modules.ai_subject import owned_subject
 from modules import usage
+from modules.ai_transit_guard import require_supported_question
 
 router = APIRouter(prefix="/relationships", tags=["Relationships"])
 
@@ -123,6 +124,7 @@ def ask_relationship(relationship_id: int, data: RelationshipAsk, request: Reque
                      current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     user_id = current_user.id
     owned_subject(db, user_id, relationship_id=relationship_id)
+    require_supported_question(data.question)
     reservation_id = usage.reserve(db, user_id, relationship_id=relationship_id)
     try:
         from modules.interpretation import client, OPENAI_PARAMS

@@ -146,7 +146,7 @@ class BirthPipelineTests(unittest.TestCase):
                 response=self.client.post('/natal-chart',json=payload,headers=self.owner)
                 self.assertEqual(response.status_code,200,response.text)
                 ephem.assert_called_once_with(1999,12,31,18.5,30.,50.)
-                aspects.assert_called_once_with(1999,12,31,18.5,30.,50.)
+                aspects.assert_called_once_with(1999,12,31,18.5,30.,50.,ephemeris=ephem.return_value)
         cid=response.json()['chart_id']
         with self.sessions() as db:
             chart=db.get(NatalChart,cid);data=db.query(ChartData).filter_by(chart_id=cid).one()
@@ -163,6 +163,34 @@ class BirthPipelineTests(unittest.TestCase):
             self.assertEqual(loaded.status_code,200,loaded.text)
             self.assertEqual(loaded.json()['houses'],houses)
             self.assertEqual(loaded.json()['time_provenance'],'local_iana')
+
+    def test_true_node_direction_survives_creation_reload_and_ai_context(self):
+        cases = [
+            ({"year": 2023, "month": 3, "day": 25, "hour": 12}, False),
+            ({"year": 2023, "month": 2, "day": 1, "hour": 0}, True),
+        ]
+        with patch.object(Ephemeris, "_asteroid_snapshot", return_value={}):
+            for date, retrograde in cases:
+                with self.subTest(date=date):
+                    response = self.client.post(
+                        "/natal-chart", json={**f.PAYLOAD, **date}, headers=self.owner
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    created = response.json()
+                    chart_id = created["chart_id"]
+                    loaded = self.client.get(f"/natal-chart/{chart_id}", headers=self.owner)
+                    self.assertEqual(loaded.status_code, 200, loaded.text)
+                    self.assertEqual(loaded.json(), created)
+                    with self.sessions() as db:
+                        context = json.loads(build_chart_context(db, 1, chart_id))
+                    placements = {row[0]: row for row in context["placements"]}
+                    for symbol in ("☊", "☋"):
+                        self.assertIs(created["bodies_for_circle"][symbol]["retrograde"], retrograde)
+                        self.assertIs(placements[symbol][-1], retrograde)
+                        point = next(line for line in created["points_data"] if line.startswith(symbol))
+                        self.assertEqual(" (R)" in point, retrograde)
+                    bodies = created["bodies_for_circle"]
+                    self.assertAlmostEqual((bodies["☋"]["degree"] - bodies["☊"]["degree"]) % 360, 180)
 
     def test_legacy_without_zone_and_saved_cusps_remains_readable_without_ai_calculation(self):
         cid=self.chart()

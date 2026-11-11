@@ -125,7 +125,7 @@ class Ephemeris:
             degree = float(parts[0]) + float(parts[1].strip("'")) / 60
 
             # ✅ Определяем, является ли объект ретроградным
-            retro = True if body in ["Северный Узел", "Южный Узел"] else speed < 0  
+            retro = speed < 0
 
             house = self._find_house(pos[0], sign, houses, is_key_point=True)
 
@@ -145,7 +145,7 @@ class Ephemeris:
         results["Южный Узел"] = {
             "знак": south_sign,
             "градус": south_degree_str,
-            "ретроградный": True,
+            "ретроградный": results["Северный Узел"]["ретроградный"],
             "дом": self._find_house(south_node_long, south_sign, houses, is_key_point=True),
             "абс_долгота": south_node_long
         }
