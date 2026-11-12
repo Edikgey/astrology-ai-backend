@@ -139,6 +139,16 @@ product messages. Paid provider work preceding a failed overall request is not r
 by this minimal successful-request analytics; centralized failure-cost tracking is a
 possible future improvement.
 
+Claude provider (CHAT-CLAUDE, `LUNARIA_CHAT_PROVIDER=anthropic`, `modules/ai_anthropic.py`)
+fills the same columns, no schema change: `model` = the message's model (else the
+configured one); `input_tokens` = `input_tokens + cache_creation_input_tokens +
+cache_read_input_tokens` (the full input); `output_tokens` = `output_tokens` (thinking
+included); `total_tokens` = input + output; `summary_usage` items keep the same four keys
+(+ `discarded`). A cost computed from these columns at the plain input price is an upper
+estimate for Claude: cache reads are 10x cheaper and cache writes 25% dearer than plain
+input. The exact split by cache is in the Anthropic Console (and in the eval tool's own
+journal), not in `gpt_usage`.
+
 No production/Railway migration, environment change, push, commit or deployment was
 performed for this AI task. Only isolated local test schemas were migrated. The existing
 portable local PostgreSQL runtime was started for tests and stopped afterwards.

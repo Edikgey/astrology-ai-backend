@@ -9,17 +9,18 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 from modules import usage
-from modules.ai_conversation import AIAnswer, AnswerCut, stream_answer
+from modules.ai_conversation import AIAnswer, AnswerCut, log_label, stream_answer
 
 logger = logging.getLogger(__name__)
 
 
-def log_outcome(outcome, relationship_id, model, output_tokens, started):
-    """One line per abnormal chat outcome: closed labels and numbers only, never text or ids."""
-    logger.warning('AI chat outcome=%s subject=%s model=%s output_tokens=%s duration_ms=%d',
-                   outcome, 'natal' if relationship_id is None else 'relationship', model,
+def log_outcome(outcome, relationship_id, model, output_tokens, started, refusal=None):
+    """One line per abnormal chat outcome: closed labels and numbers only, never text or ids.
+    refusal: Claude's closed refusal category label (ai_anthropic.refusal_label), only for outcome=filtered."""
+    logger.warning('AI chat outcome=%s subject=%s model=%s output_tokens=%s duration_ms=%d%s',
+                   outcome, 'natal' if relationship_id is None else 'relationship', log_label(model),
                    output_tokens if type(output_tokens) is int else 'none',
-                   round((time.monotonic() - started) * 1000))
+                   round((time.monotonic() - started) * 1000), f' refusal={refusal}' if refusal else '')
 
 
 def chat_events(bind, user_id, chart_id, question, reservation_id, client, params, *, relationship_id=None):
@@ -45,7 +46,7 @@ def chat_events(bind, user_id, chart_id, question, reservation_id, client, param
         except Exception as error:
             # Refusals before the call (ownership, budget, history) are not chat outcomes.
             if isinstance(error, AnswerCut):
-                log_outcome(error.outcome, relationship_id, params['model'], error.output_tokens, started)
+                log_outcome(error.outcome, relationship_id, params['model'], error.output_tokens, started, error.refusal)
             elif not isinstance(error, HTTPException):
                 log_outcome('interrupted', relationship_id, params['model'], None, started)
             usage.release(db, user_id, reservation_id)

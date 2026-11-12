@@ -7,15 +7,40 @@ from database.connection import get_db  # если вдруг используе
 from database.queries import ChartInterpretationData
 from openai import OpenAI
 from modules.usage import OPENAI_TIMEOUT_SECONDS
-from modules.ai_conversation import generate_answer
+from modules.ai_conversation import generate_answer, log_label
+import logging
 import os
-client = OpenAI(timeout=OPENAI_TIMEOUT_SECONDS, max_retries=0)
-# Repetition penalties are gone: they push Russian endings toward strained synonyms.
-# Reasoning mode (OPENAI_REASONING_EFFORT) is applied per call in ai_conversation.provider_params.
-OPENAI_PARAMS = {
-    "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-    "temperature": 0.7,
-}
+
+logger = logging.getLogger(__name__)
+
+
+def select_chat_backend(env):
+    """(client, chat params) from the environment mapping; LUNARIA_CHAT_PROVIDER unset or 'openai' -> OpenAI as before.
+
+    A misconfigured Claude choice falls back to OpenAI with one journal line instead of failing the import
+    (a failed import would take down the whole site, payments and login included). The Anthropic SDK is
+    imported only on the Claude branch."""
+    provider = (env.get("LUNARIA_CHAT_PROVIDER") or "openai").strip().lower()
+    if provider == "anthropic":
+        if (env.get("ANTHROPIC_API_KEY") or "").strip():
+            from modules import ai_anthropic
+            params, effort_valid = ai_anthropic.chat_params(env)
+            logger.warning("AI chat provider=anthropic model=%s effort=%s%s", log_label(params["model"]),
+                           params["effort"], "" if effort_valid else " reason=effort_invalid")
+            return ai_anthropic.build_client(env), params
+        logger.warning("AI chat provider=anthropic outcome=fallback reason=no_key")
+    elif provider != "openai":
+        logger.warning("AI chat provider=unknown fallback=openai")     # the value itself is never printed
+    # Repetition penalties are gone: they push Russian endings toward strained synonyms.
+    # Reasoning mode (OPENAI_REASONING_EFFORT) is applied per call in ai_conversation.provider_params.
+    return OpenAI(timeout=OPENAI_TIMEOUT_SECONDS, max_retries=0), {
+        "model": env.get("OPENAI_MODEL", "gpt-4o-mini"),
+        "temperature": 0.7,
+    }
+
+
+# OPENAI_PARAMS keeps its name (api/* and the eval tool import it): these are the chat parameters of either provider.
+client, OPENAI_PARAMS = select_chat_backend(os.environ)
 class ChartInterpreter:
     def __init__(self, year: int, month: int, day: int, hour: float, lon: float, lat: float, calculate=True):
         self.date = (year, month, day, hour)

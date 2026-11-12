@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 import json
 import os
+import re
 from jiter import from_json
 from fastapi import HTTPException
 from openai import LengthFinishReasonError, ContentFilterFinishReasonError
@@ -54,13 +55,19 @@ FILTERED_TEXT = "AI не смог ответить на этот вопрос. �
 INTERRUPTED_TEXT = "Ответ прервался. Квота не списана; повторите вопрос."
 FINISH_OUTCOMES = {'length': 'truncated', 'content_filter': 'filtered'}
 OUTCOME_TEXTS = {'truncated': TRUNCATED_TEXT, 'filtered': FILTERED_TEXT, 'interrupted': INTERRUPTED_TEXT}
+LOG_LABEL = re.compile(r'[A-Za-z0-9._-]{1,48}')
+
+
+def log_label(value):
+    """A value from configuration goes to the journal only as a short closed-charset label."""
+    return value if isinstance(value, str) and LOG_LABEL.fullmatch(value) else 'invalid'
 
 
 class AnswerCut(HTTPException):
-    """The provider ended the answer abnormally. outcome is a closed label for the journal."""
-    def __init__(self, outcome, output_tokens=None):
+    """The provider ended the answer abnormally. outcome (and refusal, for Claude) are closed labels for the journal."""
+    def __init__(self, outcome, output_tokens=None, refusal=None):
         super().__init__(502, OUTCOME_TEXTS[outcome])
-        self.outcome, self.output_tokens = outcome, output_tokens
+        self.outcome, self.output_tokens, self.refusal = outcome, output_tokens, refusal
 
 
 def provider_params(params, ceiling):
@@ -219,15 +226,19 @@ def prepare_answer(db, user_id, chart_id, question, client, params, *, relations
         summary_payload = summary_input([])
         if len(summary_payload.encode('utf-8')) > SUMMARY_INPUT_BUDGET:
             raise HTTPException(422, "Старая история превышает бюджет summary; требуется проверка чата.")
-        response = client.chat.completions.create(
-            **provider_params({'model': params['model'], 'temperature': 0.2}, SUMMARY_TOKENS),
-            messages=[{'role': 'system', 'content': summary_prompt},
-                      {'role': 'user', 'content': summary_payload}])
-        spent = token_metadata(response, params['model'])
-        try:
-            candidate = response_text(response)
-        except AnswerCut:   # stopped by length or by the provider filter
-            candidate = None
+        if params.get('provider') == 'anthropic':
+            from modules import ai_anthropic
+            candidate, spent = ai_anthropic.summarize(client, params, summary_prompt, summary_payload)
+        else:
+            response = client.chat.completions.create(
+                **provider_params({'model': params['model'], 'temperature': 0.2}, SUMMARY_TOKENS),
+                messages=[{'role': 'system', 'content': summary_prompt},
+                          {'role': 'user', 'content': summary_payload}])
+            spent = token_metadata(response, params['model'])
+            try:
+                candidate = response_text(response)
+            except AnswerCut:   # stopped by length or by the provider filter
+                candidate = None
         if candidate is None or len(candidate.encode('utf-8')) > SUMMARY_BUDGET:
             # A cut, filtered or oversized summary must not block the question: memory stays as it was,
             # compaction stops for this request and the model is told older history is pending.
@@ -257,6 +268,12 @@ def prepare_answer(db, user_id, chart_id, question, client, params, *, relations
 
 def generate_answer(db, user_id, chart_id, question, client, params, *, relationship_id=None):
     messages, update, summary_usage = prepare_answer(db, user_id, chart_id, question, client, params, relationship_id=relationship_id)
+    if params.get('provider') == 'anthropic':
+        from modules import ai_anthropic
+        content, metadata = ai_anthropic.complete(client, params, messages)
+        answer, suggestions = answer_parts(content, question)
+        return AIAnswer(answer, metadata=metadata, memory_update=update,
+                        summary_usage=summary_usage, follow_up_suggestions=suggestions)
     response = client.chat.completions.create(**provider_params(params, ANSWER_TOKENS), messages=messages,
                                               response_format=ANSWER_FORMAT)
     answer, suggestions = answer_parts(response_text(response), question)
@@ -267,6 +284,13 @@ def generate_answer(db, user_id, chart_id, question, client, params, *, relation
 def stream_answer(db, user_id, chart_id, question, client, params, *, relationship_id=None):
     """SDK network stream; partial JSON is decoded by the SDK's jiter dependency."""
     messages, update, summary_usage = prepare_answer(db, user_id, chart_id, question, client, params, relationship_id=relationship_id)
+    if params.get('provider') == 'anthropic':
+        from modules import ai_anthropic
+        content, metadata = yield from ai_anthropic.stream(client, params, messages)
+        answer, suggestions = answer_parts(content, question)
+        yield AIAnswer(answer, metadata=metadata, memory_update=update,
+                       summary_usage=summary_usage, follow_up_suggestions=suggestions)
+        return
     emitted = ''
     try:
         with client.beta.chat.completions.stream(
