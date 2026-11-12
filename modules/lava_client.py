@@ -14,6 +14,13 @@ BASE_URL = "https://gate.lava.top"
 PREMIUM_RUB = Decimal("799")
 logger = logging.getLogger(__name__)
 
+# One neutral text: the same request serves reads, invoice creation and cancellation.
+PROVIDER_SILENT = ("Платёжный сервис не ответил. Обновите страницу через минуту и проверьте статус, прежде чем "
+                   "снова оплачивать или отменять подписку. Если ошибка повторится, напишите в поддержку: "
+                   "lunariaai.support@gmail.com.")
+RUB_NOT_AVAILABLE = "Оплата в рублях пока недоступна. Попробуйте позже."
+RUB_TEMPORARILY_UNAVAILABLE = "Оплата в рублях временно недоступна. Попробуйте позже."
+
 
 class InvoiceEmailRejected(HTTPException):
     """Definitive provider validation rejection; no invoice was created."""
@@ -63,7 +70,7 @@ def config():
             returns[field] = https_url(value)
         return offer, returns
     except (KeyError, ValueError, TypeError):
-        raise HTTPException(503, "Оплата в RUB пока не настроена.") from None
+        raise HTTPException(503, RUB_NOT_AVAILABLE) from None
 
 
 def configured():
@@ -77,7 +84,7 @@ def configured():
 def request(method, path, **kwargs):
     key = os.getenv("LAVA_API_KEY")
     if not key:
-        raise HTTPException(503, "Оплата в RUB пока не настроена.")
+        raise HTTPException(503, RUB_NOT_AVAILABLE)
     operation = request_operation(method, path)
     timeout = (httpx.Timeout(connect=10, read=30, write=10, pool=5)
                if operation == "invoice_create" else httpx.Timeout(4, connect=2))
@@ -105,9 +112,9 @@ def request(method, path, **kwargs):
                     and not error_body.get("id") and not error_body.get("paymentUrl")):
                 raise InvoiceEmailRejected()
         if response.status_code == 429:
-            raise HTTPException(503, "Платёжный сервис занят. Попробуйте позже.", headers={"Retry-After": "60"})
+            raise HTTPException(503, PROVIDER_SILENT, headers={"Retry-After": "60"})
         if not 200 <= response.status_code < 300:
-            raise HTTPException(502, "Платёжный сервис временно недоступен.")
+            raise HTTPException(502, PROVIDER_SILENT)
         if response.status_code == 204:
             return None
         stage = "decode_response"
@@ -120,7 +127,7 @@ def request(method, path, **kwargs):
         raise
     except (httpx.HTTPError, ValueError, TypeError) as error:
         log_failure(error)
-        raise HTTPException(502, "Не удалось подтвердить ответ платёжного сервиса.") from None
+        raise HTTPException(502, PROVIDER_SILENT) from None
 
 
 def verified_offer(offer_id):
@@ -138,13 +145,13 @@ def verified_offer(offer_id):
                           and p.get("periodicity") == "MONTHLY"]
                 if (product.get("type") != "SUBSCRIPTION" or product.get("isDynamicPrice") is True
                         or len(prices) != 1 or Decimal(str(prices[0].get("amount"))) != PREMIUM_RUB):
-                    raise HTTPException(503, "Цена подписки в RUB требует проверки. Оплата недоступна.")
+                    raise HTTPException(503, RUB_TEMPORARILY_UNAVAILABLE)
                 return external_id(product["id"])
         following = catalog.get("nextPage")
         if not following:
             break
         url = urlsplit(following)
         if url.scheme != "https" or url.netloc != "gate.lava.top" or url.path != "/api/v2/products":
-            raise HTTPException(502, "Некорректный ответ каталога оплаты.")
+            raise HTTPException(502, RUB_TEMPORARILY_UNAVAILABLE)
         path = url.path + "?" + url.query
-    raise HTTPException(503, "Тариф оплаты в RUB не найден.")
+    raise HTTPException(503, RUB_TEMPORARILY_UNAVAILABLE)
