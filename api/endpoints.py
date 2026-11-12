@@ -24,6 +24,9 @@ import asyncio
 
 router = APIRouter()
 
+CHART_NOT_FOUND = "Карта не найдена. Откройте её из раздела «Мои карты» или постройте новую."
+CHART_FORBIDDEN = "Нет доступа к этой карте. Откройте свою карту из раздела «Мои карты»."
+
 import numpy as np
 
 def clean_json_data(data):
@@ -101,7 +104,7 @@ def _create_natal_chart(chart_data: NatalChartCreate, identity: dict, db: Sessio
             points_data.append(line)
 
     if not body_data or not isinstance(body_data, dict):
-        raise HTTPException(status_code=400, detail="❌ Ошибка: не получены данные по телам")
+        raise HTTPException(status_code=400, detail="Не удалось рассчитать карту. Попробуйте ещё раз через минуту.")
 
     # 2. Аспекты
     aspects_module = Aspects(*calculation, ephemeris=ephem)
@@ -186,7 +189,7 @@ def get_natal_chart_by_id(
     chart = db.query(NatalChart).filter(NatalChart.id == chart_id).first()
 
     if not chart:
-        raise HTTPException(status_code=404, detail="❌ Карта не найдена")
+        raise HTTPException(status_code=404, detail=CHART_NOT_FOUND)
 
     # A user-owned chart can never be accessed through its guest token.
     if chart.user_id is not None:
@@ -194,12 +197,12 @@ def get_natal_chart_by_id(
     else:
         allowed = session_token is not None and chart.session_token == session_token
     if not allowed:
-        raise HTTPException(status_code=404, detail="❌ Карта не найдена")
+        raise HTTPException(status_code=404, detail=CHART_NOT_FOUND)
 
     # Получаем все связанные данные
     chart_data = db.query(ChartData).filter_by(chart_id=chart.id).first()
     if not chart_data:
-        raise HTTPException(status_code=404, detail="Нет данных для этой карты")
+        raise HTTPException(status_code=404, detail="Расчётные данные карты отсутствуют. Обратитесь в поддержку для восстановления карты.")
 
     return {
         "chart_id": chart.id,
@@ -247,7 +250,7 @@ def delete_natal_chart(
         NatalChart.id == chart_id, NatalChart.user_id == current_user.id
     ).with_for_update().first()
     if chart is None:
-        raise HTTPException(status_code=404, detail="❌ Карта не найдена")
+        raise HTTPException(status_code=404, detail="Карта не найдена — возможно, она уже удалена. Обновите страницу.")
     try:
         if db.query(Relationship.id).filter(or_(Relationship.chart_a_id == chart_id,
                                                 Relationship.chart_b_id == chart_id)).first():
@@ -282,10 +285,10 @@ def ask_gpt_interpretation(
     """
     chart = db.query(NatalChart).filter_by(id=data.chart_id).first()
     if not chart:
-        raise HTTPException(status_code=404, detail="❌ Натальная карта не найдена")
+        raise HTTPException(status_code=404, detail=CHART_NOT_FOUND)
 
     if chart.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="⛔ Недоступно: карта не принадлежит пользователю")
+        raise HTTPException(status_code=403, detail=CHART_FORBIDDEN)
 
     # Copy scalar values before reserve commits/expires the ORM instances.
     user_id, chart_id = current_user.id, chart.id
@@ -302,7 +305,7 @@ def ask_gpt_interpretation(
         # Sync SQLAlchemy and lock waits stay in FastAPI's worker thread.
         interpretation = asyncio.run(interpreter.ask_gpt(chart_id, db, data.question, user_id))
         if not isinstance(interpretation, str) or not interpretation.strip():
-            raise HTTPException(502, detail="GPT не вернул ответ. Квота не списана.")
+            raise HTTPException(502, detail="AI не вернул ответ. Квота не списана — задайте вопрос ещё раз.")
         result = GPTInterpretationResponse(chart_id=chart_id, response=interpretation,
                                           follow_up_suggestions=getattr(interpretation, 'follow_up_suggestions', []))
         usage.finalize(db, user_id, reservation_id, data.question, interpretation)
@@ -328,10 +331,10 @@ def get_gpt_messages(
     """
     chart = db.query(NatalChart).filter_by(id=chart_id).first()
     if not chart:
-        raise HTTPException(status_code=404, detail="❌ Натальная карта не найдена")
+        raise HTTPException(status_code=404, detail=CHART_NOT_FOUND)
 
     if chart.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="⛔ Недоступно: карта не принадлежит пользователю")
+        raise HTTPException(status_code=403, detail=CHART_FORBIDDEN)
 
     messages = db.query(GPTMessage).filter_by(chart_id=chart_id).order_by(GPTMessage.id).all()
     return messages

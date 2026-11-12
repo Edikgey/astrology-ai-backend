@@ -14,6 +14,7 @@ from modules import usage
 from modules.ai_transit_guard import require_supported_question
 
 router = APIRouter(prefix="/relationships", tags=["Relationships"])
+RELATIONSHIP_NOT_FOUND = "Анализ отношений не найден. Обновите страницу и выберите анализ из списка."
 
 
 def pair_query(db, user_id, a, b):
@@ -92,7 +93,7 @@ def list_relationships(chart_id: int | None = Query(default=None, gt=0),
 def get_relationship(relationship_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     row = db.query(Relationship).filter_by(id=relationship_id, user_id=current_user.id).first()
     if row is None:
-        raise HTTPException(404, "Анализ отношений не найден или недоступен.")
+        raise HTTPException(404, RELATIONSHIP_NOT_FOUND)
     return row
 
 
@@ -102,7 +103,7 @@ def delete_relationship(relationship_id: int, current_user: User = Depends(get_c
         db.query(User).filter_by(id=current_user.id).with_for_update().one()
         row = db.query(Relationship).filter_by(id=relationship_id, user_id=current_user.id).with_for_update().first()
         if row is None:
-            raise HTTPException(404, "Анализ отношений не найден или недоступен.")
+            raise HTTPException(404, RELATIONSHIP_NOT_FOUND)
         db.delete(row)
         db.commit()
     except BaseException:
