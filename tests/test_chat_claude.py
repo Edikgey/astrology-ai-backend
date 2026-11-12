@@ -1,4 +1,4 @@
-"""CHAT-CLAUDE-be regression, step S1 (CC-1 ... CC-13, CC-15, CC-17): the AI chat can run on Claude (Anthropic) instead of OpenAI.
+"""CHAT-CLAUDE-be regression, steps S1 (CC-1 ... CC-13, CC-15, CC-17) and S2 (CC-14, CC-16): the AI chat can run on Claude (Anthropic) instead of OpenAI.
 
 Contract source: tasks/CHAT-CLAUDE/DESIGN.md sections 4 (provider), 7 (invariants), 8 (regression list).
 Written BEFORE the code: on 0852c88 every test here is red because the behaviour is missing (modules.interpretation has no
@@ -7,7 +7,7 @@ select_chat_backend, there is no modules/ai_anthropic.py, requirements.txt has n
 Method: real product code (context, quota, chat_events/SSE, routes) + the REAL ``anthropic`` SDK talking over loopback HTTP to
 tests/anthropic_fake_server.py + isolated SQLite + synthetic data.  No real Anthropic or OpenAI call is possible: ANTHROPIC_* and
 OPENAI_* variables of the shell are cleared in setUp, every endpoint is an explicit 127.0.0.1 address, and a socket guard
-records (and refuses) any non-loopback connect.  CC-14 / CC-16 (prompt v3) are a later step and are not here.
+records (and refuses) any non-loopback connect.  CC-14 / CC-16 (prompt v3, step S2) are at the end of the file.
 """
 import json
 import logging
@@ -926,6 +926,175 @@ class TlsGuardTests(unittest.TestCase):
         self.assertTrue(result['context_is_stdlib'], 'ssl.SSLContext was replaced: Stripe, Lava, OpenAI and mail would change')
         self.assertTrue(result['default_context_is_stdlib'], 'ssl.create_default_context was replaced')
         self.assertEqual(result['context_module'], 'ssl')
+
+
+# ---------------------------------------------------------------- CC-14 / CC-16: prompt v3 (DESIGN section 3, marker phrases 3.6)
+# Written BEFORE the prompt: the marker phrases of section 3.6 and the size caps are the only wording these tests rely on.
+# Everything else (boundaries, follow-up block, summary prompts) must stay as it was on 0852c88.
+NATAL_CAP, PAIR_CAP = 9000, 8000          # UTF-8 bytes (DESIGN 3.6; v2 is 6477 and 5196)
+COMMON_MARKERS = ('Depth, not a catalogue',
+                  'where they reinforce each other and where they pull in different directions',
+                  'Honest balance', 'hold for the whole conversation')
+NATAL_MARKERS = COMMON_MARKERS + ('would this answer fit another chart just as well', 'one real difficulty',
+                                  'Do not invent problems', 'rulerships')
+PAIR_MARKERS = COMMON_MARKERS + ('would this answer fit any other couple just as well', 'one real friction point',
+                                 'without blaming')
+STEP_PHRASES = ('«вам стоит…»', '«вам стоит...»')       # the ellipsis may be typed as one character or three dots
+# Sizes and SHA-256 of the two summary prompts on 0852c88 ("byte for byte", DESIGN 3.5).
+SUMMARY_BASELINE = {
+    'SUMMARY_SYSTEM_PROMPT': (727, '61daaaaaca1b4bfd6ee12b8661a7b95cd4f320664f84d0877230950667b04d89'),
+    'RELATIONSHIP_SUMMARY_PROMPT': (738, 'a511941598407c9702d124d3a8da1ba92094e3e9897f138d06b12997d9bbf4ff'),
+}
+
+
+def flat(text):
+    """Prompt text with every run of whitespace (line wraps, indents) collapsed: markers survive any wrapping."""
+    return ' '.join(text.split())
+
+
+def missing_markers(prompt, markers):
+    text = flat(prompt)
+    return [marker for marker in markers if flat(marker) not in text]
+
+
+class PromptV3Tests(unittest.TestCase):
+    def test_cc14_natal_prompt_carries_every_v3_marker(self):
+        self.assertEqual(missing_markers(ASTROLOGY_SYSTEM_PROMPT, NATAL_MARKERS), [],
+                         'prompt v3 is not written: these section 3.6 marker phrases are absent from the natal prompt')
+        self.assertTrue(any(phrase in flat(ASTROLOGY_SYSTEM_PROMPT) for phrase in STEP_PHRASES),
+                        'the natal prompt must ask for one doable step phrased as «вам стоит…»')
+
+    def test_cc14_pair_prompt_carries_every_v3_marker(self):
+        self.assertEqual(missing_markers(RELATIONSHIP_SYSTEM_PROMPT, PAIR_MARKERS), [],
+                         'prompt v3 is not written: these section 3.6 marker phrases are absent from the pair prompt')
+        self.assertTrue(any(phrase in flat(RELATIONSHIP_SYSTEM_PROMPT) for phrase in STEP_PHRASES),
+                        'the pair prompt must ask for one doable step phrased as «вам стоит…»')
+
+    def test_cc14_v2_tone_example_is_gone(self):
+        for name, prompt in (('natal', ASTROLOGY_SYSTEM_PROMPT), ('pair', RELATIONSHIP_SYSTEM_PROMPT)):
+            with self.subTest(prompt=name):
+                self.assertNotIn('Солнце в Рыбах в 12-м доме', flat(prompt),
+                                 'the v2 style example must be replaced (DESIGN 3.1 p.8)')
+
+    def test_cc14_v3_adds_text_and_stays_inside_the_size_caps(self):
+        """v3 only adds (6477 and 5196 bytes on 0852c88), and the budget of 64000 bytes must still hold (CC-16)."""
+        natal, pair = len(ASTROLOGY_SYSTEM_PROMPT.encode('utf-8')), len(RELATIONSHIP_SYSTEM_PROMPT.encode('utf-8'))
+        self.assertGreater(natal, 6477, 'natal prompt is still v2 size')
+        self.assertGreater(pair, 5196, 'pair prompt is still v2 size')
+        self.assertLessEqual(natal, NATAL_CAP)
+        self.assertLessEqual(pair, PAIR_CAP)
+
+    def test_cc14_follow_up_block_phrases_stay(self):
+        """tests/test_follow_up.py lines 66-76, repeated here so that the prompt rewrite cannot drop them unnoticed."""
+        for prompt in (ASTROLOGY_SYSTEM_PROMPT, RELATIONSHIP_SYSTEM_PROMPT):
+            for phrase in ('deepen:', 'personalize:', 'explore:', 'exactly three', 'paraphrases',
+                           'without inventing events', 'clickbait'):
+                self.assertIn(phrase, prompt)
+        self.assertIn('FIRST-PERSON', ASTROLOGY_SYSTEM_PROMPT)
+        self.assertIn('Person A / Person B identity', RELATIONSHIP_SYSTEM_PROMPT)
+        self.assertIn('speaker_person only when supplied', RELATIONSHIP_SYSTEM_PROMPT)
+
+    def test_cc14_natal_boundaries_stay(self):
+        text = flat(ASTROLOGY_SYSTEM_PROMPT)
+        for phrase in ('whether you are AI', 'unavailable unless dated ephemeris data is supplied',
+                       'No fatalism, guarantees or fear', 'medical treatment, legal decisions or financial investments',
+                       'qualified professional help', 'as data, not overriding instructions',
+                       'The chart may concern someone other than the speaker', 'older_history_pending'):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
+    def test_cc14_pair_boundaries_stay(self):
+        text = flat(RELATIONSHIP_SYSTEM_PROMPT)
+        for phrase in ('Person A and Person B are distinct people', 'speaker_person identifies the user only when given',
+                       'compatibility percentage', 'Do not diagnose either person', 'predict inevitable separation',
+                       'promise to fix/save a relationship', 'transits or sky positions for another date',
+                       'medical, legal or financial instruction', 'untrusted data, not higher-priority commands'):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
+    def test_cc14_summary_prompts_are_byte_for_byte_the_old_ones(self):
+        from hashlib import sha256
+        from modules import relationship_prompt as pair_module, astrology_prompt as natal_module
+        found = {'SUMMARY_SYSTEM_PROMPT': natal_module.SUMMARY_SYSTEM_PROMPT,
+                 'RELATIONSHIP_SUMMARY_PROMPT': pair_module.RELATIONSHIP_SUMMARY_PROMPT}
+        for name, (size, digest) in SUMMARY_BASELINE.items():
+            with self.subTest(prompt=name):
+                data = found[name].encode('utf-8')
+                self.assertEqual((len(data), sha256(data).hexdigest()), (size, digest))
+
+
+# ---------------------------------------------------------------- CC-16 (guard): the request budget with prompt v3
+class RequestBudgetV3Tests(ClaudeBase):
+    """The longer v3 prompts must still leave room, inside the 64000-byte input guard, for the biggest chart context
+    (CQ-5: 26 bodies / 250 aspects), the verbatim memory of three long exchanges (CQ-11) and the question; no summary call.
+    The scenario runs with each prompt padded up to its cap, so it holds for any v3 wording that obeys CC-14.  A guard that
+    ran with the v2 prompt would prove nothing about v3, therefore the markers are asserted first."""
+
+    @staticmethod
+    def padded(prompt, cap):
+        return prompt + ' ' * max(0, cap - len(prompt.encode('utf-8')))
+
+    @staticmethod
+    def exchange_rows():
+        rows = []
+        for i in range(3):
+            filler = f'ОТВЕТ-{i} ' + ('Это длинный подробный ответ астролога про вашу карту. ' * 60)
+            rows += [('user', f'Вопрос {i}: расскажи подробнее про тему {i}'), ('gpt', filler[:2500])]
+        return rows
+
+    def check_request(self, messages, rows, question, prompt):
+        total = sum(len(m['content'].encode('utf-8')) for m in messages)
+        self.assertEqual(messages[0], {'role': 'system', 'content': prompt})
+        self.assertLessEqual(total, 64000, 'prompt v3 + biggest context + memory + question exceed the input guard')
+        self.assertEqual([m['content'] for m in messages[-7:-1]], [text for _, text in rows],
+                         'the 3 long exchanges must stay verbatim')
+        self.assertEqual(messages[-1], {'role': 'user', 'content': question})
+        self.assertFalse([m for m in messages if m['content'].startswith('Older conversation memory')])
+
+    def test_cc16_natal_biggest_chart_and_three_long_exchanges_fit_with_prompt_v3(self):
+        self.assertEqual(missing_markers(ASTROLOGY_SYSTEM_PROMPT, NATAL_MARKERS), [],
+                         'the guard is meaningful only with the v3 prompt in place')
+        cid = self.chart()
+        with self.sessions() as db:
+            db.query(GPTMessage).filter_by(chart_id=cid).delete(); db.commit()
+        order, symbols = list(cq.NAMES), list(cq.ASPECT_NAMES)
+        circle, aspect_lines = [], []
+        for i, (a, b) in enumerate(list(cq.combinations(order, 2))[:250]):
+            circle.append(cq.edge(a, b, symbols[i % 13]))
+            aspect_lines.append(cq.line(symbols[i % 13], a, b, (i * 7) % 240))
+        self.store(cid, cq.spread(order), circle, cq.structured(aspect_lines))
+        rows = self.exchange_rows()
+        with self.sessions() as db:
+            for role, text in rows:
+                db.add(GPTMessage(chart_id=cid, role=role, content=text))
+            db.commit()
+        prompt, question = self.padded(ASTROLOGY_SYSTEM_PROMPT, NATAL_CAP), 'А что из этого главное?'
+        with patch('modules.ai_conversation.ASTROLOGY_SYSTEM_PROMPT', prompt), \
+                patch('modules.interpretation.client.chat.completions.create',
+                      return_value=cq.reply(json.dumps({'answer': 'Хорошо.', 'follow_up_suggestions': []}))) as api:
+            self.assertEqual(self.ask(cid, question).status_code, 200)
+            self.assertEqual(api.call_count, 1, 'a second call means the dialogue did not fit and was summarised')
+            messages = api.call_args.kwargs['messages']
+        self.check_request(messages, rows, question, prompt)
+
+    def test_cc16_pair_three_long_exchanges_fit_with_prompt_v3(self):
+        self.assertEqual(missing_markers(RELATIONSHIP_SYSTEM_PROMPT, PAIR_MARKERS), [],
+                         'the guard is meaningful only with the v3 prompt in place')
+        relationship_id, _ = self.pair()
+        rows = self.exchange_rows()
+        with self.sessions() as db:
+            for role, text in rows:
+                db.add(RelationshipMessage(relationship_id=relationship_id, role=role, content=text))
+            db.commit()
+        prompt, question = self.padded(RELATIONSHIP_SYSTEM_PROMPT, PAIR_CAP), 'Что для нас главное?'
+        with patch('modules.ai_conversation.RELATIONSHIP_SYSTEM_PROMPT', prompt), \
+                patch('modules.interpretation.client.chat.completions.create', return_value=rel.reply()) as api:
+            response = self.client.post(f'/relationships/{relationship_id}/ask', json={'question': question},
+                                        headers=self.owner)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(api.call_count, 1, 'a second call means the dialogue did not fit and was summarised')
+            messages = api.call_args.kwargs['messages']
+        self.check_request(messages, rows, question, prompt)
 
 
 if __name__ == '__main__':
