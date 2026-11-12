@@ -9,11 +9,10 @@ from pathlib import Path
 
 TOOL_DIR = Path(__file__).resolve().parent
 # DECISIONS no. 17: the owner's OpenAI project limit is 9 USD, the hard stop of the whole eval is 8.5 (all paid runs together,
-# by the shared ledger); the Anthropic account holds 10 USD of credits, the hard stop is 9.5.
+# by the shared ledger); the Anthropic account holds 10 USD of credits, the hard stop is 9.5. Each hard stop is BOTH the default and
+# the highest value a flag may name: the tool ceiling stays below the provider limit, only a new owner decision raises it.
 BUDGET_DEFAULT_USD = 8.5
-OWNER_LIMIT_USD = 9.0
 ANTHROPIC_EVAL_LIMIT_USD = 9.5
-ANTHROPIC_OWNER_LIMIT_USD = 10.0
 OPENAI_URL = "https://api.openai.com/v1"   # the only address a paid run sends the key to (besides a loopback rehearsal)
 STAND_OPENAI_URL = "http://127.0.0.1:8101/v1"
 ANTHROPIC_URL = "https://api.anthropic.com"
@@ -64,6 +63,7 @@ CONFIGS = {
 JUDGE_MODEL = "gpt-6.1-sol"
 JUDGE_EFFORT = "low"
 ANTHROPIC_JUDGE_MODEL = "claude-opus-5-5"     # the owner may choose claude-sonnet-5-5 instead (DESIGN 6.3)
+CLAUDE_JUDGE_MODELS = ("claude-opus-5-5", "claude-sonnet-5-5")     # the only judges: never a candidate (Haiku does not judge itself)
 
 _SECRETS = set()
 _KEY_SHAPE = re.compile(r"sk-[A-Za-z0-9_\-]{8,}")
@@ -131,14 +131,14 @@ def paid_state_dir():
 
 
 def valid_budget(value):
-    """A finite number above 0 and not above the owner's OpenAI limit (NaN and inf fail every comparison, so test them first)."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 < value <= OWNER_LIMIT_USD
+    """A finite number above 0 and not above the OpenAI ceiling of the tool, 8.5 (NaN and inf fail every comparison, so test them first)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 < value <= BUDGET_DEFAULT_USD
 
 
 def valid_anthropic_budget(value):
     """Like valid_budget, but 0 is allowed and means 'the owner has not named a sum': every paid Anthropic call then refuses."""
     return (isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
-            and 0 <= value <= ANTHROPIC_OWNER_LIMIT_USD)
+            and 0 <= value <= ANTHROPIC_EVAL_LIMIT_USD)
 
 
 def client_base_url(*, real, dry_url, real_base_url="", provider="openai"):

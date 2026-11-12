@@ -513,7 +513,8 @@ def build_claude_report(run_dir, seed, ledger_path, limits, charts, g_final=None
     shas["tool"] = next(iter(metas.values()))["tool_sha"] if metas else "unknown"
     mode = next(iter(metas.values()))["mode"] if metas else "dry"
     spent = {k: round(v, 6) for k, v in budget_mod.spent_by_provider(ledger_path).items()}
-    metrics = {"mode": mode, "final": {"g": g, "h": h}, "gates": gates, "j0": j0, "j1": j1, "j2": j2, "j3": j3, "j4": j4,
+    finals_basis = {"g": "override" if g_final else "j3", "h": "override" if h_final else "j3"}      # F-4: an override skips J3
+    metrics = {"mode": mode, "final": {"g": g, "h": h}, "finals_basis": finals_basis, "gates": gates, "j0": j0, "j1": j1, "j2": j2, "j3": j3, "j4": j4,
                "cost_per_1000_answers": {cfg: round_or_none((entry["cost_per_answer_usd"] or 0) * 1000, 6) for cfg, entry in code.items()},
                "ttfb_ms": ttfb, "s1_word_overlap": {cfg: _s1_overlap(answers, cfg) for cfg in code}, "vam_stoit_share": vam,
                "vam_stoit_new_template": {cfg: bool(value is not None and value > 0.7) for cfg, value in vam.items()},
@@ -529,7 +530,11 @@ def render_claude_markdown(m, metas):
     lines = ["# Отчёт замера CHAT-CLAUDE", "",
              "Режим: **%s**. Только синтетические карты и вопросы; в журналах метки и числа, без текстов." % (
                  "настоящий замер" if m["mode"] == "real" else "сухой прогон на подменах (деньги не тратятся)"), "",
-             "Финалисты: %s (GPT) и %s (Haiku)." % (m["final"]["g"], m["final"]["h"]), "",
+             "Финалисты: %s (GPT) и %s (Haiku)." % (m["final"]["g"], m["final"]["h"]), ""]
+    for family, name in (("g", "GPT"), ("h", "Haiku")):
+        if m["finals_basis"][family] == "override":
+            lines += ["**Финалист %s (%s) назван вручную: J3 пропущен, выбор усилия судьёй Claude не использован.**" % (m["final"][family], name), ""]
+    lines += [
              "## Условия допуска (DESIGN 6.4, G1-G9)", "", "| Конфигурация | " + " | ".join("G%d" % i for i in range(1, 10)) + " | Допущена |",
              "|---|" + "---|" * 10]
     for cfg, gate in m["gates"].items():

@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .budget import Budget, spent_by_provider
-from .common import (ANTHROPIC_EVAL_LIMIT_USD, ANTHROPIC_JUDGE_MODEL, BUDGET_DEFAULT_USD, CONFIGS, STAND_ANTHROPIC_URL,
+from .common import (ANTHROPIC_EVAL_LIMIT_USD, ANTHROPIC_JUDGE_MODEL, BUDGET_DEFAULT_USD, CLAUDE_JUDGE_MODELS, CONFIGS, STAND_ANTHROPIC_URL,
                      STAND_OPENAI_URL, STUB_ANTHROPIC_KEY, STUB_KEY, TOOL_DIR, KeyError_, child_env, client_base_url, default_secrets_dir,
                      default_tasks_dir, key_file_for, is_loopback_url, load_key, log_event, paid_state_dir, redact, refuse_non_loopback,
                      valid_anthropic_budget, valid_budget)
@@ -42,9 +42,9 @@ def add_common(parser):
     parser.add_argument("--v2-repo", help="checkout with the 'v2 point' (the Claude provider, the old prompt): G2, H2")
     parser.add_argument("--v3-repo", help="checkout with the 'v3 point' (the new prompt): G3, G3x, H3, H3x, probes P1, P2, PH1, PH2")
     parser.add_argument("--run-dir", help="default: <tasks>/eval-dry (dry) or <tasks>/eval/<run id> (real)")
-    parser.add_argument("--budget-usd", type=float, default=BUDGET_DEFAULT_USD, help="OpenAI hard cap of the whole eval (default 8.5, owner limit 9)")
+    parser.add_argument("--budget-usd", type=float, default=BUDGET_DEFAULT_USD, help="OpenAI hard cap of the whole eval: default and highest allowed value 8.5 (the owner project limit is 9)")
     parser.add_argument("--anthropic-budget-usd", type=float, default=ANTHROPIC_EVAL_LIMIT_USD,
-                        help="Anthropic hard cap of the whole eval (default 9.5, credits 10); 0 means the owner named no sum: no paid call")
+                        help="Anthropic hard cap of the whole eval: default and highest allowed value 9.5 (credits 10); 0 means the owner named no sum: no paid call")
     parser.add_argument("--secrets-dir", default=None,
                         help="folder with openai-eval.env and anthropic-eval.env (paid mode; default: the owner's .secrets folder, applied by the command line only)")
     parser.add_argument("--key-file", default=None, help="OpenAI key file (default <secrets-dir>/openai-eval.env)")
@@ -60,9 +60,12 @@ def add_common(parser):
     parser.add_argument("--seed", default=None, help="seed of the blind shuffle (default: the run directory name)")
     parser.add_argument("--params-func", default="", help="module:attr of the candidate's parameter source, if not auto-detected")
     parser.add_argument("--judges", default=None, help="comma separated: openai,claude (stage defaults: controls and main both, effort claude)")
-    parser.add_argument("--claude-judge-model", default=ANTHROPIC_JUDGE_MODEL, help="claude-opus-5-5 (default) or claude-sonnet-5-5")
-    parser.add_argument("--g-final", choices=sorted(CONFIGS), default=None, help="the GPT finalist (default: decided by J3)")
-    parser.add_argument("--h-final", choices=sorted(CONFIGS), default=None, help="the Haiku finalist (default: decided by J3)")
+    parser.add_argument("--claude-judge-model", choices=CLAUDE_JUDGE_MODELS, default=ANTHROPIC_JUDGE_MODEL,
+                        help="claude-opus-5-5 (default) or claude-sonnet-5-5; never a candidate model")
+    parser.add_argument("--g-final", choices=("G3", "G3x"), default=None,
+                        help="the GPT finalist, instead of J3's choice (the report then says J3 was skipped)")
+    parser.add_argument("--h-final", choices=("H3", "H3x"), default=None,
+                        help="the Haiku finalist, instead of J3's choice (the report then says J3 was skipped)")
     parser.add_argument("--owner-line", default=None, help="the line the owner copied from the page")
 
 
@@ -121,15 +124,15 @@ def settle_paths(args):
     return run_dir, ledger
 
 
-def refuse(reason):
-    log_event("chat_eval.cli", outcome="refused", reason=reason)
+def refuse(reason, **fields):
+    log_event("chat_eval.cli", outcome="refused", reason=reason, **fields)
     raise SystemExit(2)
 
 
 def prepare(args):
     """Start conditions for any command that may call a provider. Returns (run_dir, ledger) or exits with a reason."""
     if not valid_budget(args.budget_usd):
-        refuse("budget_out_of_range")
+        refuse("budget_out_of_range", provider="openai", limit_usd=BUDGET_DEFAULT_USD)
     anthropic_cap = getattr(args, "anthropic_budget_usd", ANTHROPIC_EVAL_LIMIT_USD)
     openai_rehearsal, anthropic_rehearsal = getattr(args, "real_base_url", ""), getattr(args, "anthropic_real_base_url", "")
     if args.ledger_dir and not (args.real and (openai_rehearsal or anthropic_rehearsal)):
@@ -142,12 +145,14 @@ def prepare(args):
     if args.real:
         if need_anthropic:                       # the cap is checked before any key file is looked for
             if not valid_anthropic_budget(anthropic_cap):
-                refuse("budget_out_of_range")
+                refuse("budget_out_of_range", provider="anthropic", limit_usd=ANTHROPIC_EVAL_LIMIT_USD)
             if anthropic_cap == 0:
                 refuse("anthropic_budget_unset")
-        os.environ.pop("OPENAI_BASE_URL", None)          # an inherited address must never receive a key
-        if need_anthropic:
-            os.environ.pop("ANTHROPIC_BASE_URL", None)
+        # Nothing inherited from either provider survives: not an address (it would receive the key), not ANTHROPIC_AUTH_TOKEN,
+        # OPENAI_ORG_ID or OPENAI_PROJECT_ID (the SDKs read them on their own and would send a request to another account or
+        # project, past the limit). Only the key loaded below stays; the children are built from this environment.
+        for name in [n for n in os.environ if n.upper().startswith(("OPENAI_", "ANTHROPIC_"))]:
+            del os.environ[name]
         try:
             if need_openai:
                 load_key(key_file_for("openai", getattr(args, "key_file", None), secrets_dir), "OPENAI_API_KEY")
