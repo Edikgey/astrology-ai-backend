@@ -7,7 +7,7 @@ from modules.ephemeris import Ephemeris, HOUSE_SYSTEM_NAME, UnsupportedHouseSyst
 from modules.birth_time import calculator_args, resolve_birth_time
 from modules.aspects import Aspects
 from modules.patterns import AstrologicalPatterns
-from models.natal_chart import NatalChartResponse, NatalChartCreate, GPTInterpretationRequest, GPTInterpretationResponse, ChartIdRequest, GPTMessageResponse, PatternResponse
+from models.natal_chart import NatalChartResponse, NatalChartCreate, GPTInterpretationRequest, GPTInterpretationResponse, GPTMessageResponse
 from api.auth import get_current_user, get_current_user_or_guest
 from models.natal_chart import NatalChartListResponse
 from database.queries import User, ChartInterpretationData, NatalChart, ChartData, GPTMessage, GPTConversation
@@ -338,100 +338,3 @@ def get_gpt_messages(
 
     messages = db.query(GPTMessage).filter_by(chart_id=chart_id).order_by(GPTMessage.id).all()
     return messages
-@router.post("/chart-bodies-info", tags=["Natal Chart"])
-def get_bodies_info(
-    data: ChartIdRequest,
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user_or_guest)
-):
-    chart = db.query(NatalChart).filter_by(id=data.chart_id, user_id=current_user.id).first()
-    if not chart:
-        raise HTTPException(status_code=404, detail="❌ Натальная карта не найдена")
-
-    # Проверка: есть ли уже сохранённые данные
-    chart_data = db.query(ChartData).filter_by(chart_id=chart.id).first()
-    if chart_data and chart_data.points_data:
-        return {"bodies": chart_data.points_data}
-
-    # Если данных нет — считаем их
-    ephem = Ephemeris(*calculator_args(chart))
-    combined_bodies = ephem.get_all_bodies_with_symbols()
-
-    result = []
-    for body, info in combined_bodies.items():
-        if isinstance(info, dict):
-            retro = " (R)" if info.get("ретроградный", False) else ""
-            sign = info.get("знак", "Нет данных")
-            degree = info.get("градус", "Нет данных")
-            house = f"({info.get('дом', 'Нет данных')} Дом)"
-            line = f"{body}{retro}  {degree} {sign} {house}"
-            result.append(line)
-
-    # Сохраняем в chart_data.points_data
-    if chart_data:
-        chart_data.points_data = result
-    else:
-        chart_data = ChartData(
-            chart_id=chart.id,
-            bodies_for_circle=None,
-            aspects_for_circle=None,
-            points_data=result
-        )
-        db.add(chart_data)
-
-    db.commit()
-
-    return {"bodies": result}
-@router.post("/get-patterns", response_model=List[PatternResponse], tags=["Natal Chart"])
-async def get_patterns(
-    data: ChartIdRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user_or_guest)
-):
-    """
-    Эндпоинт для получения структурированных астрологических паттернов по заданной натальной карте.
-    """
-    # Получаем натальную карту пользователя
-    chart = db.query(NatalChart).filter_by(id=data.chart_id, user_id=current_user.id).first()
-    if not chart:
-        raise HTTPException(status_code=404, detail="❌ Натальная карта не найдена или не принадлежит пользователю")
-
-    # Проверяем, есть ли уже сохраненные паттерны в таблице
-    chart_data = db.query(ChartData).filter_by(chart_id=chart.id).first()
-    if chart_data and chart_data.patterns_data:
-        # Возвращаем сохраненные паттерны, если они уже есть
-        return chart_data.patterns_data
-
-    # Создаём объект для работы с аспектами
-    aspects_module = Aspects(*calculator_args(chart))
-    raw_aspect_list = aspects_module.get_all_aspects_flat().split("\n")
-    raw_aspect_list = [line.strip() for line in raw_aspect_list if line.strip()]
-    aspect_dict = aspects_module.convert_aspects_for_chart(raw_aspect_list)
-    
-    # Создаём объект для получения тел с символами
-    ephem = Ephemeris(*calculator_args(chart))
-    bodies = ephem.get_all_bodies_with_symbols()
-
-    # Создаём объект паттернов с телами и аспектами
-    patterns = AstrologicalPatterns(aspect_dict, bodies)
-    
-    # Получаем структурированные паттерны
-    structured_patterns = patterns.get_patterns_structured()
-
-    # Сохраняем паттерны в таблицу ChartData
-    if chart_data:
-        chart_data.patterns_data = structured_patterns
-    else:
-        chart_data = ChartData(
-            chart_id=chart.id,
-            bodies_for_circle=None,
-            aspects_for_circle=None,
-            points_data=None,
-            patterns_data=structured_patterns  # Сохраняем паттерны
-        )
-        db.add(chart_data)
-
-    db.commit()
-
-    # Возвращаем структурированные паттерны
-    return structured_patterns
