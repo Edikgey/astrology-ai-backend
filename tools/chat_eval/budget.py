@@ -10,7 +10,7 @@ import threading
 from pathlib import Path
 from uuid import uuid4
 
-from .common import PRICES, redact
+from .common import PRICES, redact, valid_budget
 
 
 class BudgetStop(Exception):
@@ -53,6 +53,8 @@ class Reservation:
 
 class Budget:
     def __init__(self, limit_usd, ledger_path):
+        if not valid_budget(limit_usd):
+            raise ValueError("budget must be a finite number above 0 and not above the owner limit")
         self.limit = float(limit_usd)
         self.path = Path(ledger_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)

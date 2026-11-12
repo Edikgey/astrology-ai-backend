@@ -14,14 +14,13 @@ from pathlib import Path
 
 from .budget import Budget
 from .common import (BUDGET_DEFAULT_USD, CONFIGS, STAND_OPENAI_URL, STUB_KEY, TOOL_DIR, KeyError_, child_env,
-                     default_key_file, default_tasks_dir, is_loopback_url, load_key, log_event, redact,
-                     refuse_non_loopback)
+                     client_base_url, default_key_file, default_tasks_dir, is_loopback_url, load_key, log_event,
+                     paid_state_dir, redact, refuse_non_loopback, valid_budget)
 from .judge import run_judge
 from .metered import JsonlWriter, MeteredClient
 from .report import build_report, read_jsonl
 
 TOOL_ROOT = TOOL_DIR.parent.parent
-OWNER_LIMIT_USD = 10.0
 DEFAULT_RUNS = {"C0": 2, "C1": 2, "C2": 1, "C3": 1, "C4": 1, "P0": 1, "P1": 1, "P2": 1}
 
 
@@ -35,6 +34,8 @@ def add_common(parser):
     parser.add_argument("--base-url", default=STAND_OPENAI_URL, help="dry mode: the loopback OpenAI stand-in")
     parser.add_argument("--real-base-url", default="",
                         help="rehearsal of the paid code path against a LOOPBACK server (tests); never an external address")
+    parser.add_argument("--ledger-dir", default="",
+                        help="TESTS ONLY, and only with --real --real-base-url on loopback: another folder for the paid ledger")
     parser.add_argument("--charts", default=str(TOOL_DIR / "charts.json"))
     parser.add_argument("--seed", default=None, help="seed of the blind shuffle (default: the run directory name)")
     parser.add_argument("--params-func", default="", help="module:attr of the candidate's parameter source, if not auto-detected")
@@ -48,19 +49,27 @@ def settle_paths(args):
         run_dir = tasks / "eval" / datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     else:
         run_dir = tasks / "eval-dry"
-    ledger = (run_dir.parent / "spend.jsonl") if args.real else (run_dir / "spend.jsonl")
+    if args.real:
+        # One ledger and one lock for every paid run, whatever --run-dir says (the limit is shared by all of them).
+        ledger = (Path(args.ledger_dir).resolve() if args.ledger_dir else paid_state_dir()) / "spend.jsonl"
+    else:
+        ledger = run_dir / "spend.jsonl"
     return run_dir, ledger
 
 
 def prepare(args):
     """Start conditions for any command that may call a provider. Returns (run_dir, ledger) or exits with a reason."""
-    if args.budget_usd > OWNER_LIMIT_USD or args.budget_usd <= 0:
+    if not valid_budget(args.budget_usd):
         log_event("chat_eval.cli", outcome="refused", reason="budget_out_of_range")
+        raise SystemExit(2)
+    if args.ledger_dir and not (args.real and args.real_base_url):
+        log_event("chat_eval.cli", outcome="refused", reason="ledger_dir_only_for_rehearsal")
         raise SystemExit(2)
     if args.real_base_url and not is_loopback_url(args.real_base_url):
         log_event("chat_eval.cli", outcome="refused", reason="real_base_url_must_be_loopback")
         raise SystemExit(2)
     if args.real:
+        os.environ.pop("OPENAI_BASE_URL", None)          # an inherited address must never receive the key
         try:
             load_key(args.key_file or default_key_file())
         except KeyError_ as error:
@@ -108,6 +117,11 @@ def repo_for(args, config):
 
 
 def run_workers(args, run_dir, ledger, configs, only=""):
+    existing = {a["config"] for a in read_jsonl(run_dir / "answers.jsonl")}
+    if existing & set(configs) and not getattr(args, "allow_existing", False):
+        # A second run would pay for new answers and leave the old verdicts attached to them.
+        log_event("chat_eval.cli", outcome="refused", reason="answers_already_exist")
+        return 2
     run_dir.mkdir(parents=True, exist_ok=True)
     for config in configs:
         repo = repo_for(args, config)
@@ -140,12 +154,10 @@ def run_workers(args, run_dir, ledger, configs, only=""):
 
 def make_metered(args, run_dir, ledger, config_label):
     from openai import OpenAI
-    options = {"timeout": 180, "max_retries": 0}
+    options = {"timeout": 180, "max_retries": 0,
+               "base_url": client_base_url(real=args.real, dry_url=args.base_url, real_base_url=args.real_base_url)}
     if not args.real:
-        options["base_url"] = args.base_url
         refuse_non_loopback()
-    elif args.real_base_url:
-        options["base_url"] = args.real_base_url
     return MeteredClient(OpenAI(**options), Budget(args.budget_usd, ledger), JsonlWriter(run_dir / "calls.jsonl"),
                          config=config_label)
 
@@ -196,13 +208,15 @@ def main(argv=None):
             command.add_argument("--configs", default="C0,C1", help="comma separated: C0,C1,C2,C3,C4")
             command.add_argument("--only", default="", help="comma separated question ids (a smoke run)")
             command.add_argument("--runs", type=int, default=0, help="runs per configuration (default 2 for C0/C1, else 1)")
+            command.add_argument("--allow-existing", action="store_true",
+                                 help="run again on a folder that already has answers of these configurations (pays again)")
         if name in ("judge", "cycle"):
             command.add_argument("--judge-workers", type=int, default=4)
     args = parser.parse_args(argv)
     run_dir, ledger = prepare(args)
     with RunLock(ledger, args.real and args.command != "report"):
         if args.command == "probe":
-            return run_workers(args, run_dir, ledger, ["P0", "P1", "P2"], only="N01")
+            return run_workers(args, run_dir / "probe", ledger, ["P0", "P1", "P2"], only="N01")
         configs = [c.strip() for c in getattr(args, "configs", "C0,C1").split(",") if c.strip()]
         if any(c not in CONFIGS or c.startswith("P") for c in configs):
             log_event("chat_eval.cli", outcome="refused", reason="unknown_config")

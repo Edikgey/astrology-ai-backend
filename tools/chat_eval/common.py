@@ -9,6 +9,8 @@ from pathlib import Path
 
 TOOL_DIR = Path(__file__).resolve().parent
 BUDGET_DEFAULT_USD = 9.5          # DECISIONS no. 9: hard stop, inside the $10 the owner allowed
+OWNER_LIMIT_USD = 10.0            # DECISIONS no. 8: all paid runs together, by the shared ledger
+OPENAI_URL = "https://api.openai.com/v1"   # the only address a paid run sends the key to (besides a loopback rehearsal)
 STAND_OPENAI_URL = "http://127.0.0.1:8101/v1"
 STUB_KEY = "sk-chat-eval-dry-run-stub"
 
@@ -89,6 +91,23 @@ def find_root():
 def default_tasks_dir():
     root = find_root()
     return (root / "tasks" / "CHAT-QUALITY") if root else Path.cwd() / "CHAT-QUALITY"
+
+
+def paid_state_dir():
+    """The ONE place of the paid money ledger (spend.jsonl) and run.lock, whatever --run-dir is."""
+    return default_tasks_dir() / "eval"
+
+
+def valid_budget(value):
+    """A finite number above 0 and not above the owner's $10 (NaN and inf fail every comparison, so test them first)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 < value <= OWNER_LIMIT_USD
+
+
+def client_base_url(*, real, dry_url, real_base_url=""):
+    """The explicit provider address of every process: never read from the inherited environment."""
+    if real:
+        return real_base_url or OPENAI_URL
+    return dry_url
 
 
 def default_key_file():

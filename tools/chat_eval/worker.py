@@ -7,6 +7,7 @@ the provider client is wrapped by MeteredClient (budget check before the call, u
 Exit codes: 0 done, 2 refused to start, 3 stopped by the budget, 4 aborted (the provider refuses the key).
 """
 import argparse
+import importlib
 import json
 import os
 import sys
@@ -14,8 +15,8 @@ import time
 from pathlib import Path
 
 from .budget import Budget, UnknownModel, price_for
-from .common import (CONFIGS, STUB_KEY, TOOL_DIR, child_env, git_state, is_loopback_url, log_event, redact,
-                     refuse_non_loopback, register_secret, tool_sha)
+from .common import (CONFIGS, STUB_KEY, TOOL_DIR, child_env, client_base_url, git_state, is_loopback_url, log_event,
+                     paid_state_dir, redact, refuse_non_loopback, register_secret, tool_sha, valid_budget)
 from .facts import ChartFacts
 from .metered import JsonlWriter, MeteredClient
 from . import questions as Q
@@ -43,13 +44,23 @@ def parse(argv):
 
 def product_params(interpretation, override):
     """The parameters the product would send for the model in the environment (differs between base and candidate)."""
-    names = [override.split(":", 1)[1]] if override else list(PARAM_SOURCES)
+    source, names = interpretation, list(PARAM_SOURCES)
+    if override:
+        module_name, _, attribute = override.partition(":")
+        if not module_name or not attribute:
+            return None, None
+        try:
+            source = importlib.import_module(module_name)
+        except Exception:
+            return None, None
+        names = [attribute]
     for name in names:
-        value = getattr(interpretation, name, None)
+        value = getattr(source, name, None)
+        label = override or name
         if callable(value):
-            return dict(value()), name
+            return dict(value()), label
         if isinstance(value, dict):
-            return dict(value), name
+            return dict(value), label
     return None, None
 
 
@@ -225,6 +236,14 @@ def main(argv=None):
     args = parse(argv)
     config = CONFIGS[args.config]
     out_dir, repo = Path(args.out_dir).resolve(), Path(args.repo).resolve()
+    # Same rules as the CLI, because this process can be started directly: a finite limit in (0, 10] and, for a
+    # paid run, the one shared ledger (only a loopback rehearsal may use another).
+    if not valid_budget(args.budget_usd):
+        log_event("chat_eval.worker", outcome="refused", reason="budget_out_of_range", config=args.config)
+        return 2
+    if args.real and not args.real_base_url and Path(args.ledger).resolve() != (paid_state_dir() / "spend.jsonl").resolve():
+        log_event("chat_eval.worker", outcome="refused", reason="paid_ledger_must_be_the_shared_one", config=args.config)
+        return 2
     out_dir.mkdir(parents=True, exist_ok=True)
     # --- start conditions: a paid run only with a key, a dry run only against this computer -------------------
     if args.real:
@@ -269,11 +288,9 @@ def main(argv=None):
     if params is None or params.get("model") != config["model"]:
         log_event("chat_eval.worker", outcome="refused", reason="product_params_unavailable", config=args.config)
         return 2
-    client_args = {"timeout": OPENAI_TIMEOUT_SECONDS, "max_retries": 0}
-    if not args.real:
-        client_args["base_url"] = os.environ["OPENAI_BASE_URL"]
-    elif args.real_base_url:
-        client_args["base_url"] = args.real_base_url
+    client_args = {"timeout": OPENAI_TIMEOUT_SECONDS, "max_retries": 0,
+                   "base_url": client_base_url(real=args.real, dry_url=os.environ.get("OPENAI_BASE_URL", ""),
+                                               real_base_url=args.real_base_url)}
     budget = Budget(args.budget_usd, out_args[1])
     run_id = out_dir.name
     metered = MeteredClient(OpenAI(**client_args), budget, JsonlWriter(out_dir / "calls.jsonl"), config=args.config)

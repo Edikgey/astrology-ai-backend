@@ -134,7 +134,10 @@ class ChartFactsTests(unittest.TestCase):
             self.assertEqual(bodies, data["bodies_for_circle"], key)
             self.assertEqual(structured, data["aspects_structured"], key)
             self.assertEqual(houses, data["houses"], key)
-            self.assertEqual(patterns, data["patterns_data"], key)
+            def canon(rows):      # the product builds patterns from sets: the order is not stable between processes
+                return sorted(json.dumps({"type": r["type"], "bodies": sorted(r["bodies"], key=lambda b: b["symbol"])},
+                                         ensure_ascii=False, sort_keys=True) for r in rows)
+            self.assertEqual(canon(patterns), canon(data["patterns_data"]), key)
 
     def test_degree_in_sign_drops_minutes_and_never_rounds_into_the_next_sign(self):
         self.assertEqual(degree_in_sign(353.0846), (23, 5))

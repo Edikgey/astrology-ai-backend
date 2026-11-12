@@ -186,7 +186,24 @@ def spend_by_kind(calls):
     return {k: round(v, 6) for k, v in totals.items()}
 
 
-def build_pages(run_dir, answers, facts, seed):
+def pick_second_model(answers, judgments):
+    """The better of C2/C3 for the model page: more judge wins in C2-against-C3 pairs; no data or equal -> C2 (cheaper)."""
+    by_pair = defaultdict(list)
+    for j in judgments:
+        if (j["left"], j["right"]) == ("C2", "C3"):
+            by_pair[(j["q"], j["run"])].append(j)
+    verdicts = Counter(pair_verdict(js) for js in by_pair.values())
+    present = {a["config"] for a in answers}
+    if "C3" not in present:
+        return "C2", "only_c2"
+    if "C2" not in present:
+        return "C3", "only_c3"
+    if verdicts.get("C2", 0) + verdicts.get("C3", 0) == 0:
+        return "C2", "no_judge_data"
+    return ("C3" if verdicts.get("C3", 0) > verdicts.get("C2", 0) else "C2"), "judge_wins"
+
+
+def build_pages(run_dir, answers, facts, seed, judgments=()):
     """compare.html (C0/C1, first runs, twelve cards) and, if C2/C3 exist, compare-models.html; key.json for both."""
     run_dir = Path(run_dir)
     key, written = {}, []
@@ -212,11 +229,13 @@ def build_pages(run_dir, answers, facts, seed):
 
     page("compare.html", Q.OWNER_PAGE_IDS, "C0", "C1", "Сравнение ответов Lunaria вслепую: 12 вопросов")
     present = {a["config"] for a in answers}
-    best = next((c for c in ("C2", "C3") if c in present), None)
-    if best and "C1" in present:
+    extra = {}
+    if {"C2", "C3"} & present and "C1" in present:
+        best, reason = pick_second_model(answers, judgments)
         page("compare-models.html", Q.MODEL_PAGE_IDS, "C1", best, "Сравнение ответов Lunaria вслепую: выбор модели")
+        extra = {"model_page_second": best, "model_page_reason": reason}
     if written:
-        (run_dir / "key.json").write_text(json.dumps({"seed": seed, "pages": key}, ensure_ascii=False, indent=1) + "\n",
+        (run_dir / "key.json").write_text(json.dumps({"seed": seed, "pages": key, **extra}, ensure_ascii=False, indent=1) + "\n",
                                           encoding="utf-8")
     return written
 
@@ -297,7 +316,7 @@ def build_report(run_dir, seed, ledger_path, limit_usd, charts, pairs_spec):
     from .budget import Budget
     spent = Budget(limit_usd, ledger_path).spent()
     projection, kinds = project_costs(run["calls"]), spend_by_kind(run["calls"])
-    pages = build_pages(run_dir, run["answers"], run["facts"], seed) if run["facts"] else []
+    pages = build_pages(run_dir, run["answers"], run["facts"], seed, run["judgments"]) if run["facts"] else []
     mode = next(iter(run["metas"].values()))["mode"] if run["metas"] else "dry"
     tool = next(iter(run["metas"].values()))["tool_sha"] if run["metas"] else "unknown"
     metrics = {"mode": mode, "tool_sha": tool, "spent_usd": round(spent, 6), "limit_usd": limit_usd, "projection": projection,

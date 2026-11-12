@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 SUGGESTIONS = [{"type": "deepen", "text": "Расскажи об этом подробнее"},
                {"type": "personalize", "text": "Как это проявляется в моей жизни?"},
                {"type": "explore", "text": "А что говорят другие планеты?"}]
+PARAMS_FOR_TEST = {"model": "gpt-4o-mini", "temperature": 0.1}   # a parameter source for the --params-func test
 ANSWER = "**Коротко.** Луна в Водолее в 12 доме.\n\n- первое\n- второе"
 
 

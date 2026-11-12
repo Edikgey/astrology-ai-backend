@@ -59,15 +59,16 @@ class CycleTests(unittest.TestCase):
         key_file = self.root / "openai-eval.env"
         key_file.write_text("OPENAI_API_KEY=%s\n" % key, encoding="utf-8")
         with FakeOpenAI(expected_key=key, judge_valid=True) as server:
-            result = self.cycle("--real", "--real-base-url", server.url, "--key-file", str(key_file))
+            result = self.cycle("--real", "--real-base-url", server.url, "--key-file", str(key_file),
+                                "--ledger-dir", str(self.root / "ledger"))
             self.assertTrue(server.auth_seen and all(server.auth_seen), "the provider must receive the key from the file")
         self.assertEqual(result.returncode, 0, result.stdout[-1200:])
         self.assertNotIn(key, result.stdout)
         self.assertNotIn(key, result.stderr)
         for path, text in read_all_text(self.root, skip=("openai-eval.env",)):
             self.assertNotIn(key, text, path.name)
-        self.assertTrue((self.root / "spend.jsonl").is_file())            # the paid ledger sits next to the run folder
-        self.assertFalse((self.root / "run.lock").exists())
+        self.assertTrue((self.root / "ledger" / "spend.jsonl").is_file())     # the paid ledger lives in the ledger dir
+        self.assertFalse((self.root / "ledger" / "run.lock").exists())
         judgments = [json.loads(l) for l in (self.run_dir / "judgments.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual({j["outcome"] for j in judgments}, {"ok"})
         self.assertEqual({j["winner"] for j in judgments}, {"C0", "C1"})   # judge always says "answer 2": order decides it
@@ -77,7 +78,8 @@ class CycleTests(unittest.TestCase):
         key_file = self.root / "openai-eval.env"
         key_file.write_text("OPENAI_API_KEY=%s\n" % key, encoding="utf-8")
         with FakeOpenAI(expected_key=key, mode="unauthorized_echo") as server:
-            result = self.cycle("--real", "--real-base-url", server.url, "--key-file", str(key_file))
+            result = self.cycle("--real", "--real-base-url", server.url, "--key-file", str(key_file),
+                                "--ledger-dir", str(self.root / "ledger"))
             made = server.count()
         self.assertEqual(result.returncode, 4, result.stdout[-1200:])         # aborted: the provider refuses the key
         self.assertEqual(made, 2)                                              # after two refusals no more calls
@@ -137,7 +139,7 @@ class StartConditionTests(unittest.TestCase):
             key_file.write_text("OPENAI_API_KEY=sk-test-not-used-anywhere\n", encoding="utf-8")
             result = run_cli("run", "--real", "--real-base-url", "http://127.0.0.1:9/v1", "--configs", "C0",
                              "--base-repo", str(REPO), "--candidate-repo", str(REPO), "--key-file", str(key_file),
-                             "--run-dir", str(Path(tmp) / "run"))
+                             "--ledger-dir", tmp, "--run-dir", str(Path(tmp) / "run"))
         self.assertEqual(result.returncode, 2)
         self.assertIn("reason=another_run_in_progress", result.stdout)
 
