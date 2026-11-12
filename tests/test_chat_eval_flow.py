@@ -13,7 +13,7 @@ from chat_eval_fake_server import FakeOpenAI, judgment
 from test_chat_eval_budget import FakeInner, REPO, response, run_cli
 from tools.chat_eval import common, questions
 from tools.chat_eval.budget import Budget
-from tools.chat_eval.judge import build_messages, judge_one, pair_verdict, parse_judgment
+from tools.chat_eval.judge import CRITERIA, build_messages, judge_one, pair_verdict, parse_judgment
 from tools.chat_eval.metered import JsonlWriter, MeteredClient
 from tools.chat_eval.page import assign_sides, build_page, render_markup
 from tools.chat_eval.report import judge_metrics, thresholds
@@ -176,8 +176,8 @@ class LogVocabularyTests(unittest.TestCase):
 
 class QuestionSetTests(unittest.TestCase):
     def test_the_set_matches_eval_set(self):
-        self.assertEqual(len(questions.QUESTIONS), 21)
-        self.assertEqual(sum(len(c[3]) for c in questions.CONVERSATIONS), 22)       # 21 evaluated + X01
+        self.assertEqual(len(questions.QUESTIONS), 28)
+        self.assertEqual(sum(len(c[3]) for c in questions.CONVERSATIONS), 29)       # 28 evaluated + X01 (rubric v2 set, CHAT-CLAUDE)
         self.assertEqual(len(questions.OWNER_PAGE_IDS), 12)
         self.assertEqual(len(questions.SEED_MESSAGES), 24)
         self.assertEqual([m[0] for m in questions.SEED_MESSAGES[:4]], ["user", "gpt", "user", "gpt"])
@@ -287,8 +287,7 @@ class JudgeTests(unittest.TestCase):
     def test_a_win_needs_both_orders_and_resolved_pairs_drive_the_threshold(self):
         def j(q, order, winner, left_score=3, right_score=4):
             return {"q": q, "run": 1, "left": "C0", "right": "C1", "order": order, "outcome": "ok", "winner": winner,
-                    "reason": "r", "scores": {"C0": {c: left_score for c in ("specific", "facts", "language", "structure", "usefulness", "no_filler")},
-                                                "C1": {c: right_score for c in ("specific", "facts", "language", "structure", "usefulness", "no_filler")}},
+                    "reason": "r", "scores": {"C0": {c: left_score for c in CRITERIA}, "C1": {c: right_score for c in CRITERIA}},
                     "fact_errors": {"C0": [], "C1": []}, "boundary_kept": {"C0": "n/a", "C1": "n/a"}}
         answers = [{"config": c, "q": q, "run": 1, "outcome": "ok", "response": "x"} for c in ("C0", "C1") for q in ("N01", "N03", "N04")]
         judgments = [j("N01", "XY", "C1"), j("N01", "YX", "C1"),          # both agree: C1 wins

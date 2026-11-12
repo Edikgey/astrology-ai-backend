@@ -208,7 +208,7 @@ class MeteredClientTests(unittest.TestCase):
 
 
 def run_cli(*args, env_extra=None, key_file=None):
-    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("OPENAI_")}
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("OPENAI_", "ANTHROPIC_"))}
     env.update(PYTHONUTF8="1", **(env_extra or {}))
     return subprocess.run([sys.executable, "-m", "tools.chat_eval", *args], cwd=str(REPO), env=env, capture_output=True,
                           text=True, encoding="utf-8", errors="replace", timeout=600)
@@ -245,20 +245,20 @@ class EndToEndBudgetTests(unittest.TestCase):
 
     def test_a_provider_failure_is_recorded_and_never_repeated(self):
         with FakeOpenAI(mode="http500") as server:
-            result = self.run_c0(server, "N01,N02", 9.5)
+            result = self.run_c0(server, "N01,N02", 8.5)
             made = server.count()
         self.assertEqual(result.returncode, 0, result.stdout[-800:])
         self.assertEqual(made, 2)                              # one request per question: no SDK retries, no re-asking
         answers = self.answers()
         self.assertEqual([a["outcome"] for a in answers], ["server_error", "server_error"])
-        self.assertGreater(Budget(9.5, self.dir / "spend.jsonl").spent(), 0)      # an ambiguous failure still counts
+        self.assertGreater(Budget(8.5, self.dir / "spend.jsonl").spent(), 0)      # an ambiguous failure still counts
 
     def test_a_rejected_request_costs_nothing_and_its_message_is_not_kept(self):
         with FakeOpenAI(mode="bad_request") as server:
-            result = self.run_c0(server, "N01", 9.5)
+            result = self.run_c0(server, "N01", 8.5)
         self.assertEqual(result.returncode, 0, result.stdout[-800:])
         self.assertEqual(self.answers()[0]["outcome"], "rejected")
-        self.assertEqual(Budget(9.5, self.dir / "spend.jsonl").spent(), 0)
+        self.assertEqual(Budget(8.5, self.dir / "spend.jsonl").spent(), 0)
         calls = (self.dir / "calls.jsonl").read_text(encoding="utf-8")
         self.assertIn('"provider_param": "max_tokens"', calls)
         for path in self.dir.iterdir():

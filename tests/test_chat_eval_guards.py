@@ -74,8 +74,8 @@ class SharedPaidStateTests(unittest.TestCase):
 
 
 class BudgetValueTests(unittest.TestCase):
-    """P2-1: the limit is a finite number, > 0 and <= 10, checked by the CLI, the worker and the ledger itself."""
-    BAD = ("nan", "inf", "-inf", "-1", "0", "10.01", "1e9")
+    """P2-1: the limit is a finite number, > 0 and <= 9 (the owner OpenAI project limit), checked by the CLI, the worker and the ledger itself."""
+    BAD = ("nan", "inf", "-inf", "-1", "0", "9.01", "10.01", "1e9")
 
     def test_the_cli_refuses_every_bad_limit_before_any_call(self):
         with FakeOpenAI() as server, tempfile.TemporaryDirectory() as tmp:
@@ -103,17 +103,17 @@ class BudgetValueTests(unittest.TestCase):
 
     def test_the_ledger_object_rejects_them(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for value in (float("nan"), float("inf"), -1.0, 0.0, 10.01):
+            for value in (float("nan"), float("inf"), -1.0, 0.0, 9.01, 10.01):
                 with self.assertRaises(ValueError, msg=str(value)):
                     Budget(value, Path(tmp) / "l.jsonl")
-            Budget(10.0, Path(tmp) / "l.jsonl")
+            Budget(9.0, Path(tmp) / "l.jsonl")
 
 
 class ProviderAddressTests(unittest.TestCase):
     """P2-2: in paid mode every process uses the explicit official address; an inherited OPENAI_BASE_URL is dropped."""
 
     def paid_args(self, tmp, **extra):
-        return Namespace(real=True, run_dir=str(Path(tmp) / "run"), ledger_dir="", real_base_url="", budget_usd=9.5,
+        return Namespace(real=True, run_dir=str(Path(tmp) / "run"), ledger_dir="", real_base_url="", budget_usd=8.5,
                          key_file=str(key_file(tmp)), base_url=common.STAND_OPENAI_URL, **extra)
 
     def test_prepare_removes_the_inherited_base_url_in_paid_mode(self):
@@ -148,8 +148,8 @@ class SmallHonestyTests(unittest.TestCase):
 
     def test_the_probe_writes_into_a_probe_folder_of_the_run_dir(self):
         with FakeOpenAI() as server, tempfile.TemporaryDirectory() as tmp:
-            result = run_cli("probe", "--base-repo", str(REPO), "--candidate-repo", str(REPO), "--run-dir", str(Path(tmp) / "run"),
-                             "--base-url", server.url)
+            result = run_cli("probe", "--configs", "P0,P1,P2", "--base-repo", str(REPO), "--v3-repo", str(REPO),
+                             "--run-dir", str(Path(tmp) / "run"), "--base-url", server.url)
             self.assertEqual(result.returncode, 0, result.stdout[-600:])
             self.assertEqual({a["config"] for a in lines(Path(tmp) / "run" / "probe" / "answers.jsonl")}, {"P0", "P1", "P2"})
             self.assertFalse((Path(tmp) / "run" / "answers.jsonl").exists())
