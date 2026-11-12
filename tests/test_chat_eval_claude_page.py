@@ -463,16 +463,60 @@ class ClaudeReportTests(unittest.TestCase):
         self.assertEqual(set(agreement), {"agree", "compared"})
         self.assertEqual((agreement["agree"], agreement["compared"]), (11, 11))      # S1-B: the jury has no winner, the owner a tie
 
+    def refused(self, *extra):
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                cli.main(["report", "--claude", "--run-dir", str(self.dir), "--seed", "s", *extra])
+        return caught.exception.code
+
+    def skipped_lines(self):
+        text = (self.dir / "report-claude.md").read_text(encoding="utf-8")
+        return [line for line in text.splitlines() if "пропущен" in line]
+
     def test_the_final_configurations_can_be_named_and_an_unknown_name_is_refused(self):
         metrics = self.report("--g-final", "G3x", "--h-final", "H3x")
         self.assertEqual(metrics["final"], {"g": "G3x", "h": "H3x"})
-        import contextlib
-        import io
-        with contextlib.redirect_stdout(io.StringIO()):
-            code = None
-            with self.assertRaises(SystemExit) as caught:
-                cli.main(["report", "--claude", "--run-dir", str(self.dir), "--g-final", "G9"])
-        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(self.refused("--g-final", "G9"), 2)
+
+    def test_a_final_can_only_be_a_v3_configuration_of_its_own_family(self):
+        # F-4: the override replaces J3, which chooses between the cheap and the costly effort of ONE family; nothing else is a finalist
+        for value in ("G2", "H3", "H3x", "H2", "C0", "C1", "P1", "PH1"):
+            self.assertEqual(self.refused("--g-final", value), 2, "g " + value)
+        for value in ("H2", "G3", "G3x", "G2", "C0", "C1", "P1", "PH1"):
+            self.assertEqual(self.refused("--h-final", value), 2, "h " + value)
+        for value, other in (("G3", "H3"), ("G3x", "H3x")):
+            self.assertEqual(self.report("--g-final", value, "--h-final", other)["final"], {"g": value, "h": other})
+
+    def test_without_an_override_the_basis_of_both_finals_is_j3_and_the_report_does_not_say_skipped(self):
+        metrics = self.report()
+        self.assertEqual(metrics["finals_basis"], {"g": "j3", "h": "j3"})
+        self.assertEqual(self.skipped_lines(), [])
+
+    def test_an_override_of_both_finals_is_recorded_and_the_report_names_the_configuration_and_says_j3_was_skipped(self):
+        metrics = self.report("--g-final", "G3x", "--h-final", "H3x")
+        self.assertEqual(metrics["finals_basis"], {"g": "override", "h": "override"})
+        skipped = self.skipped_lines()
+        self.assertTrue(any("G3x" in line for line in skipped), skipped)
+        self.assertTrue(any("H3x" in line for line in skipped), skipped)
+        self.assertTrue(all("J3" in line for line in skipped), skipped)
+        text = (self.dir / "report-claude.md").read_text(encoding="utf-8")
+        self.assertLess(text.index(skipped[0]), text.index("Рекомендация"))      # said before the recommendation that builds on it
+
+    def test_an_override_of_one_family_marks_only_that_family(self):
+        metrics = self.report("--g-final", "G3")
+        self.assertEqual(metrics["finals_basis"], {"g": "override", "h": "j3"})
+        skipped = self.skipped_lines()
+        self.assertEqual(len(skipped), 1, skipped)
+        self.assertIn("G3", skipped[0])
+        self.assertNotIn("H3", skipped[0])
+        metrics = self.report("--h-final", "H3x")
+        self.assertEqual(metrics["finals_basis"], {"g": "j3", "h": "override"})
+        skipped = self.skipped_lines()
+        self.assertEqual(len(skipped), 1, skipped)
+        self.assertIn("H3x", skipped[0])
+        self.assertNotIn("G3", skipped[0])
 
 
 if __name__ == "__main__":

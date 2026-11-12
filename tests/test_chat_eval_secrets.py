@@ -171,6 +171,56 @@ class InjectedSecretsDirectoryTests(unittest.TestCase):
             self.assertNotIn("outcome=blocked", result.stderr)
 
 
+INHERITED_NAMES = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_API_KEY", "OPENAI_ORG_ID",
+                   "OPENAI_PROJECT_ID", "OPENAI_ORGANIZATION", "OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_KEY")
+
+
+def provider_variable_names():
+    """Names only, sorted: a failing assertion prints names, never a value."""
+    return sorted(name for name in os.environ if name.upper().startswith(("ANTHROPIC_", "OPENAI_")))
+
+
+class InheritedProviderVariablesTests(unittest.TestCase):
+    """F-2: in a paid run prepare() drops EVERY inherited ANTHROPIC_* and OPENAI_* variable except the key it has just loaded,
+    in the CLI process (the judges run there) and so in the children (child_env builds from this process). Names only."""
+
+    def paid_args(self, tmp, **extra):
+        return InjectedSecretsDirectoryTests.paid_args(self, tmp, **extra)
+
+    def prepare_with_inherited(self, loaded=("anthropic", "openai"), **extra):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}):
+            for name in INHERITED_NAMES:
+                os.environ[name] = "inherited-" + uuid4().hex
+            self.addCleanup(common._SECRETS.clear)
+            folder, _, _ = fake_secrets(tmp)
+            cli.prepare(self.paid_args(tmp, secrets_dir=str(folder), **extra))
+            names = provider_variable_names()
+            children = {provider: sorted(k for k in common.child_env(real=True, provider=provider)
+                                         if k.upper().startswith(("ANTHROPIC_", "OPENAI_")))
+                        for provider in loaded}          # a worker is only started for a provider whose key was loaded
+        return names, children
+
+    def test_an_anthropic_only_command_keeps_the_anthropic_key_and_nothing_else_of_either_provider(self):
+        names, children = self.prepare_with_inherited(("anthropic",), command="judge", judges="claude")
+        self.assertEqual(names, ["ANTHROPIC_API_KEY"])
+        self.assertEqual(children["anthropic"], ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"])
+
+    def test_an_openai_only_command_keeps_the_openai_key_and_nothing_else_of_either_provider(self):
+        names, children = self.prepare_with_inherited(("openai",), command="run", configs="C0", judges=None)
+        self.assertEqual(names, ["OPENAI_API_KEY"])
+        self.assertEqual(children["openai"], ["OPENAI_API_KEY"])
+
+    def test_a_command_with_both_providers_keeps_exactly_the_two_loaded_keys(self):
+        names, _ = self.prepare_with_inherited(command="judge", judges="openai,claude")
+        self.assertEqual(names, ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"])
+
+    def test_the_dropped_names_include_the_ones_the_sdks_read_on_their_own(self):
+        names, _ = self.prepare_with_inherited(command="judge", judges="openai,claude")
+        for dangerous in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "OPENAI_ORG_ID", "OPENAI_PROJECT_ID", "OPENAI_ORGANIZATION",
+                          "OPENAI_BASE_URL", "OPENAI_API_BASE", "ANTHROPIC_BASE_URL"):
+            self.assertFalse(dangerous in names, dangerous)
+
+
 def _flags_environment_dump(node):
     """True for `<assert...>(..., os.environ, ...)`, `print(os.environ)` and `dict(os.environ)` in those calls: a failure would print every variable."""
     def is_environ(value):

@@ -144,10 +144,11 @@ class WorkerRefusalTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("reason=paid_ledger_must_be_the_shared_one", result.stdout)
 
-    def test_a_cap_above_the_owners_credits_is_out_of_range_for_anthropic_and_for_openai_above_nine(self):
+    def test_a_cap_above_the_tool_ceiling_is_out_of_range_for_anthropic_above_9_5_and_for_openai_above_8_5(self):
+        # DECISIONS 17 (F-1): the ceilings are below the provider limits (credits 10, project limit 9), so 10 and 9 are refused too
         with FakeAnthropic() as anthropic_server, FakeOpenAI() as openai_server:
-            a = worker(*self.args("H3", anthropic_server.url, budget_usd="10.01"))
-            b = worker(*self.args("G3", openai_server.url, budget_usd="9.01"))
+            a = worker(*self.args("H3", anthropic_server.url, budget_usd="9.51"))
+            b = worker(*self.args("G3", openai_server.url, budget_usd="8.51"))
             self.assertEqual((anthropic_server.count(), openai_server.count()), (0, 0))
         for result in (a, b):
             self.assertEqual(result.returncode, 2)
@@ -389,6 +390,101 @@ class DryCycleTests(unittest.TestCase):
             self.assertGreater(anthropic_server.count("attribution"), 0)
             self.assertEqual(anthropic_server.count("generation"), 0)                        # the Claude judge is never asked to answer
         self.assertFalse(list(Path(tmp).rglob("run.lock")))
+
+
+class CapCeilingMessageTests(unittest.TestCase):
+    """F-1 (DECISIONS 17): the tool ceilings are OpenAI 8.5 and Anthropic 9.5, below the provider limits (9 project limit, 10 credits).
+    A flag above the ceiling is refused before any key file is read or any call is made, and the message names the provider and the ceiling."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_an_openai_cap_above_8_5_is_refused_with_the_provider_and_the_ceiling_named(self):
+        with FakeOpenAI() as server:
+            for value in ("8.51", "9", "10"):
+                result = run_cli("run", "--configs", "C0", "--runs", "1", "--only", "N01", "--base-repo", str(REPO),
+                                 "--candidate-repo", str(REPO), "--run-dir", str(self.root / "r"), "--base-url", server.url,
+                                 "--budget-usd=" + value)
+                self.assertEqual(result.returncode, 2, value)
+                self.assertIn("reason=budget_out_of_range", result.stdout, value)
+                self.assertIn("provider=openai", result.stdout, value)
+                self.assertIn("limit_usd=8.5", result.stdout, value)
+            self.assertEqual(server.count(), 0)
+
+    def test_an_anthropic_cap_above_9_5_is_refused_before_the_key_file_is_looked_for(self):
+        for value in ("9.51", "10", "10.01"):
+            result = run_cli("run", "--real", "--configs", "H2", "--v2-repo", str(REPO), "--anthropic-budget-usd=" + value,
+                             "--anthropic-key-file", str(self.root / "nope.env"), "--run-dir", str(self.root / "r"))
+            self.assertEqual(result.returncode, 2, value)
+            self.assertIn("reason=budget_out_of_range", result.stdout, value)
+            self.assertIn("provider=anthropic", result.stdout, value)
+            self.assertIn("limit_usd=9.5", result.stdout, value)
+            self.assertNotIn("key_file_missing", result.stdout, value)
+
+    def test_the_ceiling_itself_is_accepted_and_the_run_goes_on_to_the_key_file(self):
+        result = run_cli("run", "--real", "--configs", "H2", "--v2-repo", str(REPO), "--anthropic-budget-usd=9.5",
+                         "--anthropic-key-file", str(self.root / "nope.env"), "--run-dir", str(self.root / "r"))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("reason=key_file_missing", result.stdout)
+        self.assertNotIn("budget_out_of_range", result.stdout)
+
+
+class ClaudeJudgeModelAllowListTests(unittest.TestCase):
+    """F-3: --claude-judge-model takes claude-opus-5-5 or claude-sonnet-5-5 and nothing else: never a candidate (Haiku judging
+    its own answers), never an OpenAI or an unknown name. The refusal comes before any call."""
+    REFUSED = ("claude-haiku-5-5", "gpt-6-luna", "claude-opus-4-1", "claude-sonnet-5-5-latest", "")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run_dir = Path(self.tmp.name) / "run"
+
+    def test_a_model_outside_the_list_is_refused_by_the_command_line_with_both_allowed_names_shown(self):
+        with FakeOpenAI() as openai_server, FakeAnthropic() as anthropic_server:
+            for value in self.REFUSED:
+                result = run_cli("judge", "--stage", "controls", "--judges", "claude", "--run-dir", str(self.run_dir),
+                                 "--base-url", openai_server.url, "--anthropic-base-url", anthropic_server.url, "--seed", "s",
+                                 "--claude-judge-model=" + value)
+                self.assertEqual(result.returncode, 2, repr(value) + result.stdout[-300:])
+                self.assertIn("claude-opus-5-5", result.stderr, repr(value))
+                self.assertIn("claude-sonnet-5-5", result.stderr, repr(value))
+            self.assertEqual((openai_server.count(), anthropic_server.count()), (0, 0))
+
+    def test_every_command_that_takes_the_option_refuses_the_candidate_model(self):
+        import contextlib
+        import io
+        for command in (["report", "--claude", "--run-dir", str(self.run_dir)], ["judge", "--stage", "main", "--run-dir", str(self.run_dir)]):
+            with self.subTest(command=command[0]), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    cli.main([*command, "--claude-judge-model", "claude-haiku-5-5"])
+                self.assertEqual(caught.exception.code, 2)
+
+    def test_the_two_allowed_models_still_work(self):
+        for value in ("claude-opus-5-5", "claude-sonnet-5-5"):
+            with FakeOpenAI() as openai_server, FakeAnthropic() as anthropic_server:
+                result = run_cli("judge", "--stage", "controls", "--judges", "claude", "--run-dir", str(self.run_dir / value),
+                                 "--base-url", openai_server.url, "--anthropic-base-url", anthropic_server.url, "--seed", "s",
+                                 "--claude-judge-model=" + value)
+                self.assertNotEqual(result.returncode, 2, value + result.stdout[-300:] + result.stderr[-300:])
+                self.assertEqual({b["model"] for b in anthropic_server.bodies}, {value})
+
+
+class InheritedAccountHeaderTests(unittest.TestCase):
+    """F-2 end to end (headers only, never values): an inherited OPENAI_ORG_ID or OPENAI_PROJECT_ID is read by the SDK on its own and
+    would send the paid judge's request to another organization or project, past the limit of the owner's project."""
+
+    def test_the_paid_openai_judge_sends_no_organization_or_project_header_even_if_they_are_inherited(self):
+        with tempfile.TemporaryDirectory() as tmp, FakeOpenAI() as server:
+            root = Path(tmp)
+            result = run_cli("judge", "--stage", "controls", "--judges", "openai", "--real", "--real-base-url", server.url,
+                             "--key-file", str(key_file(root, "openai-eval.env", "OPENAI_API_KEY", "sk-test-")),
+                             "--ledger-dir", str(root / "ledger"), "--run-dir", str(root / "run"),
+                             env_extra={"OPENAI_ORG_ID": "org-inherited-" + uuid4().hex, "OPENAI_PROJECT_ID": "proj-inherited-" + uuid4().hex})
+            self.assertGreater(server.count(), 0, result.stdout[-400:])
+            carried = [org is not None or project is not None for org, project in server.account_headers_seen]
+            self.assertFalse(any(carried), "%d of %d requests carried an organization or project header" % (sum(carried), len(carried)))
 
 
 if __name__ == "__main__":

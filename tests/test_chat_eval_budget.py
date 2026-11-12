@@ -242,7 +242,7 @@ class EndToEndBudgetTests(unittest.TestCase):
         done = [a for a in answers if a["outcome"] == "ok"]
         self.assertEqual(made, len(done))                      # the refused call never reached the provider
         self.assertTrue(3 <= made <= 5, made)
-        self.assertLessEqual(Budget(9, self.dir / "spend.jsonl").spent(), 0.009)
+        self.assertLessEqual(Budget(8.5, self.dir / "spend.jsonl").spent(), 0.009)
         self.assertIn("chat_eval.worker outcome=stopped", result.stdout)
 
     def test_a_provider_failure_is_recorded_and_never_repeated(self):

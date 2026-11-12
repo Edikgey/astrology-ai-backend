@@ -29,7 +29,7 @@ class FakeOpenAI(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", 0), Handler)
         self.expected_key, self.mode, self.usage = expected_key, mode, usage
         self.judge_valid, self.judge_winner = judge_valid, judge_winner
-        self.requests, self.auth_seen, self.lock = [], [], threading.Lock()
+        self.requests, self.auth_seen, self.account_headers_seen, self.lock = [], [], [], threading.Lock()
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
 
     @property
@@ -71,6 +71,7 @@ class Handler(BaseHTTPRequestHandler):
         with server.lock:
             server.requests.append(kind)
             server.auth_seen.append(self.headers.get("Authorization") == "Bearer " + server.expected_key)
+            server.account_headers_seen.append((self.headers.get("OpenAI-Organization"), self.headers.get("OpenAI-Project")))
         if server.mode == "unauthorized_echo":
             return self.send_json(401, {"error": {"message": "Incorrect API key provided: " + server.expected_key,
                                                   "type": "invalid_request_error", "code": "invalid_api_key"}})

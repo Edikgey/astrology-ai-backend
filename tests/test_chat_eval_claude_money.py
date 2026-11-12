@@ -126,24 +126,27 @@ class PerProviderCapTests(unittest.TestCase):
                                                     max_output_tokens=4000)
         self.assertAlmostEqual(budget.Budget(5.0, self.ledger, provider="anthropic").spent(), 3.0)
 
-    def test_the_openai_cap_values_are_the_old_ones(self):
-        # DECISIONS 17: the owner OpenAI project limit is 9 USD, the hard cap of the whole eval is 8.5
+    def test_the_openai_cap_is_8_5_and_the_owner_project_limit_of_9_is_not_an_allowed_value(self):
+        # DECISIONS 17 (the requirement changed after the first review, F-1): the tool cap must stay BELOW the provider limit.
+        # The owner OpenAI project limit is 9 USD; the allowed range of --budget-usd is (0, 8.5], the default is 8.5.
         self.assertEqual(common.BUDGET_DEFAULT_USD, 8.5)
-        self.assertEqual(common.OWNER_LIMIT_USD, 9.0)
+        self.assertTrue(common.valid_budget(8.5))
+        self.assertTrue(common.valid_budget(0.01))
         budget.Budget(8.5, self.ledger)
-        budget.Budget(9.0, self.ledger)
-        for bad in (0.0, -1.0, 9.01, 10.0, float("nan"), float("inf")):
+        for bad in (0.0, -1.0, 8.5000001, 8.51, 9.0, 9.01, 10.0, float("nan"), float("inf")):
+            self.assertFalse(common.valid_budget(bad), bad)
             with self.assertRaises(ValueError, msg=str(bad)):
                 budget.Budget(bad, self.ledger)
 
-    def test_the_anthropic_cap_is_9_5_inside_the_10_dollars_of_credits_and_zero_means_unset(self):
+    def test_the_anthropic_cap_is_9_5_below_the_10_dollars_of_credits_and_zero_means_unset(self):
+        # DECISIONS 17 (F-1): the allowed range is [0, 9.5] (0 = the owner named no sum), the credits of 10 are not an allowed value.
         self.assertEqual(common.ANTHROPIC_EVAL_LIMIT_USD, 9.5)
-        self.assertEqual(common.ANTHROPIC_OWNER_LIMIT_USD, 10.0)
         self.assertTrue(common.valid_anthropic_budget(0))
-        self.assertTrue(common.valid_anthropic_budget(10))
-        for bad in (-0.01, 10.01, float("nan"), float("inf"), True, None, "5"):
+        self.assertTrue(common.valid_anthropic_budget(9.5))
+        budget.Budget(9.5, self.ledger, provider="anthropic")
+        for bad in (-0.01, 9.5000001, 9.51, 10, 10.0, 10.01, float("nan"), float("inf"), True, None, "5"):
             self.assertFalse(common.valid_anthropic_budget(bad), bad)
-        for bad in (-0.01, 10.01, float("nan"), float("inf")):
+        for bad in (-0.01, 9.51, 10.0, 10.01, float("nan"), float("inf")):
             with self.assertRaises(ValueError, msg=str(bad)):
                 budget.Budget(bad, self.ledger, provider="anthropic")
 

@@ -62,7 +62,7 @@ class SharedPaidStateTests(unittest.TestCase):
             self.assertEqual(lines(Path(tmp) / "b" / "run" / "answers.jsonl")[0]["outcome"], "budget_stop")
             self.assertTrue((shared / "spend.jsonl").is_file())
             self.assertFalse((Path(tmp) / "a" / "spend.jsonl").exists())
-            self.assertLessEqual(Budget(9, shared / "spend.jsonl").spent(), 0.009)
+            self.assertLessEqual(Budget(8.5, shared / "spend.jsonl").spent(), 0.009)
 
     def test_a_ledger_dir_override_is_only_for_a_loopback_rehearsal(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -76,8 +76,9 @@ class SharedPaidStateTests(unittest.TestCase):
 
 
 class BudgetValueTests(unittest.TestCase):
-    """P2-1: the limit is a finite number, > 0 and <= 9 (the owner OpenAI project limit), checked by the CLI, the worker and the ledger itself."""
-    BAD = ("nan", "inf", "-inf", "-1", "0", "9.01", "10.01", "1e9")
+    """P2-1: the limit is a finite number, > 0 and <= 8.5 (DECISIONS 17: below the owner OpenAI project limit of 9, which is itself NOT
+    allowed), checked by the CLI, the worker and the ledger itself."""
+    BAD = ("nan", "inf", "-inf", "-1", "0", "8.51", "9", "9.01", "10.01", "1e9")
 
     def test_the_cli_refuses_every_bad_limit_before_any_call(self):
         with FakeOpenAI() as server, tempfile.TemporaryDirectory() as tmp:
@@ -105,10 +106,10 @@ class BudgetValueTests(unittest.TestCase):
 
     def test_the_ledger_object_rejects_them(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for value in (float("nan"), float("inf"), -1.0, 0.0, 9.01, 10.01):
+            for value in (float("nan"), float("inf"), -1.0, 0.0, 8.51, 9.0, 9.01, 10.01):
                 with self.assertRaises(ValueError, msg=str(value)):
                     Budget(value, Path(tmp) / "l.jsonl")
-            Budget(9.0, Path(tmp) / "l.jsonl")
+            Budget(8.5, Path(tmp) / "l.jsonl")
 
 
 class ProviderAddressTests(unittest.TestCase):
