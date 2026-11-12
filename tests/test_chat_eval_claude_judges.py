@@ -276,7 +276,8 @@ class PromptEffectTests(unittest.TestCase):
         for q, outcome in plan(right=v3_wins, left=v2_wins, tie=tie).items():
             rows += both_orders("openai", q, self.V2, self.V3, outcome, depth=depth, balance=balance, facts=facts)
         for q in ("N13", "N14", "R05"):
-            rows += both_orders("openai", q, self.V2, self.V3, "tie", boundary=("yes", "no" if bad_boundary else "yes"))
+            rows += both_orders("openai", q, self.V2, self.V3, "tie", depth=depth, balance=balance, facts=facts,
+                                boundary=("yes", "no" if bad_boundary else "yes"))
         return rows
 
     def test_v3_stays_when_every_condition_holds(self):

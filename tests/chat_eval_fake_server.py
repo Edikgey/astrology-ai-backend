@@ -193,7 +193,7 @@ class AnthropicHandler(BaseHTTPRequestHandler):
                                         "anthropic-version": self.headers.get("anthropic-version")})
         mode = server.mode
         if mode == "unauthorized_echo":
-            return self.error(401, "authentication_error", "invalid x-api-key: " + (self.headers.get("x-api-key") or ""))
+            return self.error(401, "authentication_error", "invalid x-api-key: " + (self.headers.get("x-api-key") or (self.headers.get("Authorization") or "").replace("Bearer ", "")))
         if mode == "overloaded":
             return self.error(529, "overloaded_error", "Overloaded")
         if mode == "rate_limit":

@@ -120,7 +120,7 @@ class ProviderAddressTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"OPENAI_BASE_URL": "https://proxy.example.invalid/v1"}):
             self.addCleanup(common._SECRETS.clear)
             cli.prepare(self.paid_args(tmp))
-            self.assertNotIn("OPENAI_BASE_URL", os.environ)
+            self.assertFalse("OPENAI_BASE_URL" in os.environ)   # not assertNotIn(os.environ): a failure would print the environment
 
     def test_the_paid_judge_client_points_at_the_official_address_whatever_the_environment_says(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"OPENAI_BASE_URL": "https://proxy.example.invalid/v1",

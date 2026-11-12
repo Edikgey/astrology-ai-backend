@@ -142,6 +142,55 @@ _JS = """
 """
 
 
+# The page of the CHAT-CLAUDE comparison: the same pick per card, plus two optional picks (which answer is deeper, which is more honest).
+# Radio names: v-<id> (the pick), d-<id> (deeper), h-<id> (more honest). The text it copies:
+#   N01:1 N03:2 N05:= N08:? ...        one token per card: 1, 2, = (the same) or ? (no pick)
+#   глубже: N01:2 N05:1                only the cards where a pick was made; the line is left out when there are none
+#   честнее: N03:= N17:1               the same for "more honest"
+#   N03: free comment                  one line per card with a comment
+_JS_EXT = r"""
+(function(){
+  var cards=[].slice.call(document.querySelectorAll('.card'));
+  function picked(card,prefix){
+    var id=card.getAttribute('data-id');
+    return card.querySelector('input[name="'+prefix+'-'+id+'"]:checked');
+  }
+  function summary(){
+    var votes=[],deeper=[],honest=[],notes=[];
+    cards.forEach(function(card){
+      var id=card.getAttribute('data-id');
+      var v=picked(card,'v'),d=picked(card,'d'),h=picked(card,'h');
+      votes.push(id+':'+(v?v.value:'?'));
+      if(d){deeper.push(id+':'+d.value);}
+      if(h){honest.push(id+':'+h.value);}
+      var note=card.querySelector('textarea').value.trim();
+      if(note){notes.push(id+': '+note);}
+    });
+    return votes.join(' ')+(deeper.length?'\nглубже: '+deeper.join(' '):'')+
+      (honest.length?'\nчестнее: '+honest.join(' '):'')+(notes.length?'\n'+notes.join('\n'):'');
+  }
+  var out=document.getElementById('out');
+  document.getElementById('copy').addEventListener('click',function(){
+    var text=summary();
+    out.value=text;out.hidden=false;out.focus();out.select();
+    var done=function(){document.getElementById('state').textContent='Скопировано. Вставьте строку в чат.';};
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done,function(){
+      try{document.execCommand('copy');done();}catch(e){document.getElementById('state').textContent='Выделите текст ниже и скопируйте вручную.';}});}
+    else{try{document.execCommand('copy');done();}catch(e){document.getElementById('state').textContent='Выделите текст ниже и скопируйте вручную.';}}
+  });
+})();
+"""
+
+
+def _vote_group(prefix, label, card_id):
+    return ('<div class="vote" role="radiogroup" aria-label="%s">'
+            '<span class="small">%s</span>'
+            '<label><input type="radio" name="%s-%s" value="1"> Ответ 1</label>'
+            '<label><input type="radio" name="%s-%s" value="2"> Ответ 2</label>'
+            '<label><input type="radio" name="%s-%s" value="="> Одинаково</label></div>') % (
+        label, label, prefix, card_id, prefix, card_id, prefix, card_id)
+
+
 def _history_html(history):
     if not history:
         return ""
@@ -151,8 +200,10 @@ def _history_html(history):
     return "<details><summary>Предыдущие реплики этой беседы</summary>%s</details>" % rows
 
 
-def build_page(cards, title):
-    """cards: [{'id','chart_label','question','answers':[{'response','history'}, {...}]}] already in display order."""
+def build_page(cards, title, extended=False):
+    """cards: [{'id','chart_label','question','answers':[{'response','history'}, {...}]}] already in display order.
+
+    extended=True is the CHAT-CLAUDE page: two more optional picks per card (deeper, more honest) and the longer copied summary."""
     body = []
     for number, card in enumerate(cards, 1):
         columns = "".join(
@@ -165,10 +216,12 @@ def build_page(cards, title):
             '<label><input type="radio" name="v-%s" value="1"> Ответ 1 лучше</label>'
             '<label><input type="radio" name="v-%s" value="2"> Ответ 2 лучше</label>'
             '<label><input type="radio" name="v-%s" value="="> Одинаково</label></div>'
-            '<textarea placeholder="Комментарий (необязательно)" aria-label="Комментарий"></textarea></article>' % (
+            '%s<textarea placeholder="Комментарий (необязательно)" aria-label="Комментарий"></textarea></article>' % (
                 html.escape(card["id"]), number, html.escape(card["id"]), html.escape(card["chart_label"]),
                 html.escape(card["question"]), columns, html.escape(card["id"]), html.escape(card["id"]),
-                html.escape(card["id"])))
+                html.escape(card["id"]),
+                (_vote_group("d", "Глубже, не шаблон (необязательно):", html.escape(card["id"])) +
+                 _vote_group("h", "Честнее и бережнее (необязательно):", html.escape(card["id"]))) if extended else ""))
     return ("<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>%s</title><style>%s</style></head>"
             "<body><main><h1>%s</h1><p class=\"hint\">Карты синтетические, это не реальные люди. В каждой паре два ответа "
@@ -176,4 +229,4 @@ def build_page(cards, title):
             "понятнее, точнее по карте, меньше воды. В конце нажмите «Скопировать итог» и пришлите строку в чат.</p>%s"
             "<div class=\"bar\"><button id=\"copy\" type=\"button\">Скопировать итог</button> <span id=\"state\" class=\"small\"></span>"
             "<textarea id=\"out\" hidden readonly aria-label=\"Итог\"></textarea></div></main><script>%s</script></body></html>"
-            % (html.escape(title), _CSS, html.escape(title), "".join(body), _JS))
+            % (html.escape(title), _CSS, html.escape(title), "".join(body), _JS_EXT if extended else _JS))

@@ -284,7 +284,7 @@ class KeyAndAddressTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "https://proxy.example.invalid",
                                                                            "ANTHROPIC_API_KEY": "sk-ant-test-not-used-anywhere"}):
             counted = cli.make_metered_claude(self.paid_args(tmp), Path(tmp) / "run", Path(tmp) / "spend.jsonl", "judge")
-            self.assertEqual(str(counted.inner.base_url), "https://api.anthropic.com/")
+            self.assertEqual(str(counted.inner.base_url).rstrip("/"), "https://api.anthropic.com")
             self.assertEqual(counted.inner.max_retries, 0)
 
     def test_prepare_drops_an_inherited_base_url_and_loads_only_the_anthropic_key_for_an_anthropic_command(self):
@@ -294,7 +294,7 @@ class KeyAndAddressTests(unittest.TestCase):
             self.addCleanup(common._SECRETS.clear)
             args = self.paid_args(tmp)
             cli.prepare(args)
-            self.assertNotIn("ANTHROPIC_BASE_URL", os.environ)
+            self.assertFalse("ANTHROPIC_BASE_URL" in os.environ)   # never assertNotIn(os.environ): a failure would print the environment
             self.assertTrue(os.environ["ANTHROPIC_API_KEY"].startswith("sk-ant-test-"))
 
     def test_the_dry_mode_replaces_a_real_key_with_the_stub_and_refuses_an_outside_address(self):
@@ -317,7 +317,7 @@ class KeyAndAddressTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as caught:
                 cli.prepare(args)
             self.assertEqual(caught.exception.code, 2)
-            self.assertNotIn("ANTHROPIC_API_KEY", os.environ)
+            self.assertFalse("ANTHROPIC_API_KEY" in os.environ)
 
 
 def make_counted(tmp, server, *, limit=5.0, config="H3", timeout=20, ledger=None):
@@ -475,8 +475,9 @@ class MeteredAnthropicTests(unittest.TestCase):
     def test_a_timeout_is_ambiguous_so_charged_at_the_worst_case(self):
         with FakeAnthropic(delay=1.5) as server:
             counted, b = make_counted(self.tmp.name, server, timeout=0.4)
-            with self.assertRaises(anthropic.APITimeoutError):
+            with self.assertRaises(Exception) as caught:         # anthropic 2.8.0 lets httpx2.ReadTimeout out of a stream untouched
                 self.stream(counted)
+            self.assertIn(type(caught.exception).__name__, ("APITimeoutError", "ReadTimeout"))
             self.assertEqual(server.count(), 1)
         self.assertGreater(b.spent(), 0)
         self.assertEqual((self.records()[0]["reason"], self.records()[0]["basis"]), ("timeout", "worst_case"))
@@ -496,7 +497,7 @@ class MeteredAnthropicTests(unittest.TestCase):
             self.stream(counted)
             body, headers = server.bodies[0], server.headers_seen[0]
         self.assertEqual(sorted(body), ["max_tokens", "messages", "model", "output_config", "stream", "system", "thinking"])
-        self.assertEqual(headers["x-api-key"], "sk-ant-test-" + "k" * 20)
+        self.assertIn("sk-ant-test-" + "k" * 20, (headers["x-api-key"], (headers["authorization"] or "").replace("Bearer ", "")))   # SDK 2.x: Bearer
         self.assertTrue(headers["anthropic-version"])
 
     def test_the_judge_and_attribution_calls_go_through_the_same_counter(self):

@@ -193,7 +193,8 @@ class ClaudePageTests(unittest.TestCase):
         for name in ("G3", "H3", "G2", "H2", "G3x", "H3x"):
             self.assertNotIn(name, visible, name)
         lowered = html.lower()
-        for secret in ("gpt", "claude", "haiku", "luna", "opus", "sonnet", "anthropic", "openai", "sha", "candidate", "compare-claude",
+        self.assertIsNone(re.search(r"(?<![a-z])luna(?![a-z])", lowered))   # the model gpt-6-luna; the product name Lunaria is fine
+        for secret in ("gpt", "claude", "haiku", "opus", "sonnet", "anthropic", "openai", "sha", "candidate", "compare-claude",
                        "http://", "https://", "src=", "href=", "<link", "@import", "url("):
             self.assertNotIn(secret, lowered, secret)
         self.assertEqual(html.count("<script>"), 1)

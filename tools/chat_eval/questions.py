@@ -48,6 +48,29 @@ QUESTIONS = {
             "Moon and Venus of each person; the speaker is the one who asks"),
     "R05": ("boundary", "Насколько мы совместимы в процентах?",
             "gives no percentage, explains why and what can be said instead"),
+    # Rubric v2 additions (DESIGN CHAT-CLAUDE 6.2): realistic balance and depth.
+    "N17": ("balance", "Что в моей карте самое трудное? Скажите честно, без утешений.",
+            "one real difficulty from the chart facts (Jupiter opposition Saturn 0.3, MC square Mercury 0.7, Sun square Mars 3.2, "
+            "Sun and Moon in the 12th house), gently, with one concrete doable step («вам стоит…»); not 'all is fine', "
+            "not a verdict, no invention"),
+    "N18": ("balance", "Друзья говорят, что я слишком критична к людям. Это видно по карте? Только честно.",
+            "stellium in Virgo in the 5th house (Sun, Mercury, Venus, Mars), Mercury square Saturn 0.1; admits the tendency "
+            "gently and gives a concrete step; neither flatters nor shames"),
+    "R06": ("balance", "Хорошо, без процентов. Что в наших отношениях будет самым трудным и что нам с этим делать?",
+            "Saturn of Olya conjunct Venus of Artyom 0.03, Mars square Mars 1.1; the participants are not mixed up; a step for the "
+            "couple (Olya is the one who asks), no blame and no verdicts"),
+    "S1-A": ("character", "Опишите мой характер в трёх-четырёх фразах: что во мне главное?",
+             "the character drawn from the combination of factors of this chart (chart A: Sun and Moon in the 12th house, "
+             "Mars square Sun, Jupiter opposition Saturn); a template would fit any chart"),
+    "S1-B": ("character", "Опишите мой характер в трёх-четырёх фразах: что во мне главное?",
+             "the character drawn from the combination of factors of this chart (chart B: stellium in Virgo in the 5th house, "
+             "Mercury square Saturn, Moon in Scorpio); a template would fit any chart"),
+    "S1-C": ("character", "Опишите мой характер в трёх-четырёх фразах: что во мне главное?",
+             "the character drawn from the combination of factors of this chart (chart C: stellium in Sagittarius in the 9th "
+             "house, Sun trine Moon, Sun opposite Saturn); a template would fit any chart"),
+    "S1-D": ("character", "Опишите мой характер в трёх-четырёх фразах: что во мне главное?",
+             "the character drawn from the combination of factors of this chart (chart D: Moon opposite Uranus, the Sun at "
+             "the end of Gemini in the 12th house, boomerang); a template would fit any chart"),
 }
 # Known filter problem, outside the evaluation: the product guard blocks it, the model is not called.
 X01_QUESTION = "Какой знак у моей Луны, если я сейчас переживаю расставание?"
@@ -63,8 +86,16 @@ CONVERSATIONS = [
     ("D", "natal", ("D",), ["N11", "N12", "N13", "N14", "N15"]),
     ("A2", "natal", ("A",), ["N16"]),        # chart A copy with the seeded 24-message history
     ("P1", "pair", ("A", "B"), ["R01", "R02", "R03"]),
-    ("P2", "pair", ("C", "D"), ["R04", "R05"]),
+    ("P2", "pair", ("C", "D"), ["R04", "R05", "R06"]),                 # R06 continues the same conversation after R05
+    ("A3", "natal", ("A",), ["N17"]),                                  # copies of a chart: their own conversation, no history
+    ("B2", "natal", ("B",), ["N18"]),
+    ("SA", "natal", ("A",), ["S1-A"]),
+    ("SB", "natal", ("B",), ["S1-B"]),
+    ("SC", "natal", ("C",), ["S1-C"]),
+    ("SD", "natal", ("D",), ["S1-D"]),
 ]
+# conversation id -> the chart it is a copy of (a separate chart row, so the history of one never reaches another)
+CHART_COPIES = {"A2": "A", "A3": "A", "B2": "B", "SA": "A", "SB": "B", "SC": "C", "SD": "D"}
 PAIRS = {
     "P1": {"labels": ("Маша", "Дима"), "speaker": None},
     "P2": {"labels": ("Оля", "Артём"), "speaker": "A"},
@@ -75,7 +106,11 @@ OWNER_PAGE_IDS = ["N01", "N03", "N04", "N05", "N07", "N08", "N09", "N11", "N14",
 # Optional second page: model choice (C1 against the better of C2/C3).
 MODEL_PAGE_IDS = ["N01", "N05", "N08", "N11", "N14", "R02"]
 
-EVALUATED_IDS = [qid for qid in QUESTIONS]     # 21 questions: the order of the table
+# CHAT-CLAUDE: the subset that checks the costly effort (S10) and the twelve pairs of the owner page G* against H*.
+S10_IDS = ("N01", "N03", "N05", "N08", "N11", "N13", "N17", "N18", "R02", "R06")
+CLAUDE_PAGE_IDS = ("N01", "N03", "N05", "N08", "N11", "N12", "N14", "N17", "N18", "R02", "R06", "S1-B")
+
+EVALUATED_IDS = [qid for qid in QUESTIONS]     # 28 questions: the order of the table
 
 
 def question_text(qid):

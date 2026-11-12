@@ -1,14 +1,16 @@
 """Metrics, thresholds, the report (report.md, metrics.json) and the owner's blind pages from a run directory."""
 import json
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
 from .budget import cost_usd, price_for
 from .common import CONFIGS, JUDGE_MODEL
 from .facts import ChartFacts, check_answer, is_russian
-from .judge import CRITERIA, collect_pairs, pair_verdict
+from .judge import CRITERIA, CRITERIA_V1, collect_pairs, pair_verdict
 from .page import assign_sides, build_page, chart_label
 from .textmetrics import filler, markup_flags, median_or_none, same_start_share, shape
+from . import attribution, jury
 from . import questions as Q
 
 GENERATION_OUTPUT_TYPICAL, SUMMARY_OUTPUT_TYPICAL, JUDGE_OUTPUT_TYPICAL = 700, 450, 1500
@@ -106,7 +108,7 @@ def judge_metrics(answers, judgments, left, right):
     left_wins, right_wins = verdicts.get(left, 0), verdicts.get(right, 0)
     resolved = left_wins + right_wins
     ok = [j for js in by_pair.values() for j in js if j["outcome"] == "ok"]
-    means = {cfg: {c: round_or_none(mean([j["scores"][cfg][c] for j in ok])) for c in CRITERIA} for cfg in (left, right)}
+    means = {cfg: {c: round_or_none(mean([j["scores"][cfg].get(c) for j in ok])) for c in CRITERIA} for cfg in (left, right)}
     boundary = {cfg: {"yes": 0, "no": 0} for cfg in (left, right)}
     for j in ok:
         if j["q"] in Q.BOUNDARY_IDS:
@@ -140,7 +142,7 @@ def thresholds(code, judge):
             wins = verdict(share >= 0.65)
         rows.append(("Судья: C1 выигрывает >= 65% решённых пар при >= 25 решённых", "%s решённых из %s пар, доля %s" % (
             resolved, judge["pairs_expected"], share), wins))
-        diffs = judge["criteria_diff"]
+        diffs = {c: judge["criteria_diff"][c] for c in CRITERIA_V1}        # the earlier measurement judged six criteria
         known = [d for d in diffs.values() if d is not None]
         rows.append(("Судья: >= 3 из 6 критериев выше на >= 0.5, ни один не ниже более чем на 0.2",
                      json.dumps(diffs, ensure_ascii=False), "no_data" if len(known) < 6 else verdict(
@@ -326,3 +328,255 @@ def build_report(run_dir, seed, ledger_path, limit_usd, charts, pairs_spec):
     Path(run_dir, "report.md").write_text(render_markdown(run, {"mode": mode, "tool_sha": tool}, code, judges, thresh, spent,
                                                           limit_usd, projection, kinds, pages), encoding="utf-8")
     return metrics
+
+
+# ------------------------------------------------------------------------------------------------ CHAT-CLAUDE
+CLAUDE_PAGE = "compare-claude.html"
+_OWNER_TOKEN = re.compile(r"([A-Za-z0-9][A-Za-z0-9\-]*):(\S*)")
+_OWNER_COMMENT = re.compile(r"^([A-Za-z0-9][A-Za-z0-9\-]*):\s*(.+)$")
+
+
+def build_claude_pages(run_dir, answers, facts, seed, g, h):
+    """compare-claude.html: the questions of Q.CLAUDE_PAGE_IDS that both configurations answered (first run), sides shuffled by the
+    seed, nothing on the page names a model, a configuration or a commit. The mapping goes to key.json, kept apart."""
+    index = {(a["config"], a["q"]): a for a in answers if a["outcome"] == "ok" and a["run"] == 1}
+    ids = [q for q in Q.CLAUDE_PAGE_IDS if (g, q) in index and (h, q) in index]
+    if not ids:
+        return []
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    sides = assign_sides(ids, g, h, seed)
+    cards = []
+    for q in ids:
+        record = index[(g, q)]
+        entry = facts["pairs"][record["conv"]] if record["subject"] == "pair" else facts["natal"][record["chart"]]
+        cards.append({"id": q, "question": record["question"], "chart_label": chart_label(record["subject"], entry, record["chart"]),
+                      "answers": [{"response": index[(sides[q][s], q)]["response"],
+                                   "history": [{"question": x["q"], "answer": x["a"]} for x in index[(sides[q][s], q)]["history"]]}
+                                  for s in ("1", "2")]})
+    (run_dir / CLAUDE_PAGE).write_text(build_page(cards, "Сравнение ответов Lunaria вслепую", extended=True), encoding="utf-8")
+    key_path = run_dir / "key.json"
+    key = json.loads(key_path.read_text(encoding="utf-8")) if key_path.is_file() else {}
+    key["seed"] = seed
+    key.setdefault("pages", {})[CLAUDE_PAGE] = sides
+    key["claude_pair"] = {"g": g, "h": h}
+    key_path.write_text(json.dumps(key, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    return [CLAUDE_PAGE]
+
+
+def parse_owner_summary(text, key, page=CLAUDE_PAGE):
+    """The line the owner pastes (see page._JS_EXT) -> picks as configurations. Tolerant: a bad token is 'no pick', an unknown card
+    is listed in `unknown`, nothing in the line is trusted beyond the card ids and the three characters 1, 2, =."""
+    sides = key["pages"][page]
+    pair = key.get("claude_pair")
+    configs = sorted({cfg for card in sides.values() for cfg in card.values()}) if not pair else [pair["g"], pair["h"]]
+    unknown = set()
+
+    def pick(q, value):
+        if value in ("1", "2"):
+            return sides[q][value]
+        return "tie" if value == "=" else None
+
+    def read(chunk, into, keep_empty=False):
+        for q, value in _OWNER_TOKEN.findall(chunk):
+            if q not in sides:
+                unknown.add(q)
+                continue
+            chosen = pick(q, value)
+            if chosen is not None or keep_empty:
+                into[q] = chosen
+
+    votes, deeper, honest, comments = {q: None for q in sides}, {}, {}, {}
+    voted = False
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if lowered.startswith("глубже:"):
+            read(line.split(":", 1)[1], deeper)
+        elif lowered.startswith("честнее:"):
+            read(line.split(":", 1)[1], honest)
+        elif not voted:
+            voted = True
+            read(line, votes, keep_empty=True)
+        else:
+            match = _OWNER_COMMENT.match(line)
+            if match:
+                if match.group(1) in sides:
+                    comments[match.group(1)] = match.group(2).strip()
+                else:
+                    unknown.add(match.group(1))
+    tally = {cfg: 0 for cfg in configs}
+    tally.update(tie=0, none=0)
+    for value in votes.values():
+        tally["none" if value is None else value] = tally.get("none" if value is None else value, 0) + 1
+    return {"votes": votes, "deeper": deeper, "honest": honest, "comments": comments, "unknown": sorted(unknown), "tally": tally}
+
+
+def _s1_overlap(answers, config):
+    texts = [a["response"] for a in answers if a["config"] == config and a["outcome"] == "ok" and a["run"] == 1 and str(a["q"]).startswith("S1-")]
+    if len(texts) < 2:
+        return None
+    words = [set(re.findall(r"\w{4,}", attribution.mask_text(t).lower())) for t in texts]
+    scores = []
+    for i in range(len(words)):
+        for j in range(i + 1, len(words)):
+            union = words[i] | words[j]
+            scores.append(len(words[i] & words[j]) / len(union) if union else 0.0)
+    return round(sum(scores) / len(scores), 4)
+
+
+def _boundary_counts(judgments, config):
+    counts = {name: {"yes": 0, "no": 0} for name in jury.JURY_JUDGES}
+    for row in judgments:
+        if row["outcome"] == "ok" and row["q"] in Q.BOUNDARY_IDS and config in row.get("boundary_kept", {}):
+            value = row["boundary_kept"][config]
+            if value in ("yes", "no"):
+                counts[jury.judge_of(row)][value] += 1
+    return counts
+
+
+def _gates_for(run, code, config):
+    mine = [a for a in run["answers"] if a["config"] == config]
+    base = [a for a in run["answers"] if a["config"] == "C0"]
+    rate = code.get(config, {}).get("facts", {}).get("contradiction_rate")
+    base_rate = code.get("C0", {}).get("facts", {}).get("contradiction_rate")
+    return jury.admission(mine, base, contradiction_rate=rate, baseline_rate=base_rate, boundary=_boundary_counts(run["judgments"], config))
+
+
+def choose_finals(run, code, g_override=None, h_override=None):
+    """The configurations that go to the page and to J1: the costly effort only if J3 chose it (it must pass G1, G2, G9 itself)."""
+    def pick(cheap, costly, override):
+        if override:
+            return override
+        gates = _gates_for(run, code, costly)
+        ok = bool(gates["G1"] and gates["G2"] and gates["G9"])
+        return jury.effort_choice(run["judgments"], cheap, costly, ok, "claude")["choice"]
+    return pick("G3", "G3x", g_override), pick("H3", "H3x", h_override)
+
+
+def _ok_costs(answers, config):
+    return [a.get("cost_usd") for a in answers if a["config"] == config and a["q"] != "X01" and a["outcome"] == "ok"]
+
+
+def build_claude_report(run_dir, seed, ledger_path, limits, charts, g_final=None, h_final=None, owner_line=None):
+    """report-claude.md, metrics-claude.json and the owner page of the CHAT-CLAUDE measurement (DESIGN 5.5, 6.4)."""
+    from . import budget as budget_mod
+    run_dir = Path(run_dir)
+    run = load_run(run_dir)
+    answers, judgments = run["answers"], run["judgments"]
+    code = code_metrics(answers, charts)
+    g, h = choose_finals(run, code, g_override=g_final, h_override=h_final)
+    gates = {cfg: _gates_for(run, code, cfg) for cfg in code if cfg != "C0"}
+    controls_path = run_dir / "controls.json"
+    controls = json.loads(controls_path.read_text(encoding="utf-8")) if controls_path.is_file() else {}
+    j0 = {judge: bool(result.get("passed")) for judge, result in controls.items()}
+    j1 = jury.model_choice(judgments, g, h)
+    j2 = {"G": jury.prompt_effect_robust(judgments, "G2", "G3", gates.get("G3", {}).get("all", False)),
+          "H": jury.prompt_effect_robust(judgments, "H2", "H3", gates.get("H3", {}).get("all", False))}
+
+    def effort_gates(cfg):
+        item = gates.get(cfg)
+        return bool(item and item["G1"] and item["G2"] and item["G9"])
+    j3 = {"G": jury.effort_choice(judgments, "G3", "G3x", effort_gates("G3x"), "claude"),
+          "H": jury.effort_choice(judgments, "H3", "H3x", effort_gates("H3x"), "claude")}
+    attribution_rows = read_jsonl(run_dir / "attribution.jsonl")
+    j4 = {"reference_only": True, "by_config": {}}
+    for cfg in sorted({r["config"] for r in attribution_rows}):
+        mine = [r for r in attribution_rows if r["config"] == cfg]
+        j4["by_config"][cfg] = {**attribution.attribution_summary(mine), "judge": mine[0].get("judge")}
+    ok_by = {cfg: [a for a in answers if a["config"] == cfg and a["q"] != "X01" and a["outcome"] == "ok"] for cfg in code}
+    vam = {cfg: round(sum("вам стоит" in (a["response"] or "").lower() for a in rows) / len(rows), 4) if rows else None
+           for cfg, rows in ok_by.items()}
+    ttfb = {cfg: {"median": median_or_none([a.get("ttfb_ms") for a in rows]), "p90": jury.percentile([a.get("ttfb_ms") for a in rows], 0.9)}
+            for cfg, rows in ok_by.items()}
+    pages = build_claude_pages(run_dir, answers, run["facts"], seed, g, h) if run["facts"] else []
+    owner, agreement = None, None
+    if owner_line and pages:
+        key = json.loads((run_dir / "key.json").read_text(encoding="utf-8"))
+        parsed = parse_owner_summary(owner_line, key)
+        jury_map = jury.jury_pairs(judgments, g, h)
+        compared = agree = 0
+        for q, vote in parsed["votes"].items():
+            if vote in (g, h) and jury_map.get(q) in (g, h):
+                compared += 1
+                agree += vote == jury_map[q]
+        agreement = {"agree": agree, "compared": compared}
+        owner = {**parsed, "agreement_with_jury": agreement}
+    recommendation = jury.recommend(
+        g, h, admitted={g: bool(gates.get(g, {}).get("all")), h: bool(gates.get(h, {}).get("all"))}, j1_decision=j1["decision"],
+        owner=owner["tally"] if owner else None,
+        cost={cfg: median_or_none(_ok_costs(answers, cfg)) for cfg in (g, h)}, ttfb={cfg: ttfb.get(cfg, {}).get("median") for cfg in (g, h)})
+    metas = run["metas"]
+    shas = {cfg: meta["sha"] for cfg, meta in metas.items()}
+    shas["tool"] = next(iter(metas.values()))["tool_sha"] if metas else "unknown"
+    mode = next(iter(metas.values()))["mode"] if metas else "dry"
+    spent = {k: round(v, 6) for k, v in budget_mod.spent_by_provider(ledger_path).items()}
+    metrics = {"mode": mode, "final": {"g": g, "h": h}, "gates": gates, "j0": j0, "j1": j1, "j2": j2, "j3": j3, "j4": j4,
+               "cost_per_1000_answers": {cfg: round_or_none((entry["cost_per_answer_usd"] or 0) * 1000, 6) for cfg, entry in code.items()},
+               "ttfb_ms": ttfb, "s1_word_overlap": {cfg: _s1_overlap(answers, cfg) for cfg in code}, "vam_stoit_share": vam,
+               "vam_stoit_new_template": {cfg: bool(value is not None and value > 0.7) for cfg, value in vam.items()},
+               "owner": owner, "recommendation": recommendation, "spend_by_provider": spent, "limits": limits, "shas": shas,
+               "pages": pages, "code": {cfg: {k: v for k, v in entry.items() if k != "facts"} for cfg, entry in code.items()}}
+    (run_dir / "metrics-claude.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    (run_dir / "report-claude.md").write_text(render_claude_markdown(metrics, metas), encoding="utf-8")
+    return metrics
+
+
+def render_claude_markdown(m, metas):
+    yes = lambda flag: "да" if flag else "нет"          # noqa: E731
+    lines = ["# Отчёт замера CHAT-CLAUDE", "",
+             "Режим: **%s**. Только синтетические карты и вопросы; в журналах метки и числа, без текстов." % (
+                 "настоящий замер" if m["mode"] == "real" else "сухой прогон на подменах (деньги не тратятся)"), "",
+             "Финалисты: %s (GPT) и %s (Haiku)." % (m["final"]["g"], m["final"]["h"]), "",
+             "## Условия допуска (DESIGN 6.4, G1-G9)", "", "| Конфигурация | " + " | ".join("G%d" % i for i in range(1, 10)) + " | Допущена |",
+             "|---|" + "---|" * 10]
+    for cfg, gate in m["gates"].items():
+        lines.append("| %s | %s | %s |" % (cfg, " | ".join(yes(gate["G%d" % i]) for i in range(1, 10)), yes(gate["all"])))
+    lines += ["", "## Судьи", "", "### J0 калибровка", "",
+              "Прошли: %s." % (", ".join("%s: %s" % (j, yes(v)) for j, v in m["j0"].items()) or "не запускалась"), "",
+              "### J1 выбор модели (%s против %s, жюри из двух)" % (m["final"]["g"], m["final"]["h"]), "",
+              "- Решённых жюри: %s, победы: %s, итог: **%s**." % (m["j1"]["resolved"], json.dumps(m["j1"]["wins"]), m["j1"]["decision"]),
+              "- Глубже: %s. Честнее: %s." % (m["j1"]["deeper"] or "нет разницы", m["j1"]["more_honest"] or "нет разницы"),
+              "- Доли своего семейства: %s%s." % (json.dumps(m["j1"]["judge_shares"]),
+                                                 "; **судьи разошлись по семействам: итог судей «неясно», решает страница владельца**"
+                                                 if m["j1"]["family_split"] else ""), "",
+              "### J2 эффект промпта (v3 против v2, судья OpenAI)", ""]
+    for family, item in m["j2"].items():
+        lines.append("- %s: v3 остаётся: **%s**; причины против: %s; решённых %s, доля v3 %s%s." % (
+            family, yes(item["keep_v3"]), ", ".join(item["reasons"]) or "нет", item["resolved"], item["v3_share"],
+            "" if item["stable"] else "; **неустойчиво без беседы A и S1-A, решает координатор**"))
+    lines += ["", "### J3 усилие (S10, судья Claude)", ""]
+    for family, item in m["j3"].items():
+        lines.append("- %s: выбор %s, решённых %s, доля дорогого %s%s." % (family, item["choice"], item["resolved"], item["share"],
+                                                                         " (%s)" % item["reason"] if item["reason"] else ""))
+    lines += ["", "### J4 атрибуция (справочно, не условие)", "", "| Конфигурация | Судья | Верно | Неверно | Не определить | Доля |", "|---|---|---|---|---|---|"]
+    for cfg, item in m["j4"]["by_config"].items():
+        lines.append("| %s | %s | %s | %s | %s | %s |" % (cfg, item["judge"], item["correct"], item["wrong"], item["cannot_tell"], item["share"]))
+    lines += ["", "## Метрики кодом", "", "| Конфигурация | Цена на 1000 ответов, $ | До первого слова, мс (медиана / p90) | Пересечение слов S1 | «Вам стоит…», доля |",
+              "|---|---|---|---|---|"]
+    for cfg in m["cost_per_1000_answers"]:
+        flag = " **новый шаблон (> 70%)**" if m["vam_stoit_new_template"].get(cfg) else ""
+        lines.append("| %s | %s | %s / %s | %s | %s%s |" % (cfg, m["cost_per_1000_answers"][cfg], m["ttfb_ms"][cfg]["median"], m["ttfb_ms"][cfg]["p90"],
+                                                           m["s1_word_overlap"][cfg], m["vam_stoit_share"][cfg], flag))
+    lines += ["", "## Владелец (страница)", ""]
+    if m["owner"]:
+        agreement = m["owner"]["agreement_with_jury"]
+        lines.append("- Выбор: %s. Согласие жюри с владельцем: %s из %s пар." % (json.dumps(m["owner"]["tally"]), agreement["agree"], agreement["compared"]))
+        if agreement["compared"] and agreement["agree"] / agreement["compared"] < 0.5:
+            lines.append("- **Ниже 50%: судьи не отражают вкус владельца.**")
+    else:
+        lines.append("Ответа владельца ещё нет. Страница: %s." % (", ".join(m["pages"]) or "не построена"))
+    rec = m["recommendation"]
+    lines += ["", "## Рекомендация команды (решает владелец)", "",
+              "**%s**, основание: %s%s." % (rec["choice"] or "нет допущенного кандидата", rec["basis"],
+                                            "; владелец на странице предпочёл другую модель в >= 8 из 12" if rec["owner_disagrees"] else ""), "",
+              "## Расход по провайдерам", "",
+              "- OpenAI: $%.4f из $%.2f; Anthropic: $%.4f из $%.2f." % (m["spend_by_provider"]["openai"], m["limits"]["openai"],
+                                                                         m["spend_by_provider"]["anthropic"], m["limits"]["anthropic"]), "",
+              "## SHA", "", "| Что | SHA |", "|---|---|"]
+    for name, sha in m["shas"].items():
+        dirty = " (не закоммичено)" if metas.get(name, {}).get("dirty") else ""
+        lines.append("| %s | %s%s |" % (name, str(sha)[:12], dirty))
+    return "\n".join(lines) + "\n"

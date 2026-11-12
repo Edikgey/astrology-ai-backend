@@ -4,7 +4,11 @@ The product code comes from --repo (a checkout: the base commit or the candidate
 the way the HTTP route does it: transit guard -> usage.reserve -> ai_stream.chat_events (finalize and release inside).
 The database is SQLite in memory (fresh for every run), the charts come from charts.json (saved calculation rows),
 the provider client is wrapped by MeteredClient (budget check before the call, usage after it, no retries).
-Exit codes: 0 done, 2 refused to start, 3 stopped by the budget, 4 aborted (the provider refuses the key).
+Both providers are supported: an OpenAI configuration wraps the OpenAI client (MeteredClient), an Anthropic one wraps the Anthropic
+client (MeteredAnthropic) and asks the product to select its Anthropic path through LUNARIA_CHAT_PROVIDER. The worker refuses
+before the first call when the product's own parameters (provider, model, effort) do not match the configuration.
+Exit codes: 0 done, 2 refused to start, 3 stopped by the budget, 4 aborted (the provider refuses the key),
+5 stopped because the provider answered with another model than the one asked for.
 """
 import argparse
 import importlib
@@ -15,10 +19,11 @@ import time
 from pathlib import Path
 
 from .budget import Budget, UnknownModel, price_for
-from .common import (CONFIGS, STUB_KEY, TOOL_DIR, child_env, client_base_url, git_state, is_loopback_url, log_event,
-                     paid_state_dir, redact, refuse_non_loopback, register_secret, tool_sha, valid_budget)
+from .common import (ANTHROPIC_URL, CONFIGS, KEY_VARIABLES, STUB_ANTHROPIC_KEY, STUB_KEY, TOOL_DIR, client_base_url, git_state,
+                     is_loopback_url, log_event, paid_state_dir, redact, refuse_non_loopback, register_secret, tool_sha,
+                     valid_anthropic_budget, valid_budget)
 from .facts import ChartFacts
-from .metered import JsonlWriter, MeteredClient
+from .metered import JsonlWriter, MeteredAnthropic, MeteredClient
 from . import questions as Q
 
 TOOL_ROOT = str(TOOL_DIR.parent.parent)
@@ -74,7 +79,7 @@ def seed_charts(engine, charts):
     with Session(bind=engine, autoflush=False) as db:
         db.add(User(id=1, email="chat-eval@example.test", password_hash="unused"))
         db.flush()
-        for key, source in (("A", "A"), ("B", "B"), ("C", "C"), ("D", "D"), ("A2", "A")):
+        for key, source in (("A", "A"), ("B", "B"), ("C", "C"), ("D", "D"), *Q.CHART_COPIES.items()):
             entry = charts[source]
             fields = dict(entry["chart"])
             fields["birth_utc"] = datetime.fromisoformat(fields["birth_utc"])
@@ -159,7 +164,7 @@ def ask_one(ctx, conv_id, subject, chart_key, qid, history, seeded, run_index):
     except HTTPException:
         return {**record, "outcome": "blocked", "reason": "transit_guard", "response": None, "cost_usd": 0.0}
     rel = {"relationship_id": ctx["rel_ids"][conv_id]} if subject == "pair" else {}
-    chart_id = None if subject == "pair" else ctx["chart_ids"][conv_id if conv_id == "A2" else chart_key[0]]
+    chart_id = None if subject == "pair" else ctx["chart_ids"][conv_id if conv_id in Q.CHART_COPIES else chart_key[0]]
     started = time.monotonic()
     with Session(bind=ctx["engine"], autoflush=False) as db:
         reservation = usage.reserve(db, 1, chart_id, **rel)
@@ -184,9 +189,12 @@ def ask_one(ctx, conv_id, subject, chart_key, qid, history, seeded, run_index):
            "partial_text": None if outcome == "ok" else "".join(text_parts) or None,
            "follow_up_count": len(final.get("follow_up_suggestions") or []) if outcome == "ok" else None,
            "finish_reason": generation.get("finish_reason"), "model_returned": generation.get("model_returned"),
-           "input_tokens": generation.get("input_tokens"), "output_tokens": generation.get("output_tokens"),
+           "input_tokens": generation.get("input_tokens_total", generation.get("input_tokens")),
+           "output_tokens": generation.get("output_tokens"),
+           "cache_creation_input_tokens": generation.get("cache_creation_input_tokens"),
+           "cache_read_input_tokens": generation.get("cache_read_input_tokens"),
            "summary_calls": len(summaries),
-           "summary_input_tokens": sum(c.get("input_tokens") or 0 for c in summaries),
+           "summary_input_tokens": sum(c.get("input_tokens_total", c.get("input_tokens")) or 0 for c in summaries),
            "summary_output_tokens": sum(c.get("output_tokens") or 0 for c in summaries),
            "cost_usd": round(sum(c.get("cost_usd") or 0.0 for c in metered.records), 8),
            "ttfb_ms": first_delta_ms, "duration_ms": total_ms,
@@ -226,42 +234,65 @@ def run_once(ctx, run_index, only):
                 history.append({"q": record["question"], "a": record["response"]})
             if record["outcome"] == "budget_stop":
                 return 3
+            if record["outcome"] == "model_substituted":
+                return 5
             auth_failures = auth_failures + 1 if record.get("provider_status") in (401, 403) else 0
             if auth_failures >= 2:
                 return 4
     return 0
 
 
+def budget_problem(provider, real, value):
+    """The closed reason a limit is refused for, or None. An Anthropic cap of 0 in a paid run means 'the owner has not named a sum'."""
+    if provider == "anthropic":
+        if not valid_anthropic_budget(value):
+            return "budget_out_of_range"
+        if value == 0 and real:
+            return "anthropic_budget_unset"
+        return "budget_out_of_range" if value == 0 else None
+    return None if valid_budget(value) else "budget_out_of_range"
+
+
 def main(argv=None):
     args = parse(argv)
     config = CONFIGS[args.config]
+    provider, key_name = config["provider"], KEY_VARIABLES[config["provider"]]
     out_dir, repo = Path(args.out_dir).resolve(), Path(args.repo).resolve()
-    # Same rules as the CLI, because this process can be started directly: a finite limit in (0, 10] and, for a
-    # paid run, the one shared ledger (only a loopback rehearsal may use another).
-    if not valid_budget(args.budget_usd):
-        log_event("chat_eval.worker", outcome="refused", reason="budget_out_of_range", config=args.config)
+    # Same rules as the CLI, because this process can be started directly: a finite limit inside the owner's limit of the provider
+    # and, for a paid run, the one shared ledger (only a loopback rehearsal may use another).
+    problem = budget_problem(provider, args.real, args.budget_usd)
+    if problem:
+        log_event("chat_eval.worker", outcome="refused", reason=problem, config=args.config)
         return 2
     if args.real and not args.real_base_url and Path(args.ledger).resolve() != (paid_state_dir() / "spend.jsonl").resolve():
         log_event("chat_eval.worker", outcome="refused", reason="paid_ledger_must_be_the_shared_one", config=args.config)
         return 2
     out_dir.mkdir(parents=True, exist_ok=True)
-    # --- start conditions: a paid run only with a key, a dry run only against this computer -------------------
+    # --- start conditions: a paid run only with its own provider's key, a dry run only against this computer ---------
+    stub = STUB_ANTHROPIC_KEY if provider == "anthropic" else STUB_KEY
+    url_name = "ANTHROPIC_BASE_URL" if provider == "anthropic" else "OPENAI_BASE_URL"
     if args.real:
-        os.environ.pop("OPENAI_BASE_URL", None)
+        os.environ.pop(url_name, None)
         if args.real_base_url and not is_loopback_url(args.real_base_url):
             log_event("chat_eval.worker", outcome="refused", reason="real_base_url_must_be_loopback", config=args.config)
             return 2
-        if not os.environ.get("OPENAI_API_KEY") or os.environ["OPENAI_API_KEY"] == STUB_KEY:
+        if not os.environ.get(key_name) or os.environ[key_name] == stub:
             log_event("chat_eval.worker", outcome="refused", reason="no_key", config=args.config)
             return 2
-        register_secret(os.environ["OPENAI_API_KEY"])
+        register_secret(os.environ[key_name])
+        if provider == "anthropic":
+            os.environ[url_name] = args.real_base_url or ANTHROPIC_URL
     else:
-        base_url = args.base_url or os.environ.get("OPENAI_BASE_URL", "")
+        base_url = args.base_url or os.environ.get(url_name, "")
         if not base_url or not is_loopback_url(base_url):
             log_event("chat_eval.worker", outcome="refused", reason="dry_needs_loopback_url", config=args.config)
             return 2
-        os.environ["OPENAI_BASE_URL"], os.environ["OPENAI_API_KEY"] = base_url, STUB_KEY
+        os.environ[url_name], os.environ[key_name] = base_url, stub
         refuse_non_loopback()
+    if provider == "anthropic":
+        # The product module imports an OpenAI client even when it selects Anthropic: give it a stub key and a dead loopback address,
+        # so that nothing can ever reach OpenAI from an Anthropic configuration (and no real OpenAI key is passed on).
+        os.environ["OPENAI_API_KEY"], os.environ["OPENAI_BASE_URL"] = STUB_KEY, "http://127.0.0.1:9/v1"
     try:
         price_for(config["model"])
     except UnknownModel:
@@ -270,30 +301,41 @@ def main(argv=None):
     charts = json.loads(Path(args.charts).read_text(encoding="utf-8"))
     out_args = (out_dir, Path(args.ledger).resolve())
     # --- the product, from the chosen checkout, with its own environment ---------------------------------------
-    os.environ.update({"DATABASE_URL": "sqlite://", "SECRET_KEY": "chat-eval-only", "LUNARIA_FREE_BETA_ENABLED": "true",
-                       "OPENAI_MODEL": config["model"]})
-    os.environ.pop("OPENAI_REASONING_EFFORT", None)
-    if config["effort"] is not None:
-        os.environ["OPENAI_REASONING_EFFORT"] = config["effort"]
+    os.environ.update({"DATABASE_URL": "sqlite://", "SECRET_KEY": "chat-eval-only", "LUNARIA_FREE_BETA_ENABLED": "true"})
+    for name in ("LUNARIA_CHAT_PROVIDER", "ANTHROPIC_CHAT_MODEL", "ANTHROPIC_CHAT_EFFORT", "OPENAI_REASONING_EFFORT", "OPENAI_MODEL"):
+        os.environ.pop(name, None)
+    if provider == "anthropic":
+        os.environ.update({"LUNARIA_CHAT_PROVIDER": "anthropic", "ANTHROPIC_CHAT_MODEL": config["model"],
+                           "ANTHROPIC_CHAT_EFFORT": config["effort"]})
+    else:
+        os.environ["OPENAI_MODEL"] = config["model"]
+        if config["effort"] is not None:
+            os.environ["OPENAI_REASONING_EFFORT"] = config["effort"]
     import dotenv
     dotenv.load_dotenv = lambda *a, **k: False       # the repository .env is never read
     sys.path[:0] = [str(repo), TOOL_ROOT]
     os.chdir(repo)
     import warnings
     warnings.filterwarnings("ignore")
-    from openai import OpenAI
     from modules import interpretation
     from modules.usage import OPENAI_TIMEOUT_SECONDS
     params, source = product_params(interpretation, args.params_func)
-    if params is None or params.get("model") != config["model"]:
+    if (params is None or params.get("model") != config["model"] or params.get("provider", "openai") != provider or
+            (provider == "anthropic" and params.get("effort") != config["effort"])):
         log_event("chat_eval.worker", outcome="refused", reason="product_params_unavailable", config=args.config)
         return 2
     client_args = {"timeout": OPENAI_TIMEOUT_SECONDS, "max_retries": 0,
-                   "base_url": client_base_url(real=args.real, dry_url=os.environ.get("OPENAI_BASE_URL", ""),
-                                               real_base_url=args.real_base_url)}
-    budget = Budget(args.budget_usd, out_args[1])
+                   "base_url": client_base_url(real=args.real, dry_url=os.environ.get(url_name, ""), real_base_url=args.real_base_url,
+                                               provider=provider)}
+    budget = Budget(args.budget_usd, out_args[1], provider=provider)
     run_id = out_dir.name
-    metered = MeteredClient(OpenAI(**client_args), budget, JsonlWriter(out_dir / "calls.jsonl"), config=args.config)
+    if provider == "anthropic":
+        import anthropic
+        metered = MeteredAnthropic(anthropic.Anthropic(api_key=os.environ[key_name], **client_args), budget,
+                                   JsonlWriter(out_dir / "calls.jsonl"), config=args.config)
+    else:
+        from openai import OpenAI
+        metered = MeteredClient(OpenAI(**client_args), budget, JsonlWriter(out_dir / "calls.jsonl"), config=args.config)
     ctx = {"run_id": run_id, "config": args.config, "model": config["model"], "params": params,
            "params_record": {"source": source, **{k: v for k, v in params.items() if isinstance(v, (str, int, float, bool))}},
            "metered": metered, "writer": JsonlWriter(out_dir / "answers.jsonl"), "charts": charts, "out_dir": out_dir,
@@ -306,14 +348,14 @@ def main(argv=None):
         code = run_once(ctx, run_index, only)
         if code:
             break
-    meta = {"config": args.config, "code": config["code"], "model": config["model"], "effort": config["effort"],
+    meta = {"config": args.config, "code": config["code"], "provider": provider, "model": config["model"], "effort": config["effort"],
             "repo": str(repo.name), **ctx["repo"], "tool_sha": ctx["tool_sha"], "mode": "real" if args.real else "dry",
             "params": ctx["params_record"], "runs": args.runs, "answers": ctx["answers"], "exit_code": code}
     (out_dir / ("meta-%s.json" % args.config)).write_text(json.dumps(meta, ensure_ascii=False, indent=1) + "\n",
                                                           encoding="utf-8")
-    log_event("chat_eval.worker", outcome={0: "done", 3: "stopped", 4: "aborted"}.get(code, "failed"), config=args.config,
+    log_event("chat_eval.worker", outcome={0: "done", 3: "stopped", 4: "aborted", 5: "stopped"}.get(code, "failed"), config=args.config,
               answers=ctx["answers"], spent_usd=round(budget.spent(), 6),
-              reason={3: "budget", 4: "auth"}.get(code, "ok"))
+              reason={3: "budget", 4: "auth", 5: "model_substituted"}.get(code, "ok"))
     return code
 
 
