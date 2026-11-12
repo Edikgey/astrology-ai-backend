@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .budget import Budget, UnknownModel, price_for
 from .common import (CONFIGS, STUB_KEY, TOOL_DIR, child_env, git_state, is_loopback_url, log_event, redact,
-                     refuse_non_loopback, tool_sha)
+                     refuse_non_loopback, register_secret, tool_sha)
 from .facts import ChartFacts
 from .metered import JsonlWriter, MeteredClient
 from . import questions as Q
@@ -235,6 +235,7 @@ def main(argv=None):
         if not os.environ.get("OPENAI_API_KEY") or os.environ["OPENAI_API_KEY"] == STUB_KEY:
             log_event("chat_eval.worker", outcome="refused", reason="no_key", config=args.config)
             return 2
+        register_secret(os.environ["OPENAI_API_KEY"])
     else:
         base_url = args.base_url or os.environ.get("OPENAI_BASE_URL", "")
         if not base_url or not is_loopback_url(base_url):
