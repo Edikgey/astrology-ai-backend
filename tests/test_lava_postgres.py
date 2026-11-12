@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 import test_postgres_usage as pg
 from database.queries import User, BillingEvent, LavaCheckout, GPTUsage
 from modules import lava_billing as billing
-from test_lava import OFFER, PRODUCT, CONTRACT, ENV, iso, InvoiceScript
+from test_lava import OFFER, PRODUCT, CONTRACT, ENV, iso, InvoiceScript, CancelScript
 
 WAIT = 5  # seconds: every barrier/event wait is bounded; a broken ordering fails, it never hangs
 
@@ -231,3 +231,109 @@ class LavaPostgresTests(unittest.TestCase):
         self.assertEqual(a, (502, billing.api.PROVIDER_SILENT, None))
         self.assertEqual((after_a, c, script.posts),
                          ([("creating", None, None)], (409, billing.CHECKOUT_PENDING, None), 1))
+
+    # --- PAY-LAVA-CANCEL C8-C10 (tasks/PAY-LAVA-CANCEL/DESIGN.md §3 "Двойное нажатие и две вкладки", §5) -------
+    # Real cancel_subscription + real lava_client.request over httpx.MockTransport; row locks are PostgreSQL's.
+    PENDING = (200, {"pending": True}, None)
+    DELETE_PARAMS = {"contractId": CONTRACT, "email": "test@example.com"}
+
+    def prepare_subscriber(self):
+        """User 1 (test@example.com) holds an active Lava subscription from a verified payment event."""
+        self.prepare_race()
+        with patch.object(billing, "snapshot", return_value=self.provider_state.copy()), self.sessions() as db:
+            self.assertEqual(billing.process_event(db, self.value), "processed")
+        self.subscription = {"id": CONTRACT, "datetime": iso(self.start), "status": "COMPLETED",
+            "receipt": {"amount": 799, "currency": "RUB"}, "buyer": {"email": "test@example.com"},
+            "periodicity": "MONTHLY", "subscriptionStatus": "ACTIVE", "expiredAt": iso(self.provider_state["end"]),
+            "cancelledAt": None, "terminatedAt": None, "recurrentPayments": []}
+        self.release_claim()
+
+    def subscriber(self):
+        """(claim, plan, subscription_status, scheduled_cancel_at)."""
+        with self.sessions() as db:
+            user = db.get(User, 1)
+            checkout = db.query(LavaCheckout).filter_by(user_id=1, contract_id=CONTRACT).one()
+            return checkout.cancel_requested, user.plan, user.subscription_status, user.scheduled_cancel_at
+
+    def release_claim(self):
+        """Clean state for every case: no claim, the same paid subscriber."""
+        with self.sessions() as db:
+            db.query(LavaCheckout).filter_by(user_id=1, contract_id=CONTRACT).one().cancel_requested = False
+            db.commit()
+        self.assertEqual(self.subscriber(), (False, "premium", "active", None))
+
+    def cancel_tab(self):
+        """One tab of user 1: (status, body or detail, headers). A broken ordering is a result, not a hang."""
+        with self.sessions() as db:
+            try:
+                return 200, billing.cancel_subscription(db, 1), None
+            except HTTPException as exc:
+                return exc.status_code, exc.detail, exc.headers
+            except Exception as exc:  # BrokenBarrierError / RuntimeError from a bounded wait in the transport
+                return "error", type(exc).__name__, None
+
+    def tab_b_during_held_delete(self, outcome, applied=False):
+        """Tab A is stopped inside its DELETE (its claim is committed, no lock held); tab B cancels;
+        then A gets `outcome`; then tab C cancels. Ordering by Events, never by sleep."""
+        deleting, release = Event(), Event()
+
+        def hold():
+            deleting.set()
+            if not release.wait(WAIT):
+                raise RuntimeError("tab A was never released")
+        script = CancelScript(self.subscription, first=outcome, applied=applied, before_first=hold)
+        with patch.dict(os.environ, ENV), script.installed(), ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                tab_a = pool.submit(self.cancel_tab)
+                self.assertTrue(deleting.wait(WAIT), "tab A never reached the DELETE")
+                before_b = len(script.calls)
+                b = self.cancel_tab()
+                calls_during_b = script.calls[before_b:]
+            finally:
+                release.set()
+            a = tab_a.result(timeout=WAIT)
+            claim_after_a = self.subscriber()[0]
+            before_c = len(script.calls)
+            c = self.cancel_tab()
+            calls_of_c = script.calls[before_c:]
+        return script, a, (b, calls_during_b), claim_after_a, (c, calls_of_c)
+
+    def test_c8_second_tab_during_refused_delete_then_new_cancel(self):
+        self.prepare_subscriber()
+        script, a, b, claim_after_a, c = self.tab_b_during_held_delete(lambda: httpx.Response(429, json={}))
+        self.assertEqual(b, (self.PENDING, []))  # B answers "sent" from A's claim and never calls Lava
+        self.assertEqual(a, (503, billing.api.PROVIDER_SILENT, {"Retry-After": "60"}))
+        # Red on 61e4abc: A's claim stays true, so C answers "pending" without Lava: (True, (PENDING, []), 1).
+        self.assertEqual((claim_after_a, c, script.deletes), (False, (self.PENDING, ["GET", "DELETE"]), 2))
+        self.assertEqual(script.params, [self.DELETE_PARAMS] * 2)
+        self.assertEqual(self.subscriber(), (True, "premium", "active", None))
+
+    def test_c9_two_simultaneous_tabs_send_one_delete(self):
+        # Guard (green on 61e4abc): both tabs pass the read together, one claim wins, one DELETE.
+        # A lock held across the HTTP read would stop the second tab before its read: the barrier breaks in 5 s.
+        self.prepare_subscriber()
+        barrier = Barrier(2)
+        script = CancelScript(self.subscription, before_read=lambda: barrier.wait(timeout=WAIT))
+        with patch.dict(os.environ, ENV), script.installed(), ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: self.cancel_tab(), range(2)))
+        self.assertEqual((results, script.deletes, self.subscriber()[0]), ([self.PENDING] * 2, 1, True))
+        self.assertEqual(script.params, [self.DELETE_PARAMS])
+        self.assertEqual(self.subscriber()[1:], ("premium", "active", None))
+
+    def test_c10_second_tab_during_unclear_delete_then_new_cancel_reads_first(self):
+        self.prepare_subscriber()
+        for applied in (False, True):
+            with self.subTest(applied="applied" if applied else "not applied"):
+                self.release_claim()
+                script, a, b, claim_after_a, c = self.tab_b_during_held_delete(
+                    lambda: httpx.ReadTimeout("synthetic: read timeout"), applied=applied)
+                self.assertEqual(b, (self.PENDING, []))
+                self.assertEqual(a, (502, billing.api.PROVIDER_SILENT, None))  # never shown as "cancelled"
+                if applied:
+                    # Guard (green on 61e4abc): Lava already cancelled, so no second DELETE whatever the claim says.
+                    self.assertEqual((c[0], script.deletes), (self.PENDING, 1))
+                else:
+                    # Red on 61e4abc: A's claim stays true, C answers "pending" without Lava: (True, (PENDING, []), 1).
+                    self.assertEqual((claim_after_a, c, script.deletes), (False, (self.PENDING, ["GET", "DELETE"]), 2))
+                    self.assertEqual(script.params, [self.DELETE_PARAMS] * 2)
+                self.assertEqual(self.subscriber()[1:], ("premium", "active", None))

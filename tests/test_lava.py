@@ -1,15 +1,18 @@
 """Fake Lava credentials/responses only. Never calls a real payment service."""
 import copy
+import json
+import logging
 import os
 import threading
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from unittest.mock import patch, Mock
 from uuid import uuid4
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 import test_my_charts as fixtures
 from database.queries import User, LavaCheckout, StripeCheckout, BillingEvent, GPTUsage
 from modules import lava_billing as billing, lava_client as api, usage
@@ -723,3 +726,269 @@ class LavaInvoiceRefusalTests(unittest.TestCase):
         for name, first, status in CONTRADICTORY:
             with self.subTest(name):
                 self.assert_still_blocked(first, status)
+
+
+# --- PAY-LAVA-CANCEL (tasks/PAY-LAVA-CANCEL/DESIGN.md §3, §5): cancellation must not hang after a failed DELETE ---
+SUBSCRIPTION_READ = "/api/v1/subscriptions/" + CONTRACT
+CLAIM_NOT_RELEASED = "Lava cancel claim not released "
+FAILURE_KEYS = {"operation", "stage", "exception_class", "duration_ms", "http_status"}
+
+
+class CancelScript:
+    """Synthetic Lava for subscription cancellation behind httpx.MockTransport for the real lava_client.request.
+
+    `GET /api/v1/subscriptions/{CONTRACT}` serves a copy of `subscription`, or `read()` while `read` is set
+    (an httpx.Response, or an httpx exception that is raised). The first DELETE gets `first()`; with `applied`
+    the subscription is marked cancelled before that answer (Lava did it, we just never heard). Every other
+    DELETE gets 204 and cancels. Anything else is 404. `calls` lists requests in arrival order ("GET", "DELETE",
+    or "METHOD path" for anything unexpected); `params` holds the query of every DELETE. `before_first` runs
+    inside the first DELETE before it answers (a race test holds tab A there); `before_read` inside every GET."""
+
+    installed = InvoiceScript.installed
+
+    def __init__(self, subscription, first=None, applied=False, read=None, before_first=None, before_read=None):
+        self.subscription = copy.deepcopy(subscription)
+        self.first, self.applied, self.read = first, applied, read
+        self.before_first, self.before_read = before_first, before_read
+        self.lock, self.calls, self.params = threading.Lock(), [], []
+
+    @property
+    def deletes(self):
+        return self.calls.count("DELETE")
+
+    def cancelled_at_lava(self):
+        with self.lock:
+            self.subscription.update(subscriptionStatus="CANCELLED", cancelledAt=iso(datetime.utcnow()))
+
+    @staticmethod
+    def answer(outcome):
+        value = outcome()
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def __call__(self, request):
+        method, path = request.method, request.url.path
+        if method == "GET" and path == SUBSCRIPTION_READ:
+            with self.lock:
+                self.calls.append("GET")
+            if self.before_read:
+                self.before_read()
+            if self.read is not None:
+                return self.answer(self.read)
+            with self.lock:
+                return httpx.Response(200, json=copy.deepcopy(self.subscription))
+        if method == "DELETE" and path == "/api/v1/subscriptions":
+            with self.lock:
+                self.calls.append("DELETE")
+                self.params.append(dict(request.url.params))
+                number = self.calls.count("DELETE")
+            if number == 1 and self.first is not None:
+                if self.before_first:
+                    self.before_first()
+                if self.applied:
+                    self.cancelled_at_lava()
+                return self.answer(self.first)
+            self.cancelled_at_lava()
+            return httpx.Response(204)
+        with self.lock:
+            self.calls.append(f"{method} {path}")
+        return httpx.Response(404, json={})
+
+
+@contextmanager
+def captured_logs():
+    """Every WARNING+ record that reaches the root logger; unlike assertLogs, an empty capture is allowed."""
+    records = []
+    handler = logging.Handler(logging.WARNING)
+    handler.emit = records.append
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        yield records
+    finally:
+        root.removeHandler(handler)
+
+
+class LavaCancelTests(unittest.TestCase):
+    """PAY-LAVA-CANCEL C1-C7, C11: POST /payments/lava/cancel over the real lava_client.request and a synthetic
+    Lava. User 1 subscribes through a verified webhook (fake provider), then the transport takes over."""
+    tearDown = fixtures.MyChartsTests.tearDown
+    provider, event, send = LavaTests.provider, LavaTests.event, LavaTests.send
+    DELETE_PARAMS = {"contractId": CONTRACT, "email": "a@example.test"}
+    PENDING = (200, {"pending": True})
+
+    def setUp(self):
+        LavaTests.setUp(self)
+        r = self.send(self.event())
+        self.assertEqual(r.status_code, 200, r.text)
+        self.network.side_effect = REAL_LAVA_REQUEST
+
+    def subscriber(self):
+        """(claim, plan, subscription_status, scheduled_cancel_at): only a verified webhook may change the last three."""
+        with self.sessions() as db:
+            user = db.get(User, 1)
+            return (db.get(LavaCheckout, "bound").cancel_requested, user.plan, user.subscription_status,
+                    user.scheduled_cancel_at)
+
+    def fresh(self, **script):
+        """Clean state for every case: no claim, the same paid subscriber, a new synthetic Lava."""
+        with self.sessions() as db:
+            db.get(LavaCheckout, "bound").cancel_requested = False
+            db.commit()
+        self.assertEqual(self.subscriber(), (False, "premium", "active", None))
+        return CancelScript(self.snapshot, **script)
+
+    def cancel(self):
+        return self.client.post("/payments/lava/cancel", headers=self.owner)
+
+    def assert_refused(self, response, status):
+        """A failed or unclear cancellation is never shown as a success: the old error, code and header."""
+        self.assertEqual((response.status_code, response.json().get("detail"), response.headers.get("retry-after")),
+                         (status, api.PROVIDER_SILENT, "60" if status == 503 else None), response.text)
+
+    def assert_access_untouched(self, claim=None):
+        claim_now, *access = self.subscriber()
+        self.assertEqual(access, ["premium", "active", None])  # access and dates come only from a verified webhook
+        if claim is not None:
+            self.assertEqual(claim_now, claim)
+
+    def click_twice(self, script):
+        with script.installed():
+            one = self.cancel()
+            after_one = (self.subscriber()[0], list(script.calls))
+            two = self.cancel()
+        return one, after_one, two
+
+    def assert_released_then_cancelled(self, first, status):
+        script = self.fresh(first=first)
+        one, (claim, calls), two = self.click_twice(script)
+        self.assert_refused(one, status)
+        self.assertEqual(calls.count("DELETE"), 1)  # one DELETE per click, never an automatic retry
+        # Red on 61e4abc: the claim stays true, so the next click answers "pending" without Lava (calls == ["DELETE"]).
+        self.assertEqual((claim, two.status_code, script.calls), (False, 200, ["GET", "DELETE", "GET", "DELETE"]),
+                         two.text)
+        self.assertEqual(two.json(), {"pending": True})
+        self.assertEqual(script.params, [self.DELETE_PARAMS] * 2)  # contract and email from the database
+        self.assert_access_untouched(claim=True)
+
+    def test_c1_rate_limited_cancel_releases_claim_and_next_click_reaches_lava(self):
+        self.assert_released_then_cancelled(RATE_LIMIT, 503)
+
+    def test_c2_definitive_refusal_or_no_connection_releases_claim(self):
+        for name, first, status in DEFINITIVE + NOT_SENT:
+            with self.subTest(name):
+                self.assert_released_then_cancelled(first, status)
+
+    def test_c3_unclear_outcome_not_applied_next_click_reads_then_deletes(self):
+        for name, first, status in UNCLEAR:
+            with self.subTest(name):
+                self.assert_released_then_cancelled(first, status)
+
+    def test_c4_unclear_outcome_applied_by_lava_never_sends_second_delete(self):
+        # Guard (green on 61e4abc): no second DELETE once Lava shows the cancellation; never "cancelled" on error.
+        for name, first, status in UNCLEAR:
+            with self.subTest(name):
+                script = self.fresh(first=first, applied=True)
+                one, _, two = self.click_twice(script)
+                self.assert_refused(one, status)
+                self.assertEqual(((two.status_code, two.json()), script.deletes), (self.PENDING, 1), two.text)
+                self.assert_access_untouched()
+
+    def test_c5_cancellation_already_visible_at_lava_sends_no_delete(self):
+        for name, changes in (("CANCELLED", {"subscriptionStatus": "CANCELLED"}),
+                              ("cancelledAt only", {"cancelledAt": iso(datetime.utcnow())}),
+                              ("terminatedAt only", {"terminatedAt": iso(datetime.utcnow())})):
+            with self.subTest(name):
+                script = self.fresh()
+                script.subscription.update(changes)
+                with script.installed():
+                    r = self.cancel()
+                # Red on 61e4abc: there is no read, the DELETE goes out and the claim is set.
+                self.assertEqual(((r.status_code, r.json()), script.calls, self.subscriber()[0]),
+                                 (self.PENDING, ["GET"], False), r.text)
+                self.assert_access_untouched()
+
+    def test_c6_failed_read_sends_no_delete_and_next_click_cancels(self):
+        foreign = {**self.snapshot, "id": str(uuid4())}
+        without_id = {k: v for k, v in self.snapshot.items() if k != "id"}
+        for name, read, status in (("500", lambda: httpx.Response(500, json={}), 502),
+                                   ("429", RATE_LIMIT, 503),
+                                   ("ReadTimeout", lambda: httpx.ReadTimeout("synthetic: read timeout"), 502),
+                                   ("200 foreign id", lambda: httpx.Response(200, json=foreign), 502),
+                                   ("200 without id", lambda: httpx.Response(200, json=without_id), 502),
+                                   ("204", lambda: httpx.Response(204), 502)):
+            with self.subTest(name):
+                script = self.fresh(read=read)
+                with script.installed():
+                    one = self.cancel()
+                    after_one = (one.status_code, one.json().get("detail"), one.headers.get("retry-after"),
+                                 list(script.calls), self.subscriber()[0])
+                    script.read = None  # the read recovered; the person clicks again
+                    two = self.cancel()
+                # Red on 61e4abc: no read, the DELETE goes out at once: (200, None, None, ["DELETE"], True).
+                self.assertEqual(after_one, (status, api.PROVIDER_SILENT, "60" if status == 503 else None, ["GET"], False))
+                self.assertEqual(((two.status_code, two.json()), script.calls), (self.PENDING, ["GET", "GET", "DELETE"]),
+                                 two.text)
+                self.assertEqual(script.params, [self.DELETE_PARAMS])
+                self.assert_access_untouched(claim=True)
+
+    def test_c7_accepted_cancel_then_more_clicks_send_one_delete(self):
+        # Guard (green on 61e4abc): after a 2xx the claim stays, further clicks never reach Lava.
+        script = self.fresh()
+        answers, seen = [], []
+        with script.installed():
+            for _ in range(3):
+                r = self.cancel()
+                answers.append((r.status_code, r.json()))
+                seen.append(len(script.calls))
+        self.assertEqual(answers, [self.PENDING] * 3)
+        self.assertEqual((script.deletes, script.calls[-1], seen[0] == seen[1] == seen[2]), (1, "DELETE", True))
+        self.assertEqual(script.params, [self.DELETE_PARAMS])
+        self.assert_access_untouched(claim=True)
+
+    def test_c11a_failure_diagnostics_exclude_key_contract_email_and_provider_text(self):
+        # Guard (green on 61e4abc): only the fixed fields reach the journal and the answer.
+        canary = "canary-lava-key-and-provider-text-5e1c"
+
+        def refusal(status):
+            return lambda: httpx.Response(status, json={"error": canary, "contractId": CONTRACT,
+                                                        "email": "a@example.test", "detail": canary})
+        for name, script_args in (("DELETE 403", {"first": refusal(403)}), ("read 400", {"read": refusal(400)})):
+            with self.subTest(name), patch.dict(os.environ, {"LAVA_API_KEY": canary}):
+                script = self.fresh(**script_args)
+                with script.installed(), captured_logs() as records:
+                    r = self.cancel()
+                output = "\n".join(record.getMessage() for record in records) + "\n" + r.text
+                for private in (canary, CONTRACT, "a@example.test"):
+                    self.assertNotIn(private, output)
+                operations = []
+                for record in records:
+                    message = record.getMessage()
+                    self.assertIsNone(record.exc_info)
+                    if message.startswith("Lava request failed "):
+                        data = json.loads(message.split("Lava request failed ", 1)[1])
+                        self.assertEqual(set(data), FAILURE_KEYS)
+                        operations.append(data["operation"])
+                    elif message.startswith(CLAIM_NOT_RELEASED):
+                        self.assertEqual(set(json.loads(message[len(CLAIM_NOT_RELEASED):])), {"exception_class"})
+                if name == "DELETE 403":
+                    self.assertEqual(operations, ["subscription_cancel"])
+
+    def test_c11b_claim_release_database_failure_keeps_provider_error_and_logs_one_line(self):
+        script = self.fresh(first=RATE_LIMIT)
+        real_locked_user = billing.locked_user
+
+        def locked_user(db, user_id):
+            if script.deletes:  # the transport already saw the DELETE: releasing the claim hits a dead database
+                raise OperationalError("SELECT users FOR UPDATE", {}, Exception("synthetic: database unavailable"))
+            return real_locked_user(db, user_id)
+        with script.installed(), patch("modules.lava_billing.locked_user", side_effect=locked_user), \
+                captured_logs() as records:
+            r = self.cancel()
+        lines = [json.loads(m[len(CLAIM_NOT_RELEASED):]) for m in (record.getMessage() for record in records)
+                 if m.startswith(CLAIM_NOT_RELEASED)]
+        # Red on 61e4abc: the claim is never released, so there is no line: (503, ..., "60", 1, []).
+        self.assertEqual((r.status_code, r.json().get("detail"), r.headers.get("retry-after"), script.deletes, lines),
+                         (503, api.PROVIDER_SILENT, "60", 1, [{"exception_class": "OperationalError"}]), r.text)
+        self.assertTrue(self.subscriber()[0])  # the claim could not be released (DESIGN §7.2)
