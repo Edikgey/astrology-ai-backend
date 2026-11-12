@@ -98,9 +98,9 @@ house/retrograde; Sun, Moon and Ascendant are explicitly identified when availab
 Aspects are undirected and deduplicated, named in words, with the orb parsed from the
 saved `aspects_structured` text (null when absent) and ordered by importance; pattern
 member bodies are listed once by name. Birth date, stored calculator hour, timezone
-and UTC are included; locality and coordinates are not sent (CHAT-QUALITY). Twelve
-Placidus cusps are calculated by the existing `Ephemeris.get_houses()` using those
-same stored inputs and the same system as placement house assignments. No transits,
+and UTC are included; locality and coordinates are not sent (CHAT-QUALITY). House
+cusps come from the saved `ChartData.houses` (sign and degree in sign) with the saved
+house system; the AI path calculates nothing and missing cusps stay null. No transits,
 new aspects, fabricated birth facts or interpretation cache text are injected.
 
 The backend already stores enough calculated placements for a compact context; the
