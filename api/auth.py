@@ -12,9 +12,10 @@ from models.natal_chart import NatalChartCreate
 from database.queries import EmailVerificationCode, NatalChart
 from database.connection import get_db
 from database.queries import User, PasswordReset
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from fastapi.security import OAuth2PasswordBearer
 from services.email_service import send_confirmation_email, EmailDeliveryError
+import logging
 import os
 from starlette import status
 from modules.migration import migrate_guest_data_to_user
@@ -271,6 +272,18 @@ def current_session(payload, user):
     return type(version) is int and version == user.auth_version
 
 
+SESSION_CHECK_UNAVAILABLE = "Сервис временно недоступен: не удалось проверить вход. Подождите минуту и повторите."
+
+
+def session_user(db: Session, user_id: int) -> Optional[User]:
+    # A database failure is not a bad token: answer 503 instead of 401 or a guest fallback.
+    try:
+        return db.query(User).filter(User.id == user_id).first()
+    except SQLAlchemyError as error:
+        logging.getLogger(__name__).warning('Session check unavailable (%s)', type(error).__name__)
+        raise HTTPException(503, detail=SESSION_CHECK_UNAVAILABLE) from None
+
+
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -278,7 +291,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     except (JWTError, ValueError, TypeError):
         raise HTTPException(status_code=401, detail="Сессия истекла. Войдите в аккаунт снова.")
 
-    user = db.query(User).filter(User.id == user_id).first()
+    user = session_user(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="Аккаунт не найден. Войдите снова или зарегистрируйтесь.")
     if not current_session(payload, user):
@@ -286,7 +299,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
 optional_oauth2_scheme = OptionalOAuth2Scheme()
 
-async def get_current_user_or_guest(
+def get_current_user_or_guest(
     token: Optional[str] = Depends(optional_oauth2_scheme),  # ← JWT из Authorization
     session_token: Optional[str] = Header(None, alias="X-Session-Token"),  # ← session_token из кастомного заголовка
     db: Session = Depends(get_db)
@@ -296,11 +309,12 @@ async def get_current_user_or_guest(
         try:
             payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
             user_id = int(payload.get("sub"))
-            user = db.query(User).filter(User.id == user_id).first()
+        except (JWTError, ValueError, TypeError):
+            payload = None  # если JWT плохой — идем дальше
+        if payload is not None:
+            user = session_user(db, user_id)
             if user and current_session(payload, user):
                 return {"user": user, "session_token": None}
-        except Exception:
-            pass  # если JWT плохой — идем дальше
 
     # 2. Гость с session_token
     if session_token:
