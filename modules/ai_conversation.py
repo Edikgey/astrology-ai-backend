@@ -51,13 +51,15 @@ ANSWER_FORMAT = {
 TRUNCATED_TEXT = ("Ответ получился слишком длинным и оборвался. Квота не списана. "
                   "Попросите ответить короче или задайте вопрос по частям.")
 FILTERED_TEXT = "AI не смог ответить на этот вопрос. Квота не списана. Попробуйте сформулировать его иначе."
+INTERRUPTED_TEXT = "Ответ прервался. Квота не списана; повторите вопрос."
 FINISH_OUTCOMES = {'length': 'truncated', 'content_filter': 'filtered'}
+OUTCOME_TEXTS = {'truncated': TRUNCATED_TEXT, 'filtered': FILTERED_TEXT, 'interrupted': INTERRUPTED_TEXT}
 
 
 class AnswerCut(HTTPException):
-    """The provider itself stopped the answer. outcome is a closed label for the journal."""
+    """The provider ended the answer abnormally. outcome is a closed label for the journal."""
     def __init__(self, outcome, output_tokens=None):
-        super().__init__(502, TRUNCATED_TEXT if outcome == 'truncated' else FILTERED_TEXT)
+        super().__init__(502, OUTCOME_TEXTS[outcome])
         self.outcome, self.output_tokens = outcome, output_tokens
 
 
@@ -293,7 +295,7 @@ def stream_answer(db, user_id, chart_id, question, client, params, *, relationsh
     if finish in FINISH_OUTCOMES:
         raise AnswerCut(FINISH_OUTCOMES[finish], token_metadata(response, None)['output_tokens'])
     if finish != 'stop':
-        raise HTTPException(502, "Ответ прервался. Квота не списана; повторите вопрос.")
+        raise AnswerCut('interrupted', token_metadata(response, None)['output_tokens'])
     answer, suggestions = answer_parts(response_text(response), question)
     yield AIAnswer(answer, metadata=token_metadata(response, params['model']), memory_update=update,
                    summary_usage=summary_usage, follow_up_suggestions=suggestions)

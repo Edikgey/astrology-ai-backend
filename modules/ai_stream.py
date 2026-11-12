@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 from modules import usage
-from modules.ai_conversation import AIAnswer, stream_answer
+from modules.ai_conversation import AIAnswer, AnswerCut, stream_answer
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +44,10 @@ def chat_events(bind, user_id, chart_id, question, reservation_id, client, param
                         yield {'type': 'delta', 'text': part}
         except Exception as error:
             # Refusals before the call (ownership, budget, history) are not chat outcomes.
-            outcome = getattr(error, 'outcome', None) or (None if isinstance(error, HTTPException) else 'interrupted')
-            if outcome:
-                log_outcome(outcome, relationship_id, params['model'], getattr(error, 'output_tokens', None), started)
+            if isinstance(error, AnswerCut):
+                log_outcome(error.outcome, relationship_id, params['model'], error.output_tokens, started)
+            elif not isinstance(error, HTTPException):
+                log_outcome('interrupted', relationship_id, params['model'], None, started)
             usage.release(db, user_id, reservation_id)
             settled = True
             yield {'type': 'error', 'status': error.status_code if isinstance(error, HTTPException) else 502,
