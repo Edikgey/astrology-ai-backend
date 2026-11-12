@@ -9,6 +9,8 @@ import json
 import os
 import tempfile
 import unittest
+
+import chat_eval_secrets_guard  # noqa: F401  (no test of this run may open .secrets; tests/chat_eval_secrets_guard.py)
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
@@ -197,7 +199,7 @@ class KeyAndAddressTests(unittest.TestCase):
             path.write_text("OTHER=1\nANTHROPIC_API_KEY=%s\n" % key, encoding="utf-8")
             self.addCleanup(common._SECRETS.discard, key)
             common.load_key(path, "ANTHROPIC_API_KEY")
-            self.assertEqual(os.environ["ANTHROPIC_API_KEY"], key)
+            self.assertTrue(os.environ["ANTHROPIC_API_KEY"] == key)   # not assertEqual: it prints both values
             self.assertEqual(common.redact("boom " + key), "boom [key]")
             path.write_text("ANTHROPIC_API_KEY=\n", encoding="utf-8")
             with self.assertRaises(common.KeyError_) as caught:
@@ -302,7 +304,7 @@ class KeyAndAddressTests(unittest.TestCase):
             args = self.paid_args(tmp)
             args.real = False
             cli.prepare(args)
-            self.assertEqual(os.environ["ANTHROPIC_API_KEY"], common.STUB_ANTHROPIC_KEY)
+            self.assertTrue(os.environ["ANTHROPIC_API_KEY"] == common.STUB_ANTHROPIC_KEY)   # not assertEqual: it prints both values
             args.anthropic_base_url = "https://api.anthropic.com"
             with self.assertRaises(SystemExit) as caught:
                 cli.prepare(args)

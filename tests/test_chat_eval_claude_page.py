@@ -7,6 +7,8 @@ import re
 import subprocess
 import tempfile
 import unittest
+
+import chat_eval_secrets_guard  # noqa: F401  (no test of this run may open .secrets; tests/chat_eval_secrets_guard.py)
 from pathlib import Path
 
 from chat_eval_fake_server import FakeOpenAI

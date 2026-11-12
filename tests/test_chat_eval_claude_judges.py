@@ -6,6 +6,8 @@ Pure functions on tables, plus the Claude judge request against the real SDK and
 import json
 import tempfile
 import unittest
+
+import chat_eval_secrets_guard  # noqa: F401  (no test of this run may open .secrets; tests/chat_eval_secrets_guard.py)
 from pathlib import Path
 
 import anthropic

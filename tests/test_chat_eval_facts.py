@@ -9,6 +9,8 @@ import json
 import os
 import socket
 import unittest
+
+import chat_eval_secrets_guard  # noqa: F401  (no test of this run may open .secrets; tests/chat_eval_secrets_guard.py)
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
