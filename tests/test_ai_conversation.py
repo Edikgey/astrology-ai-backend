@@ -169,7 +169,7 @@ class AIConversationTests(unittest.TestCase):
             db.add(GPTConversation(chart_id=chart_id,user_id=1,summary='Original memory',through_message_id=0));db.commit()
         before=self.snapshot(chart_id)
         for responses in ([TimeoutError('mock')], [reply('Candidate memory'),TimeoutError('mock')],
-                          [reply('Candidate memory'),reply('')], [reply('incomplete',finish='length')]):
+                          [reply('Candidate memory'),reply('')]):  # summary cut by length: CQ-10 (answer is given)
             with self.subTest(responses=len(responses)):
                 state=self.client.get('/account/usage',headers=self.owner).json()
                 with patch('modules.interpretation.client.chat.completions.create',side_effect=responses):
@@ -251,7 +251,7 @@ class AIConversationTests(unittest.TestCase):
         self.assertEqual(self.client.get('/account/usage',headers=self.owner).json()['gpt_messages_used'],0)
 
     def test_budget_reduces_history_and_keeps_new_question_and_chart_intact(self):
-        chart_id=self.chart();self.long_chat(chart_id,pairs=4,size=3500)
+        chart_id=self.chart();self.long_chat(chart_id,pairs=4,size=7000)
         question='Что из этого самое проблемное?'
         with patch('modules.interpretation.client.chat.completions.create',return_value=reply('Compact memory or answer')) as api:
             self.assertEqual(self.ask(chart_id,question).status_code,200)
