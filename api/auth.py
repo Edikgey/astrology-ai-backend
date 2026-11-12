@@ -299,7 +299,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
 optional_oauth2_scheme = OptionalOAuth2Scheme()
 
-async def get_current_user_or_guest(
+def get_current_user_or_guest(
     token: Optional[str] = Depends(optional_oauth2_scheme),  # ← JWT из Authorization
     session_token: Optional[str] = Header(None, alias="X-Session-Token"),  # ← session_token из кастомного заголовка
     db: Session = Depends(get_db)
