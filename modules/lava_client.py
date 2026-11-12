@@ -22,7 +22,11 @@ RUB_NOT_AVAILABLE = "Оплата в рублях пока недоступна.
 RUB_TEMPORARILY_UNAVAILABLE = "Оплата в рублях временно недоступна. Попробуйте позже."
 
 
-class InvoiceEmailRejected(HTTPException):
+class InvoiceNotCreated(HTTPException):
+    """Lava refused to create the invoice, or the request never left; no invoice exists, the attempt may close."""
+
+
+class InvoiceEmailRejected(InvoiceNotCreated):
     """Definitive provider validation rejection; no invoice was created."""
     def __init__(self):
         super().__init__(422, "Lava отклонила email этого аккаунта для покупки. Обратитесь в поддержку Lunaria: lunariaai.support@gmail.com. Оплата не создана.")
@@ -103,14 +107,20 @@ def request(method, path, **kwargs):
             response = client.request(method, BASE_URL + path,
                                       headers={"X-Api-Key": key, "Accept": "application/json"}, **kwargs)
         stage = "http_status"
-        if response.status_code == 400 and operation == "invoice_create":
+        if 400 <= response.status_code < 500 and operation == "invoice_create":
             try:
                 error_body = response.json()
             except ValueError:
                 error_body = None
-            if (isinstance(error_body, dict) and error_body.get("error") == "Incorrect email to purchase"
-                    and not error_body.get("id") and not error_body.get("paymentUrl")):
-                raise InvoiceEmailRejected()
+            if not isinstance(error_body, dict):
+                error_body = {}
+            # A 4xx naming an invoice contradicts itself: keep it an unclear outcome below.
+            if not error_body.get("id") and not error_body.get("paymentUrl"):
+                if response.status_code == 400 and error_body.get("error") == "Incorrect email to purchase":
+                    raise InvoiceEmailRejected()
+                if response.status_code == 429:
+                    raise InvoiceNotCreated(503, PROVIDER_SILENT, headers={"Retry-After": "60"})
+                raise InvoiceNotCreated(502, PROVIDER_SILENT)
         if response.status_code == 429:
             raise HTTPException(503, PROVIDER_SILENT, headers={"Retry-After": "60"})
         if not 200 <= response.status_code < 300:
@@ -127,6 +137,9 @@ def request(method, path, **kwargs):
         raise
     except (httpx.HTTPError, ValueError, TypeError) as error:
         log_failure(error)
+        # httpx 0.28.1 / httpcore 1.0.9 raise Connect* only before any byte is sent; recheck on upgrade.
+        if operation == "invoice_create" and isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)):
+            raise InvoiceNotCreated(502, PROVIDER_SILENT) from None
         raise HTTPException(502, PROVIDER_SILENT) from None
 
 

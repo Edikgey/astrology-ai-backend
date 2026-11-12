@@ -1,6 +1,7 @@
 """Fake Lava credentials/responses only. Never calls a real payment service."""
 import copy
 import os
+import threading
 import unittest
 from datetime import datetime, timedelta
 from unittest.mock import patch, Mock
@@ -23,6 +24,52 @@ ENV = {"LAVA_API_KEY": "fake-test-key", "LAVA_WEBHOOK_SECRET": SECRET, "LAVA_OFF
 
 def iso(value):
     return value.isoformat() + "Z"
+
+
+# The real functions, captured before any test patches them (PAY-LAVA-STUCK regression).
+REAL_LAVA_REQUEST = api.request
+REAL_HTTPX_CLIENT = httpx.Client
+
+
+def catalog():
+    return {"items": [{"id": PRODUCT, "type": "SUBSCRIPTION", "offers": [{"id": OFFER,
+        "prices": [{"currency": "RUB", "amount": 799, "periodicity": "MONTHLY"}]}]}]}
+
+
+class InvoiceScript:
+    """Synthetic Lava behind httpx.MockTransport for the real lava_client.request.
+
+    The first invoice POST gets `first()` (an httpx.Response, or an httpx exception that is raised);
+    every later POST gets a fresh valid 201 invoice. The catalog is served; anything else is 404.
+    `before_first` runs inside the first POST before it answers (a race test holds tab A there).
+    `posts` counts invoice POSTs that reached the transport: the proof that nothing is retried."""
+
+    def __init__(self, first, before_first=None, products=None):
+        self.first, self.before_first, self.catalog = first, before_first, products or catalog()
+        self.lock, self.posts = threading.Lock(), 0
+
+    def __call__(self, request):
+        if request.method == "POST" and request.url.path == "/api/v3/invoice":
+            with self.lock:
+                self.posts += 1
+                number = self.posts
+            if number == 1 and self.first is not None:
+                if self.before_first:
+                    self.before_first()
+                outcome = self.first()
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+            return httpx.Response(201, json={"id": str(uuid4()), "paymentUrl": f"https://pay.example.test/invoice/{number}",
+                                             "amountTotal": {"amount": 799, "currency": "RUB"}})
+        if request.method == "GET" and request.url.path == "/api/v2/products":
+            return httpx.Response(200, json=self.catalog)
+        return httpx.Response(404, json={})
+
+    def installed(self):
+        # A new client per call, as in production: `with httpx.Client(...)` closes it.
+        return patch("modules.lava_client.httpx.Client",
+                     side_effect=lambda **kwargs: REAL_HTTPX_CLIENT(transport=httpx.MockTransport(self)))
 
 
 class LavaTests(unittest.TestCase):
@@ -436,10 +483,13 @@ class LavaHttpTests(unittest.TestCase):
             (httpx.ReadTimeout(secret), "request", "ReadTimeout", None),
             (httpx.Response(200, content=secret.encode()), "decode_response", "JSONDecodeError", 200),
             (httpx.Response(500, content=secret.encode()), "http_status", "HTTPException", 500),
-            (httpx.Response(429, content=secret.encode()), "http_status", "HTTPException", 429),
+            # PAY-LAVA-STUCK T7: a definitive refusal is labelled so support sees the attempt was closed.
+            (httpx.Response(429, content=secret.encode()), "http_status", "InvoiceNotCreated", 429),
+            (httpx.Response(403, content=secret.encode()), "http_status", "InvoiceNotCreated", 403),
+            (httpx.ConnectError(secret), "request", "ConnectError", None),
         ]
         for response, stage, exception, status in cases:
-            with self.subTest(status=status, stage=stage), patch.dict(os.environ, {**ENV, "LAVA_API_KEY": secret}):
+            with self.subTest(status=status, stage=stage, exception=exception), patch.dict(os.environ, {**ENV, "LAVA_API_KEY": secret}):
                 handler = Mock(side_effect=response) if isinstance(response, Exception) else Mock(return_value=response)
                 client = original(transport=httpx.MockTransport(handler))
                 with patch("modules.lava_client.httpx.Client", return_value=client), self.assertLogs("modules.lava_client", level="WARNING") as logs:
@@ -505,3 +555,171 @@ class LavaHttpTests(unittest.TestCase):
             client.return_value.__enter__.return_value.request.side_effect = httpx.TimeoutException("unsafe provider text")
             with self.assertRaises(HTTPException) as caught: api.request("POST", "/api/v3/invoice")
             self.assertNotIn("unsafe", caught.exception.detail)
+
+    # --- PAY-LAVA-STUCK T6 (tasks/PAY-LAVA-STUCK/DESIGN.md §2-§3): classify where the status is known ---
+    def provider_call(self, outcome, method="POST", path="/api/v3/invoice"):
+        def answer(request):
+            value = outcome()
+            if isinstance(value, Exception):
+                raise value
+            return value
+        handler = Mock(side_effect=answer)
+        kwargs = {"json": {}} if method == "POST" else {}
+        with patch.dict(os.environ, ENV), patch("modules.lava_client.httpx.Client",
+                side_effect=lambda **_: REAL_HTTPX_CLIENT(transport=httpx.MockTransport(handler))), \
+                self.assertLogs("modules.lava_client", level="WARNING"):
+            with self.assertRaises(HTTPException) as caught:
+                api.request(method, path, **kwargs)
+        self.assertEqual(handler.call_count, 1)  # one HTTP request per call, never an automatic retry
+        return caught.exception
+
+    def test_t6_definitive_invoice_refusals_raise_invoice_not_created(self):
+        not_created = getattr(api, "InvoiceNotCreated", None)
+        for name, outcome, status in [("429 json", RATE_LIMIT, 503), *DEFINITIVE, *NOT_SENT]:
+            with self.subTest(name):
+                error = self.provider_call(outcome)
+                self.assertTrue(not_created is not None and isinstance(error, not_created),
+                                f"{name}: {type(error).__name__} is not lava_client.InvoiceNotCreated")
+                # Code, text and header the user sees stay exactly as before.
+                self.assertEqual((error.status_code, error.detail, error.headers),
+                                 (status, api.PROVIDER_SILENT, {"Retry-After": "60"} if status == 503 else None))
+        with self.subTest("400 incorrect email"):
+            error = self.provider_call(lambda: httpx.Response(400, json={"error": "Incorrect email to purchase"}))
+            self.assertIsInstance(error, api.InvoiceEmailRejected)
+            self.assertEqual(error.status_code, 422)
+            self.assertTrue(not_created is not None and issubclass(api.InvoiceEmailRejected, not_created),
+                            "InvoiceEmailRejected must be a kind of InvoiceNotCreated")
+
+    def test_t6_unclear_outcomes_and_other_operations_stay_plain_errors(self):
+        # Guard (green on 1c6bb25): an invoice may exist, or the call is not an invoice creation.
+        not_created = getattr(api, "InvoiceNotCreated", None)
+
+        def plain(error):
+            return not_created is None or not isinstance(error, not_created)
+        for name, outcome, status in UNCLEAR + CONTRADICTORY:
+            with self.subTest("invoice_create " + name):
+                error = self.provider_call(outcome)
+                self.assertTrue(plain(error), f"{name}: an unclear outcome must not release the attempt")
+                self.assertEqual((error.status_code, error.detail), (status, api.PROVIDER_SILENT))
+        for operation, method, path in (("invoice_read", "GET", "/api/v2/invoices/" + CONTRACT),
+                                        ("catalog_read", "GET", "/api/v2/products?showAllSubscriptionPeriods=true"),
+                                        ("subscription_cancel", "DELETE", "/api/v1/subscriptions")):
+            for name, outcome, status in (("429", RATE_LIMIT, 503), ("403", json_refusal(403), 502), NOT_SENT[0]):
+                with self.subTest(operation + " " + name):
+                    error = self.provider_call(outcome, method, path)
+                    self.assertTrue(plain(error), f"{operation} {name}: only invoice_create is classified")
+                    self.assertEqual((error.status_code, error.detail), (status, api.PROVIDER_SILENT))
+
+
+# --- PAY-LAVA-STUCK outcome tables (DESIGN §2). Factories: every use gets a fresh response or exception. ---
+def json_refusal(status, **body):
+    return lambda: httpx.Response(status, json={"error": "synthetic refusal", **body})
+
+
+def invoice_201(**changes):
+    body = {"id": str(uuid4()), "paymentUrl": "https://pay.example.test/orphan",
+            "amountTotal": {"amount": 799, "currency": "RUB"}}
+    body.update(changes)
+    return httpx.Response(201, json={k: v for k, v in body.items() if v is not None})
+
+
+def RATE_LIMIT():
+    return httpx.Response(429, json={})
+
+
+# Definitive refusal: a full 4xx answer without `id` and `paymentUrl` (third column: our API status).
+DEFINITIVE = [("400 other validation", lambda: httpx.Response(400, json={"error": "Other validation failure"}), 502),
+              *[(str(status), json_refusal(status), 502) for status in (401, 403, 404, 405, 406, 408, 409, 410, 422)],
+              ("429 html", lambda: httpx.Response(429, html="<html><body>Too Many Requests</body></html>"), 503)]
+# The connection was never established: Lava received nothing.
+NOT_SENT = [("ConnectError", lambda: httpx.ConnectError("synthetic: connection refused"), 502),
+            ("ConnectTimeout", lambda: httpx.ConnectTimeout("synthetic: connect timeout"), 502)]
+# Unclear outcome raised inside lava_client.request: an invoice may exist.
+UNCLEAR = [*[(str(status), (lambda status=status: httpx.Response(status, json={})), 502) for status in (500, 502, 503, 504)],
+           ("302", lambda: httpx.Response(302, headers={"Location": "https://gate.lava.top/elsewhere"}), 502),
+           ("200 not json", lambda: httpx.Response(200, content=b"not json"), 502),
+           ("200 list", lambda: httpx.Response(200, json=[]), 502),
+           ("ReadTimeout", lambda: httpx.ReadTimeout("synthetic: read timeout"), 502),
+           ("WriteTimeout", lambda: httpx.WriteTimeout("synthetic: write timeout"), 502),
+           ("ReadError", lambda: httpx.ReadError("synthetic: read error"), 502),
+           ("WriteError", lambda: httpx.WriteError("synthetic: write error"), 502),
+           ("RemoteProtocolError", lambda: httpx.RemoteProtocolError("synthetic: closed after send"), 502)]
+# Unclear outcome detected by create_checkout after request() returned.
+BODY_UNCLEAR = [("201 without paymentUrl", lambda: invoice_201(paymentUrl=None), 502),
+                ("201 amount 1", lambda: invoice_201(amountTotal={"amount": 1, "currency": "RUB"}), 502),
+                ("204", lambda: httpx.Response(204), 502)]
+# A 4xx that names an invoice contradicts itself: it stays an unclear outcome.
+CONTRADICTORY = [("400 with id", lambda: httpx.Response(400, json={"error": "Other validation failure", "id": str(uuid4())}), 502),
+                 ("429 with paymentUrl", lambda: httpx.Response(429, json={"paymentUrl": "https://pay.example.test/orphan"}), 503),
+                 ("403 with id", lambda: json_refusal(403, id=str(uuid4()))(), 502)]
+
+
+class LavaInvoiceRefusalTests(unittest.TestCase):
+    """PAY-LAVA-STUCK T1-T5 (tasks/PAY-LAVA-STUCK/DESIGN.md §5): the endpoint over the real
+    lava_client.request and a synthetic Lava. User 2 pays: user 1 already has the `bound` attempt."""
+    tearDown = fixtures.MyChartsTests.tearDown
+    provider = LavaTests.provider
+
+    def setUp(self):
+        LavaTests.setUp(self)
+        self.network.side_effect = REAL_LAVA_REQUEST
+
+    def attempts(self):
+        with self.sessions() as db:
+            rows = db.query(LavaCheckout).filter_by(user_id=2).all()
+            return sorted(((c.state, c.contract_id, c.payment_url) for c in rows), key=lambda row: row[0])
+
+    def pay_twice(self, first):
+        with self.sessions() as db:  # clean state for every case
+            db.query(LavaCheckout).filter_by(user_id=2).delete()
+            db.commit()
+            self.assertEqual(db.get(User, 2).plan, "free")
+        script = InvoiceScript(first, products=self.catalog)
+        with script.installed():
+            one = self.client.post("/payments/lava/checkout", headers=self.other)
+            after_one = self.attempts()
+            two = self.client.post("/payments/lava/checkout", headers=self.other)
+        return script, one, after_one, two
+
+    def assert_closed_then_paid(self, first, status):
+        script, one, after_one, two = self.pay_twice(first)
+        self.assertEqual(one.status_code, status, one.text)
+        self.assertEqual(one.json()["detail"], api.PROVIDER_SILENT)
+        self.assertEqual(one.headers.get("retry-after"), "60" if status == 503 else None)
+        # Red on 1c6bb25: the attempt stays `creating` and the next payment gets 409 forever.
+        self.assertEqual((after_one, two.status_code), ([("rejected", None, None)], 200), two.text)
+        self.assertEqual(two.json()["url"], "https://pay.example.test/invoice/2")
+        self.assertEqual(script.posts, 2)  # the second POST is the user's new click, not a retry
+        self.assertEqual([row[0] for row in self.attempts()], ["ready", "rejected"])
+        with self.sessions() as db:
+            self.assertEqual(db.get(User, 2).plan, "free")  # Premium only after a verified webhook
+
+    def assert_still_blocked(self, first, status):
+        script, one, after_one, two = self.pay_twice(first)
+        self.assertEqual(one.status_code, status, one.text)
+        self.assertEqual((after_one, two.status_code), ([("creating", None, None)], 409), two.text)
+        self.assertEqual(two.json()["detail"], billing.CHECKOUT_PENDING)
+        self.assertEqual(script.posts, 1)
+
+    def test_t1_rate_limit_closes_attempt_and_next_payment_opens(self):
+        self.assert_closed_then_paid(RATE_LIMIT, 503)
+
+    def test_t2_definitive_4xx_closes_attempt_and_next_payment_opens(self):
+        for name, first, status in DEFINITIVE:
+            with self.subTest(name):
+                self.assert_closed_then_paid(first, status)
+
+    def test_t3_connection_not_established_closes_attempt_and_next_payment_opens(self):
+        for name, first, status in NOT_SENT:
+            with self.subTest(name):
+                self.assert_closed_then_paid(first, status)
+
+    def test_t4_unclear_outcome_still_blocks_until_reconciled(self):
+        for name, first, status in UNCLEAR + BODY_UNCLEAR:
+            with self.subTest(name):
+                self.assert_still_blocked(first, status)
+
+    def test_t5_4xx_naming_an_invoice_still_blocks(self):
+        for name, first, status in CONTRADICTORY:
+            with self.subTest(name):
+                self.assert_still_blocked(first, status)
