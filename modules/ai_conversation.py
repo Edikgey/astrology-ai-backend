@@ -1,6 +1,7 @@
 """Bounded rolling memory. Network work produces a candidate, never a DB commit."""
 from dataclasses import dataclass
 import json
+import os
 from jiter import from_json
 from fastapi import HTTPException
 from openai import LengthFinishReasonError, ContentFilterFinishReasonError
@@ -25,6 +26,8 @@ MAX_SUMMARY_CALLS = 2
 MAX_INPUT_BUDGET = 64000
 ANSWER_TOKENS = 2000
 SUMMARY_TOKENS = 900
+REASONING_EXTRA_TOKENS = 2000  # hidden reasoning shares the completion ceiling
+SAMPLING_PARAMS = ('temperature', 'top_p', 'presence_penalty', 'frequency_penalty')
 
 ANSWER_FORMAT = {
     'type': 'json_schema',
@@ -56,6 +59,18 @@ class AnswerCut(HTTPException):
     def __init__(self, outcome, output_tokens=None):
         super().__init__(502, TRUNCATED_TEXT if outcome == 'truncated' else FILTERED_TEXT)
         self.outcome, self.output_tokens = outcome, output_tokens
+
+
+def provider_params(params, ceiling):
+    """Provider arguments for one call, read from the environment at call time.
+    OPENAI_REASONING_EFFORT set -> reasoning mode: no sampling parameters (reasoning
+    models reject them), reasoning_effort passed through, ceiling raised unless 'none'."""
+    effort = os.getenv('OPENAI_REASONING_EFFORT', '').strip()
+    if not effort:
+        return {**params, 'max_completion_tokens': ceiling}
+    kept = {key: value for key, value in params.items() if key not in SAMPLING_PARAMS}
+    extra = 0 if effort == 'none' else REASONING_EXTRA_TOKENS
+    return {**kept, 'reasoning_effort': effort, 'max_completion_tokens': ceiling + extra}
 
 
 def message_size(message):
@@ -203,7 +218,7 @@ def prepare_answer(db, user_id, chart_id, question, client, params, *, relations
         if len(summary_payload.encode('utf-8')) > SUMMARY_INPUT_BUDGET:
             raise HTTPException(422, "Старая история превышает бюджет summary; требуется проверка чата.")
         response = client.chat.completions.create(
-            model=params['model'], temperature=0.2, max_tokens=SUMMARY_TOKENS,
+            **provider_params({'model': params['model'], 'temperature': 0.2}, SUMMARY_TOKENS),
             messages=[{'role': 'system', 'content': summary_prompt},
                       {'role': 'user', 'content': summary_payload}])
         spent = token_metadata(response, params['model'])
@@ -237,7 +252,7 @@ def prepare_answer(db, user_id, chart_id, question, client, params, *, relations
 
 def generate_answer(db, user_id, chart_id, question, client, params, *, relationship_id=None):
     messages, update, summary_usage = prepare_answer(db, user_id, chart_id, question, client, params, relationship_id=relationship_id)
-    response = client.chat.completions.create(**params, max_tokens=ANSWER_TOKENS, messages=messages,
+    response = client.chat.completions.create(**provider_params(params, ANSWER_TOKENS), messages=messages,
                                               response_format=ANSWER_FORMAT)
     answer, suggestions = answer_parts(response_text(response), question)
     return AIAnswer(answer, metadata=token_metadata(response, params['model']), memory_update=update,
@@ -250,7 +265,7 @@ def stream_answer(db, user_id, chart_id, question, client, params, *, relationsh
     emitted = ''
     try:
         with client.beta.chat.completions.stream(
-                **params, max_tokens=ANSWER_TOKENS, messages=messages, response_format=ANSWER_FORMAT,
+                **provider_params(params, ANSWER_TOKENS), messages=messages, response_format=ANSWER_FORMAT,
                 stream_options={'include_usage': True}) as stream:
             for event in stream:
                 if event.type != 'content.delta':
