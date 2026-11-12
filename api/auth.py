@@ -20,7 +20,7 @@ from starlette import status
 from modules.migration import migrate_guest_data_to_user
 from models.user import GoogleLogin
 from services.google_identity import verify_google_credential
-from sqlalchemy import func, inspect
+from sqlalchemy import func, inspect, or_
 import secrets
 from modules.auth_origins import AUTH_ORIGINS
 from modules.security_limits import enforce
@@ -60,6 +60,29 @@ def create_access_token(data: dict, expires_delta=None):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+# New accounts and codes are stored as email.lower() (as Google sign-in already does);
+# accounts created earlier keep the spelling they were registered with.
+DUPLICATE_EMAIL = "Этот email уже зарегистрирован. Войдите или восстановите пароль."
+
+
+def email_taken(db: Session, email: str) -> bool:
+    # Plain equality only: '_' and '%' are valid in an address, so like/ilike would match
+    # other accounts. The exact comparison also covers capitals the database lower() keeps.
+    return db.query(User.id).filter(
+        or_(User.email == email, func.lower(User.email) == email.lower())
+    ).first() is not None
+
+
+def user_for_login(db: Session, email: str) -> Optional[User]:
+    # The exact spelling wins, so every account that signs in today keeps its id. Otherwise
+    # only a single case-insensitive match is used; an ambiguous address selects nobody.
+    user = db.query(User).filter(User.email == email).first()
+    if user is None:
+        matches = db.query(User).filter(func.lower(User.email) == email.lower()).limit(2).all()
+        user = matches[0] if len(matches) == 1 else None
+    return user
+
+
 @router.post("/request-register")
 async def request_register(
     user_data: UserCreate,
@@ -67,30 +90,29 @@ async def request_register(
     db: Session = Depends(get_db)
 ):
     enforce(db, request, 'register', email=str(user_data.email))
-    # 🔒 Проверяем, существует ли пользователь
-    existing_user = db.query(User).filter(User.email == user_data.email).first()
-    if existing_user:
-        raise HTTPException(status_code=400, detail="❌ Пользователь с таким email уже зарегистрирован. Попробуйте войти.")
+    if email_taken(db, str(user_data.email)):
+        raise HTTPException(status_code=400, detail=DUPLICATE_EMAIL)
+    email = str(user_data.email).lower()
 
     # 📩 Генерация и сохранение кода
     code = str(100000 + secrets.randbelow(900000))
     expires_at = datetime.utcnow() + timedelta(minutes=10)
 
     # Удаляем предыдущие коды
-    db.query(EmailVerificationCode).filter(EmailVerificationCode.email == user_data.email).delete()
+    db.query(EmailVerificationCode).filter(EmailVerificationCode.email == email).delete()
     db.add(EmailVerificationCode(
-        email=user_data.email,
+        email=email,
         code=code,
         expires_at=expires_at
     ))
     db.commit()
 
     try:
-        await send_confirmation_email(user_data.email, code)
+        await send_confirmation_email(email, code)
     except EmailDeliveryError:
         # Do not leave an undelivered code usable, or remove a newer request's code.
         db.query(EmailVerificationCode).filter(
-            EmailVerificationCode.email == user_data.email,
+            EmailVerificationCode.email == email,
             EmailVerificationCode.code == code,
             EmailVerificationCode.expires_at == expires_at,
         ).delete()
@@ -109,14 +131,18 @@ def verify_code(
 ):
     enforce(db, request, 'verify', email=str(user_data.email))
     code = user_data.code if user_data.code is not None else code
+    email = str(user_data.email).lower()
     record = db.query(EmailVerificationCode).filter(
-        EmailVerificationCode.email == user_data.email
+        EmailVerificationCode.email == email
     ).first()
 
     if not record or record.code != code or record.expires_at < datetime.utcnow() or record.used:
         raise HTTPException(status_code=400, detail="Неверный или просроченный код")
+    # Up to 10 minutes pass between the code request and this point.
+    if email_taken(db, str(user_data.email)):
+        raise HTTPException(status_code=400, detail=DUPLICATE_EMAIL)
 
-    user = User(email=user_data.email, password_hash=get_password_hash(user_data.password))
+    user = User(email=email, password_hash=get_password_hash(user_data.password))
     db.add(user)
 
     try:
@@ -129,8 +155,10 @@ def verify_code(
         access_token = create_access_token(data={"sub": str(user.id), "ver": user.auth_version})
         db.commit()
     except IntegrityError:
+        # A concurrent registration of the same address won ix_users_email. Drop the
+        # database message: it contains the address.
         db.rollback()
-        raise HTTPException(status_code=400, detail="Email уже зарегистрирован")
+        raise HTTPException(status_code=400, detail=DUPLICATE_EMAIL) from None
     except Exception:
         db.rollback()
         raise
@@ -148,7 +176,7 @@ def login(
     db: Session = Depends(get_db)
 ):
     enforce(db, request, 'login', email=str(credentials.email))
-    user = db.query(User).filter(User.email == credentials.email).first()
+    user = user_for_login(db, str(credentials.email))
     if not user or not verify_password(credentials.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Неверный email или пароль")
 
