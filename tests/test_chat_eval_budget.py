@@ -121,7 +121,7 @@ class BudgetTests(unittest.TestCase):
         for line in self.ledger.read_text(encoding="utf-8").splitlines():
             self.assertLess(len(line), 300)
             self.assertEqual(set(json.loads(line)) - {"ev", "id", "kind", "config", "q", "model", "worst_usd", "cost_usd",
-                                                      "basis", "outcome"}, set())
+                                                      "basis", "outcome", "provider"}, set())
 
 
 class MeteredClientTests(unittest.TestCase):

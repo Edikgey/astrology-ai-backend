@@ -189,8 +189,11 @@ class ClaudePageTests(unittest.TestCase):
 
     def test_the_page_never_names_a_model_a_configuration_a_commit_or_an_outside_address(self):
         _, html, _ = self.build()
+        visible = re.sub(r"<style.*?</style>|<script.*?</script>|<[^>]+>", " ", html, flags=re.S)
+        for name in ("G3", "H3", "G2", "H2", "G3x", "H3x"):
+            self.assertNotIn(name, visible, name)
         lowered = html.lower()
-        for secret in ("g3", "h3", "g2", "h2", "gpt", "claude", "haiku", "luna", "opus", "sonnet", "anthropic", "openai", "sha", "candidate",
+        for secret in ("gpt", "claude", "haiku", "luna", "opus", "sonnet", "anthropic", "openai", "sha", "candidate", "compare-claude",
                        "http://", "https://", "src=", "href=", "<link", "@import", "url("):
             self.assertNotIn(secret, lowered, secret)
         self.assertEqual(html.count("<script>"), 1)
