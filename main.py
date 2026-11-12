@@ -32,6 +32,13 @@ def public_config(response: Response):
     return {"free_beta_enabled": free_beta_enabled()}
 
 
+@api_app.get("/health")
+async def health(response: Response):
+    # Liveness only: no database, no auth, no version or environment details.
+    response.headers["Cache-Control"] = "no-store"
+    return {"status": "ok"}
+
+
 FIELD_MESSAGES = {
     "email": "Введите email в формате name@example.com.",
     "code": "Введите 6 цифр кода из письма.",
