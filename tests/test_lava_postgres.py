@@ -3,15 +3,19 @@ import os
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from threading import Barrier
+from threading import Barrier, Event
 from unittest.mock import patch
 
+import httpx
+from fastapi import HTTPException
 from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError
 import test_postgres_usage as pg
 from database.queries import User, BillingEvent, LavaCheckout, GPTUsage
 from modules import lava_billing as billing
-from test_lava import OFFER, PRODUCT, CONTRACT, ENV, iso
+from test_lava import OFFER, PRODUCT, CONTRACT, ENV, iso, InvoiceScript
+
+WAIT = 5  # seconds: every barrier/event wait is bounded; a broken ordering fails, it never hangs
 
 
 @unittest.skipUnless(os.getenv("USAGE_TEST_POSTGRES_URL"), "Local PostgreSQL test URL not configured")
@@ -149,3 +153,81 @@ class LavaPostgresTests(unittest.TestCase):
         self.assertEqual(network.call_count, 1)
         with self.sessions() as db:
             self.assertEqual(db.query(LavaCheckout).filter_by(user_id=2).count(), 1)
+
+    # --- PAY-LAVA-STUCK T8-T10 (tasks/PAY-LAVA-STUCK/DESIGN.md §3 "Гонка двух вкладок", §5) -------------
+    # Real create_checkout + real lava_client.request over httpx.MockTransport; row locks are PostgreSQL's.
+    def pay(self):
+        """One tab of user 2 (other@example.com): (status, detail, headers) of the checkout call."""
+        with self.sessions() as db:
+            try:
+                return 200, billing.create_checkout(db, 2)["url"], None
+            except HTTPException as exc:
+                return exc.status_code, exc.detail, exc.headers
+
+    def attempts(self):
+        with self.sessions() as db:
+            rows = db.query(LavaCheckout).filter_by(user_id=2).all()
+            return sorted(((c.state, c.contract_id, c.payment_url) for c in rows), key=lambda row: row[0])
+
+    def tab_b_during_held_invoice_post(self, outcome):
+        """Tab A is stopped inside its invoice POST (its `creating` row is committed, no lock held);
+        tab B pays; then A gets `outcome`; then tab C pays. Ordering by Events, never by sleep."""
+        self.migrate()
+        posting, release = Event(), Event()
+
+        def hold():
+            posting.set()
+            if not release.wait(WAIT):
+                raise RuntimeError("tab A was never released")
+        script = InvoiceScript(outcome, before_first=hold)
+        with patch.dict(os.environ, ENV), script.installed(), ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                tab_a = pool.submit(self.pay)
+                self.assertTrue(posting.wait(WAIT), "tab A never reached the invoice POST")
+                tab_b = self.pay()
+                posts_while_held = script.posts
+            finally:
+                release.set()
+            a = tab_a.result(timeout=WAIT)
+            after_a = self.attempts()
+            c = self.pay()
+        return script, a, tab_b, posts_while_held, after_a, c
+
+    def test_t8_second_tab_during_refused_invoice_then_new_payment(self):
+        script, a, b, posts_while_held, after_a, c = self.tab_b_during_held_invoice_post(
+            lambda: httpx.Response(429, json={}))
+        self.assertEqual(b, (409, billing.CHECKOUT_PENDING, None))  # B never posts while A's outcome is open
+        self.assertEqual(posts_while_held, 1)
+        self.assertEqual(a, (503, billing.api.PROVIDER_SILENT, {"Retry-After": "60"}))
+        # Red on 1c6bb25: A's attempt stays `creating`, so C gets 409 and no second POST happens.
+        self.assertEqual((after_a, c[0], script.posts), ([("rejected", None, None)], 200, 2), c)
+        self.assertEqual([row[0] for row in self.attempts()], ["ready", "rejected"])
+
+    def test_t9_after_refusal_two_simultaneous_tabs_create_one_invoice(self):
+        self.migrate()
+        script = InvoiceScript(lambda: httpx.Response(429, json={}))
+        barrier = Barrier(2)
+        real_offer = billing.api.verified_offer
+
+        def offer(offer_id):
+            barrier.wait(timeout=WAIT)  # both tabs pass the catalog check before either locks the user
+            return real_offer(offer_id)
+        with patch.dict(os.environ, ENV), script.installed():
+            first = self.pay()
+            with patch.object(billing.api, "verified_offer", side_effect=offer), \
+                    ThreadPoolExecutor(max_workers=2) as pool:
+                results = sorted(status for status, _, _ in pool.map(lambda _: self.pay(), range(2)))
+        self.assertEqual(first[0], 503)
+        # Red on 1c6bb25: both tabs get 409 at reconciliation because the refused attempt is still `creating`.
+        self.assertEqual((results, script.posts), ([200, 409], 2))
+        self.assertEqual([row[0] for row in self.attempts()], ["ready", "rejected"])
+
+    def test_t10_second_tab_during_unclear_invoice_stays_blocked(self):
+        # Guard (green on 1c6bb25): a read timeout after the POST was sent is an unclear outcome.
+        script, a, b, posts_while_held, after_a, c = self.tab_b_during_held_invoice_post(
+            lambda: httpx.ReadTimeout("synthetic: read timeout"))
+        self.assertEqual(b, (409, billing.CHECKOUT_PENDING, None))
+        self.assertEqual(posts_while_held, 1)
+        self.assertEqual(a, (502, billing.api.PROVIDER_SILENT, None))
+        self.assertEqual((after_a, c, script.posts),
+                         ([("creating", None, None)], (409, billing.CHECKOUT_PENDING, None), 1))
