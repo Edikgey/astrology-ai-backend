@@ -222,9 +222,12 @@ def prepare_answer(db, user_id, chart_id, question, client, params, *, relations
             messages=[{'role': 'system', 'content': summary_prompt},
                       {'role': 'user', 'content': summary_payload}])
         spent = token_metadata(response, params['model'])
-        candidate = None if getattr(response.choices[0], 'finish_reason', None) == 'length' else response_text(response)
+        try:
+            candidate = response_text(response)
+        except AnswerCut:   # stopped by length or by the provider filter
+            candidate = None
         if candidate is None or len(candidate.encode('utf-8')) > SUMMARY_BUDGET:
-            # A cut or oversized summary must not block the question: memory stays as it was,
+            # A cut, filtered or oversized summary must not block the question: memory stays as it was,
             # compaction stops for this request and the model is told older history is pending.
             # The call's cost is still recorded, marked as discarded.
             summary_usage.append({**spent, 'discarded': True})
