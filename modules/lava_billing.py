@@ -154,13 +154,13 @@ def create_checkout(db, user_id):
         checkout.contract_id, checkout.payment_url, checkout.state = contract, url, "ready"
         db.commit()
         return {"url": url}
-    except api.InvoiceEmailRejected:
+    except api.InvoiceNotCreated:
         db.rollback()
         if binding:
             locked_user(db, user_id)
             checkout = db.get(LavaCheckout, binding)
             if checkout.state == "creating" and not checkout.contract_id and not checkout.payment_url:
-                # No provider invoice exists; unlike a failed payment, this needs no reconciliation.
+                # Lava refused or the request never left: no invoice exists, so nothing to reconcile.
                 checkout.state = "rejected"
             db.commit()
         raise
