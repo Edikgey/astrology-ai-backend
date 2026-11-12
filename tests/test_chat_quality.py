@@ -570,6 +570,59 @@ class SummaryNeverBlocksTests(ChatQualityBase):
         self.assertEqual(self.used(), (used + 2, 0))
         self.assertEqual(self.snapshot(cid)[1], before[1])
 
+    def test_cq10_summary_stopped_by_the_provider_filter_is_discarded_like_a_cut(self):
+        """Review F1: finish_reason=content_filter on the SUMMARY call must not block the chat (same as length)."""
+        cid = self.chart()
+        self.long_chat(cid)
+        with self.sessions() as db:
+            db.add(GPTConversation(chart_id=cid, user_id=1, summary='Original memory', through_message_id=0)); db.commit()
+        before, (used, _) = self.snapshot(cid), self.used()
+        with self.provider(reply('сводка, остановленная фильтром', finish='content_filter')) as api:
+            response = self.ask(cid)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()['response'], self.ANSWER)
+            self.assertEqual(api.call_count, 2, 'no repeated summary call in one request')
+            note = self.pending_note(api.call_args_list[1].kwargs['messages'])
+        self.assertIn('"older_history_pending":true', note)
+        self.assertIn('Original memory', note)
+        after = self.snapshot(cid)
+        self.assertEqual(after[1], before[1])                               # cursor and summary as before
+        self.assertEqual(after[0][-1], ('gpt', self.ANSWER))
+        self.assertEqual(self.used(), (used + 1, 0))
+        with self.sessions() as db:
+            row = db.query(GPTUsage).filter(GPTUsage.model.is_not(None)).one()
+            self.assertEqual(len(row.summary_usage), 1)
+            self.assertEqual(row.summary_usage[0]['total_tokens'], 168)
+            self.assertIs(row.summary_usage[0].get('discarded'), True)
+        # The next question is not blocked by the same stuck summary either.
+        with self.provider(reply('опять фильтр', finish='content_filter')) as api:
+            second = self.ask(cid, 'А что с работой?')
+            self.assertEqual(second.status_code, 200, second.text)
+            self.assertEqual(api.call_count, 2)
+        self.assertEqual(self.used(), (used + 2, 0))
+        self.assertEqual(self.snapshot(cid)[1], before[1])
+
+    def test_cq10_summary_stopped_by_the_provider_filter_streams_a_done_event(self):
+        cid = self.chart()
+        self.long_chat(cid)
+        with self.sessions() as db:
+            db.add(GPTConversation(chart_id=cid, user_id=1, summary='Original memory', through_message_id=0)); db.commit()
+            rid = usage.reserve(db, 1, cid)
+        before = self.snapshot(cid)
+        def provider(**kwargs):
+            return ProviderStream() if kwargs.get('stream') else reply('сводка, остановленная фильтром', finish='content_filter')
+        with patch('modules.interpretation.client.chat.completions.create', side_effect=provider) as api,                 self.assertLogs(level='WARNING') as logs:
+            events = list(chat_events(self.engine, 1, cid, 'Как мне двигаться дальше?', rid, client, OPENAI_PARAMS))
+        self.assertEqual(events[-1]['type'], 'done', events[-1])
+        self.assertEqual(api.call_count, 2)
+        self.assertEqual(self.snapshot(cid)[1], before[1])
+        with self.sessions() as db:
+            row = db.get(GPTUsage, rid)
+            self.assertEqual(row.status, 'succeeded')
+            self.assertIs(row.summary_usage[0].get('discarded'), True)
+        self.assertEqual(len([r for r in logs.records if 'outcome=summary_degraded' in r.getMessage()]), 1, logs.output)
+        self.assertFalse([r for r in logs.records if 'outcome=filtered' in r.getMessage()])
+
     def test_cq10_summary_without_prior_memory_is_flagged_pending_anyway(self):
         cid = self.chart()
         self.long_chat(cid)
@@ -658,6 +711,28 @@ class MemoryAndJournalTests(ChatQualityBase):
             self.assertNotIn(secret, rendered)
         for private in ('chart_id', 'user_id', f'chart={cid}', 'a@example.test'):
             self.assertNotIn(private, lines[0])
+
+    def test_cq11_stream_ending_with_an_unexpected_finish_reason_logs_interrupted(self):
+        """Review F2: finish_reason that is not stop/length/content_filter (here tool_calls) is an 'interrupted' outcome."""
+        cid = self.chart()
+        with self.sessions() as db:
+            rid = usage.reserve(db, 1, cid)
+        with self.assertLogs(level='WARNING') as logs, patch(
+                'modules.interpretation.client.chat.completions.create', return_value=ProviderStream(finish='tool_calls')):
+            events = list(chat_events(self.engine, 1, cid, self.CANARY_QUESTION, rid, client, OPENAI_PARAMS))
+        self.assertEqual(events[-1]['type'], 'error')
+        self.assertEqual(events[-1]['status'], 502)
+        self.assertTrue(events[-1]['detail'].startswith('Ответ прервался'), events[-1])
+        self.assertNotIn('done', [e['type'] for e in events])
+        with self.sessions() as db:
+            self.assertEqual(db.get(GPTUsage, rid).status, 'released')
+            self.assertEqual(db.query(GPTMessage).filter_by(chart_id=cid).count(), 2)
+        lines = self.outcome_lines(logs)
+        self.assertEqual(len(lines), 1, logs.output)
+        for part in ('AI chat outcome=interrupted', 'subject=natal', 'model=', 'output_tokens=', 'duration_ms='):
+            self.assertIn(part, lines[0])
+        rendered = '\n'.join(logging.Formatter().format(record) + repr(record.args) for record in logs.records)
+        self.assertNotIn(self.CANARY_QUESTION, rendered)
 
     def test_cq11_filtered_answer_has_its_own_outcome_and_a_good_answer_none(self):
         cid = self.chart()
