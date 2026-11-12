@@ -151,10 +151,24 @@ def client_base_url(*, real, dry_url, real_base_url="", provider="openai"):
 KEY_VARIABLES = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
 
 
-def default_key_file(provider="openai"):
-    name = "%s-eval.env" % provider
+def default_secrets_dir():
+    """The owner's real key directory. Only the command-line entry point (cli.main) may ask for it; prepare() and the tests
+    get a directory (or a key file) explicitly, so a test run never reads the real files."""
     root = find_root()
-    return (root / ".secrets" / name) if root else Path.cwd() / ".secrets" / name
+    return (root / ".secrets") if root else Path.cwd() / ".secrets"
+
+
+def default_key_file(provider="openai"):
+    return default_secrets_dir() / ("%s-eval.env" % provider)
+
+
+def key_file_for(provider, key_file=None, secrets_dir=None):
+    """The ONE place that decides which file a key is read from: an explicit file, else <secrets_dir>/<provider>-eval.env, else nothing."""
+    if key_file:
+        return Path(key_file)
+    if not secrets_dir:
+        raise KeyError_("secrets_dir_unset")
+    return Path(secrets_dir) / ("%s-eval.env" % provider)
 
 
 class KeyError_(Exception):

@@ -17,8 +17,8 @@ from pathlib import Path
 
 from .budget import Budget, spent_by_provider
 from .common import (ANTHROPIC_EVAL_LIMIT_USD, ANTHROPIC_JUDGE_MODEL, BUDGET_DEFAULT_USD, CONFIGS, STAND_ANTHROPIC_URL,
-                     STAND_OPENAI_URL, STUB_ANTHROPIC_KEY, STUB_KEY, TOOL_DIR, KeyError_, child_env, client_base_url, default_key_file,
-                     default_tasks_dir, is_loopback_url, load_key, log_event, paid_state_dir, redact, refuse_non_loopback,
+                     STAND_OPENAI_URL, STUB_ANTHROPIC_KEY, STUB_KEY, TOOL_DIR, KeyError_, child_env, client_base_url, default_secrets_dir,
+                     default_tasks_dir, key_file_for, is_loopback_url, load_key, log_event, paid_state_dir, redact, refuse_non_loopback,
                      valid_anthropic_budget, valid_budget)
 from .facts import ChartFacts
 from .judge import run_judge
@@ -45,8 +45,10 @@ def add_common(parser):
     parser.add_argument("--budget-usd", type=float, default=BUDGET_DEFAULT_USD, help="OpenAI hard cap of the whole eval (default 8.5, owner limit 9)")
     parser.add_argument("--anthropic-budget-usd", type=float, default=ANTHROPIC_EVAL_LIMIT_USD,
                         help="Anthropic hard cap of the whole eval (default 9.5, credits 10); 0 means the owner named no sum: no paid call")
-    parser.add_argument("--key-file", default=None, help="OpenAI key file (default .secrets/openai-eval.env)")
-    parser.add_argument("--anthropic-key-file", default=None, help="Anthropic key file (default .secrets/anthropic-eval.env)")
+    parser.add_argument("--secrets-dir", default=None,
+                        help="folder with openai-eval.env and anthropic-eval.env (paid mode; default: the owner's .secrets folder, applied by the command line only)")
+    parser.add_argument("--key-file", default=None, help="OpenAI key file (default <secrets-dir>/openai-eval.env)")
+    parser.add_argument("--anthropic-key-file", default=None, help="Anthropic key file (default <secrets-dir>/anthropic-eval.env)")
     parser.add_argument("--base-url", default=STAND_OPENAI_URL, help="dry mode: the loopback OpenAI stand-in")
     parser.add_argument("--anthropic-base-url", default=STAND_ANTHROPIC_URL, help="dry mode: the loopback Anthropic stand-in (port 8102)")
     parser.add_argument("--real-base-url", default="",
@@ -136,6 +138,7 @@ def prepare(args):
         if url and not is_loopback_url(url):
             refuse("real_base_url_must_be_loopback")
     need_openai, need_anthropic = needs_openai(args), needs_anthropic(args)
+    secrets_dir = getattr(args, "secrets_dir", None)     # explicit; the real default is applied by main() only
     if args.real:
         if need_anthropic:                       # the cap is checked before any key file is looked for
             if not valid_anthropic_budget(anthropic_cap):
@@ -147,9 +150,9 @@ def prepare(args):
             os.environ.pop("ANTHROPIC_BASE_URL", None)
         try:
             if need_openai:
-                load_key(args.key_file or default_key_file(), "OPENAI_API_KEY")
+                load_key(key_file_for("openai", getattr(args, "key_file", None), secrets_dir), "OPENAI_API_KEY")
             if need_anthropic:
-                load_key(getattr(args, "anthropic_key_file", None) or default_key_file("anthropic"), "ANTHROPIC_API_KEY")
+                load_key(key_file_for("anthropic", getattr(args, "anthropic_key_file", None), secrets_dir), "ANTHROPIC_API_KEY")
         except KeyError_ as error:
             refuse(str(error))
     else:
@@ -472,6 +475,8 @@ def main(argv=None):
         if args.real:
             refuse("cycle_is_dry_only")
         args.configs = args.configs or V2_CONFIGS
+    if args.real and not args.secrets_dir:
+        args.secrets_dir = str(default_secrets_dir())        # the only place that names the real key folder
     run_dir, ledger = prepare(args)
     with RunLock(ledger, args.real and args.command != "report"):
         if args.command == "probe":
