@@ -24,6 +24,15 @@ from modules.plans import effective_plan
 
 logger = logging.getLogger(__name__)
 
+# Refusal texts. While a payment outcome is unknown, never invite another attempt.
+CHECKOUT_PENDING = ("Проверяем оплату. Не оплачивайте повторно — обновите страницу через минуту. "
+                    "Если сообщение повторится, напишите в поддержку: lunariaai.support@gmail.com.")
+CHECKOUT_UNKNOWN = ("Не удалось открыть или проверить оплату. Не оплачивайте повторно — обновите страницу через минуту. "
+                    "Если ошибка повторится, напишите в поддержку: lunariaai.support@gmail.com.")
+CHECKOUT_MANUAL = ("Прошлую оплату нужно проверить вручную. Не оплачивайте повторно — напишите в поддержку: "
+                   "lunariaai.support@gmail.com.")
+STRIPE_UNAVAILABLE = "Stripe сейчас недоступен. Попробуйте позже."
+
 
 def log_checkout_failure(stage, error):
     # No provider messages, request bodies, emails, keys, or client secrets.
@@ -72,7 +81,7 @@ def config():
             or not re.fullmatch(r"acct_[A-Za-z0-9]+", account)
             or not re.fullmatch(r"price_[A-Za-z0-9]+", price)
             or os.getenv("STRIPE_API_VERSION", API_VERSION) != API_VERSION):
-        raise HTTPException(503, "Stripe LIVE billing is not configured")
+        raise HTTPException(503, STRIPE_UNAVAILABLE)
     return account, price
 
 
@@ -88,7 +97,7 @@ def return_url(name):
     value = os.getenv(name, "")
     parts = urlsplit(value)
     if parts.scheme != "https" or parts.hostname != "mylunariaai.com" or parts.username or parts.password or parts.port:
-        raise HTTPException(503, "Stripe return URL is not configured")
+        raise HTTPException(503, STRIPE_UNAVAILABLE)
     return value
 
 
@@ -99,9 +108,9 @@ def api():
     try:
         actual = client.raw_request("get", "/v1/account").data
         if actual["id"] != account:
-            raise HTTPException(503, "Stripe account mismatch")
+            raise HTTPException(503, STRIPE_UNAVAILABLE)
     except stripe.StripeError:
-        raise HTTPException(503, "Stripe account verification unavailable") from None
+        raise HTTPException(503, STRIPE_UNAVAILABLE) from None
     return client.v1
 
 
@@ -130,11 +139,14 @@ def verify_signature(body, headers):
 def eligible_checkout(db, user):
     release_legacy_unpaid_owner(db, user)
     if user.payment_provider not in (None, "stripe"):
-        raise HTTPException(409, "Account billing belongs to another provider")
+        raise HTTPException(409, ("Подписка этого аккаунта оформлена через Lava.top, поэтому оплата через Stripe недоступна. "
+                                 "Чтобы сменить способ оплаты, напишите в поддержку: lunariaai.support@gmail.com."))
     if effective_plan(user) == "premium" or user.subscription_status in ("active", "past_due", "paused", "trialing", "unpaid", "incomplete"):
-        raise HTTPException(409, "Manage your existing subscription before purchasing again")
+        raise HTTPException(409, ("У аккаунта уже есть подписка или незавершённая оплата. Не оплачивайте повторно — "
+                                 "обновите страницу через минуту. Если Premium не появится, напишите в поддержку: "
+                                 "lunariaai.support@gmail.com."))
     if user.provider_subscription_id and user.subscription_status != "canceled":
-        raise HTTPException(409, "Existing subscription requires reconciliation")
+        raise HTTPException(409, CHECKOUT_MANUAL)
 
 
 def validate_price(value, *, checkout=True):
@@ -144,19 +156,19 @@ def validate_price(value, *, checkout=True):
     if (value["id"] != price_id or (checkout and not value.get("active")) or value.get("currency") != "usd"
             or value.get("unit_amount") != 999 or recurring.get("interval") != "month"
             or recurring.get("interval_count") != 1 or recurring.get("usage_type") != "licensed"):
-        raise HTTPException(503, "Stripe Premium price requires review")
+        raise HTTPException(503, STRIPE_UNAVAILABLE)
 
 
 def session_response(session):
     session = checked(session)
     if session.get("status") != "open" or not session.get("client_secret"):
-        raise HTTPException(409, "Checkout is awaiting confirmation; refresh account usage")
+        raise HTTPException(409, CHECKOUT_PENDING)
     return {"session_id": session["id"], "client_secret": session["client_secret"]}
 
 
 def create_checkout(db, user_id):
     if not configured():
-        raise HTTPException(503, "Stripe checkout is not enabled")
+        raise HTTPException(503, STRIPE_UNAVAILABLE)
     account, price = config()
     stage = "account_read"
     try:
@@ -180,13 +192,13 @@ def create_checkout(db, user_id):
             eligible_checkout(db, user)
             intent = db.query(StripeCheckout).filter_by(session_id=saved_id).one()
             if intent.state != "ready" or intent.subscription_id:
-                raise HTTPException(409, "Checkout is being confirmed")
+                raise HTTPException(409, CHECKOUT_PENDING)
             intent.state = "expired"
             db.flush()
             intent = None
         if intent and intent.created_at < datetime.utcnow() - timedelta(hours=23):
             # Stripe retains idempotency keys for at least 24h, not indefinitely.
-            raise HTTPException(409, "Ambiguous checkout needs support reconciliation")
+            raise HTTPException(409, CHECKOUT_MANUAL)
         customer = db.query(BillingCustomer).filter_by(user_id=user_id, provider="stripe", account_id=account, livemode=True).first()
         if customer is None:
             customer = BillingCustomer(user_id=user_id, provider="stripe", account_id=account, livemode=True)
@@ -196,7 +208,7 @@ def create_checkout(db, user_id):
             db.add(intent); db.flush()
         binding, customer_binding, customer_id, email = intent.id, customer.id, customer.customer_id, user.email
         if not customer_id and customer.created_at < datetime.utcnow() - timedelta(hours=23):
-            raise HTTPException(409, "Ambiguous customer needs support reconciliation")
+            raise HTTPException(409, CHECKOUT_MANUAL)
         db.commit()
         if not customer_id:
             stage = "customer_create"
@@ -236,13 +248,13 @@ def create_checkout(db, user_id):
     except Exception as error:
         db.rollback()
         log_checkout_failure(stage, error)
-        raise HTTPException(502, "Unable to confirm checkout; retry the same checkout or contact support") from None
+        raise HTTPException(502, CHECKOUT_UNKNOWN) from None
 
 
 def checkout_status(db, user_id, session_id):
     account, _ = config()
     intent = db.query(StripeCheckout).filter_by(user_id=user_id, account_id=account, livemode=True, session_id=session_id).first()
-    if intent is None: raise HTTPException(404, "Checkout not found")
+    if intent is None: raise HTTPException(404, "Оплата не найдена. Обновите страницу.")
     return {"state": intent.state}
 
 
@@ -266,11 +278,12 @@ def create_portal(db, user_id):
     user = db.get(User, user_id)
     customer_id = portal_customer_id(db, user)
     if not customer_id:
-        raise HTTPException(409, "Для этого аккаунта нет действующей подписки Stripe.")
+        raise HTTPException(409, ("У аккаунта нет действующей подписки Stripe. Обновите страницу; "
+                                 "если подписка оплачена, напишите в поддержку: lunariaai.support@gmail.com."))
     subscription_id = user.provider_subscription_id
     db.rollback()
     configuration = os.getenv("STRIPE_PORTAL_CONFIGURATION_ID", "")
-    if not configuration.startswith("bpc_"): raise HTTPException(503, "Управление подпиской временно недоступно.")
+    if not configuration.startswith("bpc_"): raise HTTPException(503, "Управление подпиской временно недоступно. Попробуйте позже.")
     try:
         client = api()
         subscription = checked(client.subscriptions.retrieve(subscription_id))

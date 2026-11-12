@@ -63,6 +63,8 @@ def create_access_token(data: dict, expires_delta=None):
 # New accounts and codes are stored as email.lower() (as Google sign-in already does);
 # accounts created earlier keep the spelling they were registered with.
 DUPLICATE_EMAIL = "Этот email уже зарегистрирован. Войдите или восстановите пароль."
+GUEST_SESSION = "Не удалось распознать гостевую сессию. Обновите страницу и попробуйте снова."
+RESET_LINK_INVALID = "Ссылка недействительна или срок её действия истёк. Запросите новую ссылку."
 
 
 def email_taken(db: Session, email: str) -> bool:
@@ -137,7 +139,7 @@ def verify_code(
     ).first()
 
     if not record or record.code != code or record.expires_at < datetime.utcnow() or record.used:
-        raise HTTPException(status_code=400, detail="Неверный или просроченный код")
+        raise HTTPException(status_code=400, detail="Неверный или просроченный код. Проверьте код из письма или запросите новый.")
     # Up to 10 minutes pass between the code request and this point.
     if email_taken(db, str(user_data.email)):
         raise HTTPException(status_code=400, detail=DUPLICATE_EMAIL)
@@ -178,7 +180,7 @@ def login(
     enforce(db, request, 'login', email=str(credentials.email))
     user = user_for_login(db, str(credentials.email))
     if not user or not verify_password(credentials.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Неверный email или пароль")
+        raise HTTPException(status_code=401, detail="Неверный email или пароль. Проверьте данные или восстановите пароль.")
 
     session_token = request.headers.get("X-Session-Token")
     session_token_uuid = None
@@ -188,7 +190,7 @@ def login(
         except ValueError:
             raise HTTPException(
                 status_code=400,
-                detail="Некорректный X-Session-Token"
+                detail=GUEST_SESSION
             )
 
     try:
@@ -210,15 +212,15 @@ def google_login(credentials: GoogleLogin, request: Request, db: Session = Depen
     # GIS popup callback sends JSON, not Google's form-post/redirect flow. Reject
     # cross-site login CSRF explicitly; no cookies or application JWT are trusted here.
     if request.headers.get("origin") not in AUTH_ORIGINS:
-        raise HTTPException(403, detail="Недопустимый источник входа Google.")
+        raise HTTPException(403, detail="Вход через Google работает только на сайте mylunariaai.com. Откройте сайт и войдите снова.")
     if request.headers.get("content-type", "").split(";")[0].strip() != "application/json":
-        raise HTTPException(415, detail="Требуется JSON.")
+        raise HTTPException(415, detail="Не удалось обработать вход через Google. Обновите страницу и попробуйте снова.")
     enforce(db, request, 'google')
     identity = verify_google_credential(credentials.credential, credentials.nonce)
     try:
         session_token = UUID(request.headers["X-Session-Token"]) if request.headers.get("X-Session-Token") else None
     except ValueError:
-        raise HTTPException(400, detail="Некорректный X-Session-Token") from None
+        raise HTTPException(400, detail=GUEST_SESSION) from None
 
     # Uniqueness handles concurrent first sign-ins. Retry the complete transaction
     # once after a competing insert/link commits, re-reading the stable subject.
@@ -236,7 +238,7 @@ def google_login(credentials: GoogleLogin, request: Request, db: Session = Depen
                     if not credentials.password:
                         raise HTTPException(409, detail={"code": "google_link_confirmation_required", "message": "Подтвердите пароль существующего аккаунта, чтобы связать его с Google."})
                     if not verify_password(credentials.password, user.password_hash):
-                        raise HTTPException(401, detail="Не удалось подтвердить пароль существующего аккаунта.")
+                        raise HTTPException(401, detail="Неверный пароль. Введите пароль от вашего аккаунта Lunaria или восстановите его.")
                 if user is None:
                     # Existing schema requires a password hash. Generate an unknown
                     # random password; no password is exposed or assigned to the user.
@@ -274,11 +276,11 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id = int(payload.get("sub"))
     except (JWTError, ValueError, TypeError):
-        raise HTTPException(status_code=401, detail="Невалидный токен")
+        raise HTTPException(status_code=401, detail="Сессия истекла. Войдите в аккаунт снова.")
 
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
-        raise HTTPException(status_code=404, detail="Пользователь не найден")
+        raise HTTPException(status_code=404, detail="Аккаунт не найден. Войдите снова или зарегистрируйтесь.")
     if not current_session(payload, user):
         raise HTTPException(401, detail='Сессия завершена. Войдите в аккаунт заново.')
     return user
@@ -308,13 +310,13 @@ async def get_current_user_or_guest(
         except ValueError:
             raise HTTPException(
                 status_code=400,
-                detail="❌ Некорректный формат session_token"
+                detail=GUEST_SESSION
             )
 
     # 3. Никто
     raise HTTPException(
         status_code=401,
-        detail="❌ Не аутентифицирован (нужен JWT или X-Session-Token)"
+        detail="Войдите в аккаунт или обновите страницу, чтобы продолжить."
     )
 
 @router.get("/me", response_model=UserResponse)
@@ -339,18 +341,17 @@ def reset_password(body: PasswordResetConfirm, request: Request, response: Respo
                    db: Session = Depends(get_db)):
     response.headers['Cache-Control'] = 'no-store'
     enforce(db, request, 'reset_confirm')
-    invalid = 'Ссылка недействительна или срок её действия истёк. Запросите новую ссылку.'
     try:
         token_hash = digest(body.token)
         record = db.query(PasswordReset).filter_by(token_hash=token_hash).first()
         if record is None:
-            raise HTTPException(400, invalid)
+            raise HTTPException(400, RESET_LINK_INVALID)
         # Lock the user before any token: resets with different tokens serialize too.
         user = db.query(User).filter_by(id=record.user_id).with_for_update().first()
         record = db.query(PasswordReset).filter_by(token_hash=token_hash).populate_existing().with_for_update().first()
         if (not user or record is None or record.expires_at <= datetime.utcnow()
                 or record.auth_version != user.auth_version):
-            raise HTTPException(400, invalid)
+            raise HTTPException(400, RESET_LINK_INVALID)
         user.password_hash = get_password_hash(body.password)
         user.auth_version += 1
         db.query(PasswordReset).filter_by(user_id=user.id).delete(synchronize_session=False)

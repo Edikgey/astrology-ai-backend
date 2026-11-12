@@ -22,6 +22,14 @@ EVENTS = {"payment.success", "payment.failed", "subscription.recurring.payment.s
           "subscription.recurring.payment.failed", "subscription.cancelled", "refund.success", "chargeback.initiated"}
 FINANCIAL = {"refund.success", "chargeback.initiated"}
 
+# Refusal texts. While a payment outcome is unknown, never invite another attempt.
+CHECKOUT_PENDING = ("Проверяем оплату. Не оплачивайте повторно — обновите страницу через минуту. "
+                    "Если сообщение повторится, напишите в поддержку: lunariaai.support@gmail.com.")
+CHECKOUT_UNKNOWN = ("Не удалось открыть или проверить оплату. Не оплачивайте повторно — обновите страницу через минуту. "
+                    "Если ошибка повторится, напишите в поддержку: lunariaai.support@gmail.com.")
+HAS_SUBSCRIPTION = ("Оплата в рублях для этого аккаунта недоступна: у него уже есть подписка или оплата через Stripe. "
+                    "Чтобы сменить способ оплаты, напишите в поддержку: lunariaai.support@gmail.com.")
+
 
 def owns_checkout(db, user, checkout):
     # Historical superseded/abandoned attempts are still payable externally.
@@ -72,7 +80,7 @@ def reconcile_checkout(db, user_id):
     binding, contract, buyer = checkout.id, checkout.contract_id, checkout.buyer_email
     db.rollback()
     if not contract:
-        raise HTTPException(409, "Lava ещё не подтвердила создание оплаты. Повторная оплата пока недоступна.")
+        raise HTTPException(409, CHECKOUT_PENDING)
     invoice = api.request("GET", "/api/v2/invoices/" + contract)
     try:
         if api.external_id(invoice["id"]) != contract or invoice["buyer"]["email"] != buyer:
@@ -82,13 +90,13 @@ def reconcile_checkout(db, user_id):
             raise ValueError()
         state = snapshot(SimpleNamespace(contract_id=contract, buyer_email=buyer)) if status == "FAILED" else None
     except (ValueError, KeyError, TypeError, AttributeError, InvalidOperation):
-        raise HTTPException(502, "Не удалось проверить состояние оплаты Lava. Попробуйте позже.") from None
+        raise HTTPException(502, CHECKOUT_UNKNOWN) from None
     user = locked_user(db, user_id)
     checkout = db.get(LavaCheckout, binding)
     db.refresh(checkout)
     if user.plan == "premium" or checkout.paid_at or checkout.state == "completed":
         db.rollback()
-        raise HTTPException(409, "Подписка уже оплачена. Обновите лимиты аккаунта.")
+        raise HTTPException(409, "Подписка уже оплачена — повторная оплата не нужна. Обновите страницу через минуту.")
     if checkout.state not in ("creating", "ready", "failed"):
         db.rollback()
         return
@@ -103,9 +111,9 @@ def reconcile_checkout(db, user_id):
         return
     db.rollback()
     if status == "COMPLETED" or (state and state["paid"]):
-        raise HTTPException(409, "Оплата Lava подтверждается. Обновите лимиты аккаунта перед новой покупкой.")
+        raise HTTPException(409, CHECKOUT_PENDING)
     if checkout.state == "failed" or status == "FAILED":
-        raise HTTPException(409, "Lava ещё подтверждает результат оплаты. Попробуйте снова позже.")
+        raise HTTPException(409, CHECKOUT_PENDING)
 
 
 def create_checkout(db, user_id):
@@ -115,7 +123,7 @@ def create_checkout(db, user_id):
         reconcile_checkout(db, user_id)
         user = locked_user(db, user_id)
         if user.payment_provider not in (None, "lava") or user.plan == "premium" or user.subscription_status in ("active", "past_due", "paused", "trialing"):
-            raise HTTPException(409, "У аккаунта уже есть подписка. Смена провайдера пока недоступна.")
+            raise HTTPException(409, HAS_SUBSCRIPTION)
         old = db.query(LavaCheckout).filter_by(user_id=user_id).order_by(LavaCheckout.created_at.desc()).first()
         if old and old.state in ("creating", "ready"):
             if not old.payment_url:
@@ -128,7 +136,7 @@ def create_checkout(db, user_id):
         # Recheck while locked after catalog HTTP; simultaneous checkouts serialize.
         user = locked_user(db, user_id)
         if user.payment_provider not in (None, "lava") or user.plan == "premium" or user.subscription_status in ("active", "past_due", "paused", "trialing"):
-            raise HTTPException(409, "У аккаунта уже есть подписка.")
+            raise HTTPException(409, HAS_SUBSCRIPTION)
         if db.query(LavaCheckout).filter_by(user_id=user_id).filter(LavaCheckout.state.in_(("creating", "ready"))).first():
             raise HTTPException(409, "Оплата уже создаётся. Обновите страницу.")
         checkout = LavaCheckout(user_id=user_id, offer_id=offer, product_id=product, buyer_email=email)
@@ -372,7 +380,7 @@ def cancel_subscription(db, user_id):
     try:
         user = locked_user(db, user_id)
         if user.payment_provider != "lava" or not user.provider_subscription_id:
-            raise HTTPException(409, "Нет подписки Lava для этого аккаунта.")
+            raise HTTPException(409, "У аккаунта нет подписки через Lava.top — отключать нечего. Обновите страницу.")
         checkout = db.query(LavaCheckout).filter_by(user_id=user_id, contract_id=user.provider_subscription_id).one()
         if checkout.cancel_requested or user.scheduled_cancel_at:
             db.rollback(); return {"pending": True}

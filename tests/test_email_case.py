@@ -28,7 +28,7 @@ PASSWORD = 'Test-password1!'
 OTHER_PASSWORD = 'Other-password2!'
 CODE = '123456'  # 100000 + randbelow() -> randbelow patched to 23456
 DUPLICATE = 'Этот email уже зарегистрирован. Войдите или восстановите пароль.'
-LOGIN_REFUSED = 'Неверный email или пароль'
+LOGIN_REFUSED = 'Неверный email или пароль. Проверьте данные или восстановите пароль.'
 LOG_MARKER = 'be-email-case-log-capture-marker'
 
 

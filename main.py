@@ -1,3 +1,4 @@
+import re
 from fastapi import FastAPI, Response
 from modules.free_beta import free_beta_enabled
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,15 +32,35 @@ def public_config(response: Response):
     return {"free_beta_enabled": free_beta_enabled()}
 
 
+FIELD_MESSAGES = {
+    "email": "Введите email в формате name@example.com.",
+    "code": "Введите 6 цифр кода из письма.",
+    "token": auth.RESET_LINK_INVALID,
+    "X-Session-Token": auth.GUEST_SESSION,
+    "password": "Введите пароль.",
+    "password_confirmation": "Введите подтверждение пароля.",
+}
+VALUE_ERROR_PREFIX = "Value error, "
+
+
+def validation_message(error):
+    # Every message is a fixed string: Pydantic and email_validator texts repeat user input.
+    if error["type"] in ("password_policy", "password_confirmation"):
+        return error["msg"]
+    field = error["loc"][-1] if error["loc"] else None
+    if field in FIELD_MESSAGES:
+        return FIELD_MESSAGES[field]
+    # Our model validators raise fixed Russian texts only; keep it so (no input in them).
+    rest = error["msg"][len(VALUE_ERROR_PREFIX):]
+    if error["type"] == "value_error" and error["msg"].startswith(VALUE_ERROR_PREFIX) and re.search("[А-Яа-яЁё]", rest):
+        return rest
+    return "Проверьте введённые данные и попробуйте ещё раз."
+
+
 @api_app.exception_handler(RequestValidationError)
 async def safe_validation_error(request, exc):
     # Pydantic's default errors include raw input (including passwords/Google tokens).
-    errors = []
-    for error in exc.errors():
-        message = error["msg"]
-        if error["loc"][-1:] in (("password",), ("password_confirmation",)) and error["type"] not in ("password_policy", "password_confirmation"):
-            message = "Введите пароль." if error["loc"][-1] == "password" else "Введите подтверждение пароля."
-        errors.append({"loc": error["loc"], "type": error["type"], "msg": message})
+    errors = [{"loc": error["loc"], "type": error["type"], "msg": validation_message(error)} for error in exc.errors()]
     return JSONResponse(status_code=422, content={"detail": errors})
 
 api_app.include_router(auth.router)
