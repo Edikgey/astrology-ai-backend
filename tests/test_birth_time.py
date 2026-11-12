@@ -156,7 +156,8 @@ class BirthPipelineTests(unittest.TestCase):
             self.assertEqual(data.houses,houses);self.assertEqual(data.house_system,'Placidus')
             with patch('modules.ephemeris.Ephemeris',side_effect=AssertionError('AI must not calculate')):
                 context=json.loads(build_chart_context(db,1,cid))
-            self.assertEqual(context['houses']['cusp_longitudes_deg'],houses)
+            self.assertEqual([c[0] for c in context['houses']['cusps']],[h['symbol'] for h in houses])
+            self.assertEqual(context['houses']['cusps'][0],['1','Овен','20°07′'])
             self.assertEqual(context['birth']['utc'],'1999-12-31T18:30:00Z')
         with patch('api.endpoints.Ephemeris',side_effect=AssertionError('Saved houses must be used')):
             loaded=self.client.get(f'/natal-chart/{cid}',headers=self.owner)
@@ -198,7 +199,7 @@ class BirthPipelineTests(unittest.TestCase):
             db.get(NatalChart,cid).timezone=None;db.commit()
             with patch('modules.ephemeris.swe.houses',side_effect=AssertionError('AI must only read stored data')):
                 context=json.loads(build_chart_context(db,1,cid))
-            self.assertIsNone(context['houses']['cusp_longitudes_deg'])
+            self.assertIsNone(context['houses']['cusps'])
             self.assertIsNone(context['birth']['timezone'])
             self.assertIn('Legacy',context['limitations'])
         response=self.client.get(f'/natal-chart/{cid}',headers=self.owner)
