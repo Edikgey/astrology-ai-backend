@@ -2,6 +2,7 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -18,6 +19,8 @@ from modules.usage import locked_user
 from modules.plans import effective_plan
 from modules.billing_conflicts import conflict_for, record_conflict, locked_billing_user
 
+logger = logging.getLogger(__name__)
+
 EVENTS = {"payment.success", "payment.failed", "subscription.recurring.payment.success",
           "subscription.recurring.payment.failed", "subscription.cancelled", "refund.success", "chargeback.initiated"}
 FINANCIAL = {"refund.success", "chargeback.initiated"}
@@ -29,6 +32,7 @@ CHECKOUT_UNKNOWN = ("Не удалось открыть или проверит�
                     "Если ошибка повторится, напишите в поддержку: lunariaai.support@gmail.com.")
 HAS_SUBSCRIPTION = ("Оплата в рублях для этого аккаунта недоступна: у него уже есть подписка или оплата через Stripe. "
                     "Чтобы сменить способ оплаты, напишите в поддержку: lunariaai.support@gmail.com.")
+NO_LAVA_SUBSCRIPTION = "У аккаунта нет подписки через Lava.top — отключать нечего. Обновите страницу."
 
 
 def owns_checkout(db, user, checkout):
@@ -377,19 +381,56 @@ def process_event(db, body):
 
 
 def cancel_subscription(db, user_id):
+    # cancel_requested means "our DELETE is in flight or Lava accepted it (2xx)". Any other outcome
+    # releases it, so a failed DELETE never leaves the person stuck in "pending" while Lava renews.
     try:
         user = locked_user(db, user_id)
         if user.payment_provider != "lava" or not user.provider_subscription_id:
-            raise HTTPException(409, "У аккаунта нет подписки через Lava.top — отключать нечего. Обновите страницу.")
+            raise HTTPException(409, NO_LAVA_SUBSCRIPTION)
         checkout = db.query(LavaCheckout).filter_by(user_id=user_id, contract_id=user.provider_subscription_id).one()
         if checkout.cancel_requested or user.scheduled_cancel_at:
             db.rollback(); return {"pending": True}
-        contract, email = checkout.contract_id, checkout.buyer_email
-        # Avoid repeating an ambiguous destructive network request automatically.
+        binding, contract, email = checkout.id, checkout.contract_id, checkout.buyer_email
+        db.rollback()
+        # Reconcile by reading before every DELETE: an earlier unclear DELETE may already have cancelled it.
+        value = api.request("GET", "/api/v1/subscriptions/" + contract)
+        try:
+            if api.external_id(value["id"]) != contract:
+                raise ValueError()
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise HTTPException(502, api.PROVIDER_SILENT) from None
+        if value.get("subscriptionStatus") == "CANCELLED" or value.get("cancelledAt") or value.get("terminatedAt"):
+            # Only the verified cancellation webhook writes access and the expiry date.
+            return {"pending": True}
+        # Compare-and-set under the user lock: one claim per contract, so at most one DELETE in flight.
+        user = locked_user(db, user_id)
+        checkout = db.get(LavaCheckout, binding)
+        db.refresh(checkout)
+        if user.payment_provider != "lava" or user.provider_subscription_id != contract:
+            raise HTTPException(409, NO_LAVA_SUBSCRIPTION)
+        if checkout.cancel_requested or user.scheduled_cancel_at:
+            db.rollback(); return {"pending": True}
         checkout.cancel_requested = True
         db.commit()
-        api.request("DELETE", "/api/v1/subscriptions", params={"contractId": contract, "email": email})
+        try:
+            # One attempt, never retried automatically: the outcome may be ambiguous.
+            api.request("DELETE", "/api/v1/subscriptions", params={"contractId": contract, "email": email})
+        except HTTPException:
+            release_cancel_claim(db, user_id, binding)
+            raise
         # Only the verified cancellation lifecycle supplies the actual expiry.
         return {"pending": True}
     except HTTPException:
         db.rollback(); raise
+
+
+def release_cancel_claim(db, user_id, binding):
+    """Drop our claim after a non-2xx DELETE; a failure here never replaces the provider error."""
+    try:
+        locked_user(db, user_id)
+        checkout = db.get(LavaCheckout, binding)
+        db.refresh(checkout)
+        checkout.cancel_requested = False
+        db.commit()
+    except Exception as error:  # the caller rolls back and re-raises the provider error
+        logger.warning("Lava cancel claim not released %s", json.dumps({"exception_class": type(error).__name__}))
