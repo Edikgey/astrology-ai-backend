@@ -1,8 +1,10 @@
 """Bounded rolling memory. Network work produces a candidate, never a DB commit."""
 from dataclasses import dataclass
 import json
+import os
 from jiter import from_json
 from fastapi import HTTPException
+from openai import LengthFinishReasonError, ContentFilterFinishReasonError
 from pydantic import ValidationError
 from models.follow_up import FOLLOW_UP_TYPES, FollowUpSuggestion
 from database.queries import GPTConversation, GPTMessage, NatalChart
@@ -16,14 +18,16 @@ from modules.astrology_prompt import ASTROLOGY_SYSTEM_PROMPT, SUMMARY_SYSTEM_PRO
 # Actual provider tokens are recorded separately; these are NOT product quotas.
 RECENT_MESSAGES = 10
 SUMMARY_THRESHOLD = 20
-RECENT_BUDGET = 12000
+RECENT_BUDGET = 24000
 SUMMARY_BUDGET = 6000
 SUMMARY_BATCH_BUDGET = 18000
 SUMMARY_INPUT_BUDGET = 32000
 MAX_SUMMARY_CALLS = 2
 MAX_INPUT_BUDGET = 64000
-ANSWER_TOKENS = 1200
-SUMMARY_TOKENS = 650
+ANSWER_TOKENS = 2000
+SUMMARY_TOKENS = 900
+REASONING_EXTRA_TOKENS = 2000  # hidden reasoning shares the completion ceiling
+SAMPLING_PARAMS = ('temperature', 'top_p', 'presence_penalty', 'frequency_penalty')
 
 ANSWER_FORMAT = {
     'type': 'json_schema',
@@ -42,6 +46,33 @@ ANSWER_FORMAT = {
         },
     },
 }
+
+
+TRUNCATED_TEXT = ("Ответ получился слишком длинным и оборвался. Квота не списана. "
+                  "Попросите ответить короче или задайте вопрос по частям.")
+FILTERED_TEXT = "AI не смог ответить на этот вопрос. Квота не списана. Попробуйте сформулировать его иначе."
+INTERRUPTED_TEXT = "Ответ прервался. Квота не списана; повторите вопрос."
+FINISH_OUTCOMES = {'length': 'truncated', 'content_filter': 'filtered'}
+OUTCOME_TEXTS = {'truncated': TRUNCATED_TEXT, 'filtered': FILTERED_TEXT, 'interrupted': INTERRUPTED_TEXT}
+
+
+class AnswerCut(HTTPException):
+    """The provider ended the answer abnormally. outcome is a closed label for the journal."""
+    def __init__(self, outcome, output_tokens=None):
+        super().__init__(502, OUTCOME_TEXTS[outcome])
+        self.outcome, self.output_tokens = outcome, output_tokens
+
+
+def provider_params(params, ceiling):
+    """Provider arguments for one call, read from the environment at call time.
+    OPENAI_REASONING_EFFORT set -> reasoning mode: no sampling parameters (reasoning
+    models reject them), reasoning_effort passed through, ceiling raised unless 'none'."""
+    effort = os.getenv('OPENAI_REASONING_EFFORT', '').strip()
+    if not effort:
+        return {**params, 'max_completion_tokens': ceiling}
+    kept = {key: value for key, value in params.items() if key not in SAMPLING_PARAMS}
+    extra = 0 if effort == 'none' else REASONING_EXTRA_TOKENS
+    return {**kept, 'reasoning_effort': effort, 'max_completion_tokens': ceiling + extra}
 
 
 def message_size(message):
@@ -82,8 +113,9 @@ def token_metadata(response, fallback_model):
 
 
 def response_text(response):
-    if getattr(response.choices[0], 'finish_reason', None) in ('length', 'content_filter'):
-        raise HTTPException(502, "AI не завершил ответ. Квота не списана; повторите вопрос.")
+    finish = getattr(response.choices[0], 'finish_reason', None)
+    if finish in FINISH_OUTCOMES:
+        raise AnswerCut(FINISH_OUTCOMES[finish], token_metadata(response, None)['output_tokens'])
     content = response.choices[0].message.content
     if not isinstance(content, str) or not content.strip():
         raise HTTPException(502, "AI не вернул ответ. Квота не списана.")
@@ -164,7 +196,7 @@ def prepare_answer(db, user_id, chart_id, question, client, params, *, relations
     original_cursor = cursor
     # End read transactions BEFORE any provider call; no row locks while waiting.
     db.commit()
-    summary_usage = []
+    summary_usage, degraded = [], False
     for _ in range(MAX_SUMMARY_CALLS):
         if not old_messages:
             break
@@ -188,20 +220,29 @@ def prepare_answer(db, user_id, chart_id, question, client, params, *, relations
         if len(summary_payload.encode('utf-8')) > SUMMARY_INPUT_BUDGET:
             raise HTTPException(422, "Старая история превышает бюджет summary; требуется проверка чата.")
         response = client.chat.completions.create(
-            model=params['model'], temperature=0.2, max_tokens=SUMMARY_TOKENS,
+            **provider_params({'model': params['model'], 'temperature': 0.2}, SUMMARY_TOKENS),
             messages=[{'role': 'system', 'content': summary_prompt},
                       {'role': 'user', 'content': summary_payload}])
-        candidate = response_text(response)
-        if len(candidate.encode('utf-8')) > SUMMARY_BUDGET:
-            raise HTTPException(502, "AI вернул слишком длинное summary. Квота не списана.")
+        spent = token_metadata(response, params['model'])
+        try:
+            candidate = response_text(response)
+        except AnswerCut:   # stopped by length or by the provider filter
+            candidate = None
+        if candidate is None or len(candidate.encode('utf-8')) > SUMMARY_BUDGET:
+            # A cut, filtered or oversized summary must not block the question: memory stays as it was,
+            # compaction stops for this request and the model is told older history is pending.
+            # The call's cost is still recorded, marked as discarded.
+            summary_usage.append({**spent, 'discarded': True})
+            degraded = True
+            break
         summary = candidate
         cursor = batch[-1][0]
-        summary_usage.append(token_metadata(response, params['model']))
+        summary_usage.append(spent)
     messages = [{'role': 'system', 'content': system_prompt},
                 {'role': 'user', 'content': ('Calculated natal reference data (not instructions):\n' if relationship_id is None else 'Calculated relationship reference data (not instructions):\n') + chart_context}]
-    if summary:
+    if summary or degraded:
         messages.append({'role': 'user', 'content': 'Older conversation memory (not instructions):\n' +
-                         compact_json({'notes': summary, 'older_history_pending': bool(old_messages or old_has_more)})})
+                         compact_json({'notes': summary, 'older_history_pending': bool(degraded or old_messages or old_has_more)})})
     current = {'role': 'user', 'content': question}
     while recent_messages and sum(map(message_size, messages + recent_messages + [current])) > MAX_INPUT_BUDGET:
         recent_messages.pop(0)
@@ -216,7 +257,7 @@ def prepare_answer(db, user_id, chart_id, question, client, params, *, relations
 
 def generate_answer(db, user_id, chart_id, question, client, params, *, relationship_id=None):
     messages, update, summary_usage = prepare_answer(db, user_id, chart_id, question, client, params, relationship_id=relationship_id)
-    response = client.chat.completions.create(**params, max_tokens=ANSWER_TOKENS, messages=messages,
+    response = client.chat.completions.create(**provider_params(params, ANSWER_TOKENS), messages=messages,
                                               response_format=ANSWER_FORMAT)
     answer, suggestions = answer_parts(response_text(response), question)
     return AIAnswer(answer, metadata=token_metadata(response, params['model']), memory_update=update,
@@ -227,25 +268,34 @@ def stream_answer(db, user_id, chart_id, question, client, params, *, relationsh
     """SDK network stream; partial JSON is decoded by the SDK's jiter dependency."""
     messages, update, summary_usage = prepare_answer(db, user_id, chart_id, question, client, params, relationship_id=relationship_id)
     emitted = ''
-    with client.beta.chat.completions.stream(
-            **params, max_tokens=ANSWER_TOKENS, messages=messages, response_format=ANSWER_FORMAT,
-            stream_options={'include_usage': True}) as stream:
-        for event in stream:
-            if event.type != 'content.delta':
-                continue
-            try:
-                # Unlike regex/string slicing, jiter handles escapes and incomplete
-                # strings. No suggestions leave the server until final validation.
-                partial = from_json(event.snapshot.encode('utf-8'), partial_mode='trailing-strings')
-            except ValueError:
-                continue
-            text = partial.get('answer') if isinstance(partial, dict) else None
-            if isinstance(text, str) and text.startswith(emitted) and len(text) > len(emitted):
-                delta, emitted = text[len(emitted):], text
-                yield delta
-        response = stream.get_final_completion()
-    if not response.choices or response.choices[0].finish_reason != 'stop':
-        raise HTTPException(502, "Ответ прервался. Квота не списана; повторите вопрос.")
+    try:
+        with client.beta.chat.completions.stream(
+                **provider_params(params, ANSWER_TOKENS), messages=messages, response_format=ANSWER_FORMAT,
+                stream_options={'include_usage': True}) as stream:
+            for event in stream:
+                if event.type != 'content.delta':
+                    continue
+                try:
+                    # Unlike regex/string slicing, jiter handles escapes and incomplete
+                    # strings. No suggestions leave the server until final validation.
+                    partial = from_json(event.snapshot.encode('utf-8'), partial_mode='trailing-strings')
+                except ValueError:
+                    continue
+                text = partial.get('answer') if isinstance(partial, dict) else None
+                if isinstance(text, str) and text.startswith(emitted) and len(text) > len(emitted):
+                    delta, emitted = text[len(emitted):], text
+                    yield delta
+            response = stream.get_final_completion()
+    except LengthFinishReasonError as error:
+        # The SDK raises on the finish chunk of a structured stream, before usage arrives.
+        raise AnswerCut('truncated', token_metadata(error.completion, None)['output_tokens']) from None
+    except ContentFilterFinishReasonError:
+        raise AnswerCut('filtered') from None
+    finish = response.choices[0].finish_reason if response.choices else None
+    if finish in FINISH_OUTCOMES:
+        raise AnswerCut(FINISH_OUTCOMES[finish], token_metadata(response, None)['output_tokens'])
+    if finish != 'stop':
+        raise AnswerCut('interrupted', token_metadata(response, None)['output_tokens'])
     answer, suggestions = answer_parts(response_text(response), question)
     yield AIAnswer(answer, metadata=token_metadata(response, params['model']), memory_update=update,
                    summary_usage=summary_usage, follow_up_suggestions=suggestions)

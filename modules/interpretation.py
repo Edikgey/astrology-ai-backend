@@ -10,11 +10,11 @@ from modules.usage import OPENAI_TIMEOUT_SECONDS
 from modules.ai_conversation import generate_answer
 import os
 client = OpenAI(timeout=OPENAI_TIMEOUT_SECONDS, max_retries=0)
+# Repetition penalties are gone: they push Russian endings toward strained synonyms.
+# Reasoning mode (OPENAI_REASONING_EFFORT) is applied per call in ai_conversation.provider_params.
 OPENAI_PARAMS = {
     "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
     "temperature": 0.7,
-    "presence_penalty": 0.3,
-    "frequency_penalty": 0.1
 }
 class ChartInterpreter:
     def __init__(self, year: int, month: int, day: int, hour: float, lon: float, lat: float, calculate=True):

@@ -3,7 +3,7 @@ from copy import deepcopy
 from fastapi import HTTPException
 from database.queries import NatalChart, ChartData
 from modules.ai_subject import owned_subject
-from modules.ai_chart_context import compact_json
+from modules.ai_chart_context import compact_json, degree_in_sign, BODY_NAMES, ASPECT_NAMES
 from modules.synastry import PLANETS, ANGLES, MAJOR_ASPECTS, validate_synastry_input, SynastryInputError
 
 RELATIONSHIP_CONTEXT_BUDGET = 32000  # UTF-8 bytes, within the shared 64000-byte total guard.
@@ -32,8 +32,8 @@ def build_relationship_context(db, user_id, relationship_id):
                 for a in saved.aspects_for_circle or [] if a['from_body'] in positions and a['to_body'] in positions
                 and a['aspect'] in {symbol for symbol, _ in MAJOR_ASPECTS}})
             people[participant] = {'chart_id': chart_id, 'label': label,
-                'placement_columns': ['body', 'longitude_deg', 'sign', 'natal_house', 'retrograde'],
-                'placements': [[body, longitude, saved.bodies_for_circle[body].get('sign'),
+                'placement_columns': ['body', 'sign', 'degree_in_sign', 'natal_house', 'retrograde'],
+                'placements': [[body, saved.bodies_for_circle[body].get('sign'), degree_in_sign(longitude),
                                 saved.bodies_for_circle[body].get('house') if facts['cusps'] is not None else None,
                                 saved.bodies_for_circle[body].get('retrograde')]
                                for body, longitude in positions.items()],
@@ -46,6 +46,9 @@ def build_relationship_context(db, user_id, relationship_id):
                                    a['orb_deg'], a['participant_a'], a['body_a'], a['participant_b'], a['body_b'], a['aspect']))
         context = {'relationship_id': relation.id, 'speaker_person': relation.speaker_person,
             'ruleset_version': snapshot['ruleset_version'], 'schema_version': snapshot['schema_version'],
+            # Glyphs stay compact in rows; the legend names them once so the model does not guess.
+            'legend': {'bodies': {symbol: BODY_NAMES[symbol] for symbol in PLANETS + ANGLES},
+                       'aspects': {symbol: ASPECT_NAMES[symbol] for symbol, _ in MAJOR_ASPECTS}},
             'people': people, 'interchart_aspects': aspects,
             'angle_availability': snapshot['angle_availability'], 'house_overlays': snapshot['house_overlays'],
             'limitations': ['Saved natal/synastry data only; no transits or compatibility score.',

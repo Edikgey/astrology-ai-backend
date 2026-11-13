@@ -58,15 +58,23 @@ exact provider token counts or new product quotas.
 | Part | Budget |
 | --- | --- |
 | New question | 1–4000 characters, nonblank; never truncated |
-| Chart | At most 24,000 UTF-8 bytes; oversized data fails explicitly, never silently trimmed |
-| Summary trigger | More than 20 unsummarized messages OR more than 12,000 bytes of recent message content/overhead |
-| Recent history after compaction | Up to 10 messages, 12,000 bytes; drop oldest messages/exchanges if needed |
+| Chart | At most 24,000 UTF-8 bytes (`CHART_CONTEXT_BUDGET`); over budget, whole aspect rows are dropped from the least important end and counted in `omitted.aspects`; placements and cusps are never dropped; 422 only if it still does not fit |
+| Relationship | At most 32,000 UTF-8 bytes; natal then inter-chart aspect rows dropped from the tail, counted in `omitted`; 422 if it still does not fit |
+| Summary trigger | More than 20 unsummarized messages OR more than 24,000 bytes of recent message content/overhead |
+| Recent history after compaction | Up to 10 messages, 24,000 bytes (about three detailed exchanges); drop oldest messages/exchanges if needed |
 | Between compactions | Up to 20 unsummarized messages, within the same history budget |
-| Summary output | Prompt requests at most 1800 characters; provider limit 650 tokens; hard 6000-byte validation |
+| Summary output | Prompt requests at most 1800 characters; `max_completion_tokens` 900; hard 6000-byte validation |
 | Each summary input | Up to 18,000 raw dialogue bytes and 32,000 serialized JSON bytes, plus fixed summary instructions |
 | Compaction work per request | At most 32 old rows loaded and 2 summary calls |
 | Answer request | Conservative 64,000-byte/message-overhead ceiling |
-| Answer output | At most 1200 tokens; incomplete `length` responses are not saved/charged |
+| Answer output | `max_completion_tokens` 2000; a `length` or `content_filter` answer is not saved/charged and gets its own message |
+| Reasoning mode | Only when `OPENAI_REASONING_EFFORT` is set: no temperature/penalties in answer and summary, `reasoning_effort` passed, both ceilings +2000 unless the effort is `none` |
+
+A summary cut by `length` or longer than 6000 bytes does not fail the question
+(CHAT-QUALITY): that summary is discarded, the cursor and memory stay as they were,
+compaction stops for this request, the memory note says `older_history_pending: true`,
+and the call's tokens stay in `gpt_usage.summary_usage` with `"discarded": true`.
+Summary timeouts and other provider failures still refuse the question without charge.
 
 The summary stores topics, previous interpretations, explicit clarifications/preferences
 and unresolved subjects. It merges the previous notes with a contiguous older prefix.
@@ -85,12 +93,14 @@ the estimate after authorized real usage. Summary calls add cost only at compact
 ## Chart facts and audit limitations
 
 `modules/ai_chart_context.py` uses saved `ChartData.bodies_for_circle`,
-`aspects_for_circle` and `patterns_data`. Placements contain body/name/sign/longitude/
+`aspects_for_circle` and `patterns_data`. Placements contain body/name/sign/degree in sign/
 house/retrograde; Sun, Moon and Ascendant are explicitly identified when available.
-Aspects are undirected and deduplicated; pattern member bodies are listed once.
-Birth date, stored calculator hour, locality and coordinates are included. Twelve
-Placidus cusps are calculated by the existing `Ephemeris.get_houses()` using those
-same stored inputs and the same system as placement house assignments. No transits,
+Aspects are undirected and deduplicated, named in words, with the orb parsed from the
+saved `aspects_structured` text (null when absent) and ordered by importance; pattern
+member bodies are listed once by name. Birth date, stored calculator hour, timezone
+and UTC are included; locality and coordinates are not sent (CHAT-QUALITY). House
+cusps come from the saved `ChartData.houses` (sign and degree in sign) with the saved
+house system; the AI path calculates nothing and missing cusps stay null. No transits,
 new aspects, fabricated birth facts or interpretation cache text are injected.
 
 The backend already stores enough calculated placements for a compact context; the
