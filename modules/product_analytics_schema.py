@@ -17,6 +17,7 @@ ERRORS = ('network', 'unavailable', 'access_denied', 'quota', 'invalid_input', '
 SUBJECTS = ('natal', 'relationship')
 LATENCIES = ('under_5s', '5_to_15s', '15_to_30s', 'over_30s')
 WHEEL_OBJECTS = ('point', 'house', 'aspect')  # kind of chart object only, never which planet/sign/house
+PRODUCTS = ('premium_month', 'premium_year', 'question_pack')  # names only, never prices or ids
 CLIENT_EVENTS = {
     'page_viewed': {}, 'page_leave_hint': {},
     'landing_cta_clicked': {'target': ('chart', 'relationships', 'pricing', 'login')},
@@ -36,6 +37,8 @@ CLIENT_EVENTS = {
     'wheel_tooltip_opened': {'object': WHEEL_OBJECTS},
     'wheel_question_selected': {'object': WHEEL_OBJECTS},
     'site_error_occurred': {'kind': ('render', 'script', 'request')},
+    'offer_moment_shown': {'moment': ('last_free_question', 'question_limit', 'chart_limit')},
+    'offer_option_selected': {'option': PRODUCTS},
 }
 SERVER_EVENTS = {
     'registration_completed': {'method': ('email', 'google')},
@@ -45,7 +48,7 @@ SERVER_EVENTS = {
     'relationship_creation_completed': {},
     'ai_answer_completed': {'subject': SUBJECTS, 'latency': LATENCIES},
     'feedback_submitted': {'category': ('idea', 'bug', 'feedback')},
-    'checkout_initiated': {'provider': PROVIDERS},
+    'checkout_initiated': {'provider': PROVIDERS, 'product': PRODUCTS},
     'subscription_started': {'provider': PROVIDERS},
     'billing_period_paid': {'provider': PROVIDERS},
     'subscription_cancel_scheduled': {'provider': PROVIDERS},
@@ -53,6 +56,8 @@ SERVER_EVENTS = {
     'guest_chart_saved': {'method': ('email', 'google')},
     'payment_failed': {'provider': PROVIDERS, 'stage': ('checkout', 'first_payment', 'renewal', 'confirmation')},
     'free_limit_would_block': {'resource': ('chart', 'question')},
+    'question_pack_purchased': {'provider': PROVIDERS},
+    'annual_plan_started': {'provider': PROVIDERS},
 }
 
 

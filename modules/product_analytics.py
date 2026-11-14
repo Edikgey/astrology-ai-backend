@@ -372,7 +372,7 @@ def observe_flush(db, _):
     if not enabled():
         return
     try:
-        from database.queries import User, NatalChart, Relationship, Feedback, GPTUsage, BillingPeriod
+        from database.queries import User, NatalChart, Relationship, Feedback, GPTUsage, BillingPeriod, QuestionPack
         facts = db.info.setdefault('lunaria_analytics_facts', [])
         ctx = context.get()
         if ctx and ctx.get('interactive') and not ctx.get('visitor_id'):
@@ -403,8 +403,13 @@ def observe_flush(db, _):
                 fact(row.user_id, 'guest_chart_saved', {'method': 'google' if ctx.get('auth') == 'google' else 'email'}, f'guest_chart:{row.id}')
             elif isinstance(row, BillingPeriod) and row.applied and (row in db.new or state.attrs.applied.history.has_changes()):
                 fact(row.user_id, 'billing_period_paid', {'provider': row.provider}, f'paid:{row.id}')
+            elif isinstance(row, QuestionPack) and row.state == 'paid' and state.attrs.state.history.has_changes():
+                fact(row.user_id, 'question_pack_purchased', {'provider': row.provider}, f'pack:{row.id}')
             elif isinstance(row, User):
                 provider = row.payment_provider or next(iter(state.attrs.payment_provider.history.deleted), None)
+                if (provider in ('stripe', 'lava') and row.current_period_interval == 'year'
+                        and state.attrs.current_period_interval.history.has_changes()):
+                    fact(row.id, 'annual_plan_started', {'provider': provider}, f'annual:{provider}:{row.provider_subscription_id}')
                 if provider in ('stripe', 'lava'):
                     if row.scheduled_cancel_at and state.attrs.scheduled_cancel_at.history.has_changes():
                         fact(row.id, 'subscription_cancel_scheduled', {'provider': provider}, f'cancel:{row.id}:{row.scheduled_cancel_at}')

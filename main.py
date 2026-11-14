@@ -1,6 +1,7 @@
 import re
 from fastapi import FastAPI, Response
 from modules.free_beta import free_beta_enabled
+from modules.offers import public_offers
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -29,7 +30,7 @@ api_app = FastAPI(lifespan=analytics_lifespan)
 @api_app.get("/public-config")
 def public_config(response: Response):
     response.headers["Cache-Control"] = "no-store"
-    return {"free_beta_enabled": free_beta_enabled()}
+    return {"free_beta_enabled": free_beta_enabled(), "offers": public_offers()}
 
 
 @api_app.get("/health")

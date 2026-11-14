@@ -27,7 +27,7 @@ def checkout(response: Response, body: Optional[CheckoutRequest] = None, user: U
             capture_payment_failure(db, inspect(user).identity[0], 'lava', 'checkout', 'payment_failed:checkout:' + str(uuid4()))
         raise
     capture_business(db.get_bind(), inspect(user).identity[0], 'checkout_initiated',
-        {'provider': 'lava'}, 'checkout:' + str(uuid4()), analytics_context.get())
+        {'provider': 'lava', 'product': product}, 'checkout:' + str(uuid4()), analytics_context.get())
     return result
 
 
