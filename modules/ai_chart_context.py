@@ -1,16 +1,29 @@
 """Compact chart facts from existing calculator outputs; no interpretive inventions.
 
 Only formats what is saved: degree in sign and cusps are formatted saved longitudes,
-orbs are parsed from the saved aspect lines. Nothing is recalculated here.
+orbs are parsed from the saved aspect lines. Nothing natal is recalculated here; the only
+calculated part is the dated "transits" block (modules.transits) for verified charts.
 """
 import json
+import logging
 import math
 import re
+import time
+import swisseph
 from fastapi import HTTPException
 from database.queries import NatalChart, ChartData
+from modules import transits
+from modules.cusp_math import house_for_longitude
 from modules.ephemeris import ASTEROID_SYMBOLS
+from modules.synastry import ANGLES, PLANETS, stored_cusps, valid_longitude
 
 CHART_CONTEXT_BUDGET = 24000  # UTF-8 bytes, within the shared 64000-byte total guard.
+TRANSIT_BLOCK_BUDGET = 4000   # UTF-8 bytes of the transits block, inside CHART_CONTEXT_BUDGET.
+SLOW_TRANSITS_MS = 500
+VERIFIED_LIMITATIONS = "Saved natal calculations are never recalculated; dated sky data only in transits."
+LEGACY_LIMITATIONS = ("Legacy chart: birth timezone/minutes unverified; missing cusps remain unknown. "
+                      "Do not infer or recalculate.")
+logger = logging.getLogger(__name__)
 
 SIGNS = ("Овен", "Телец", "Близнецы", "Рак", "Лев", "Дева",
          "Весы", "Скорпион", "Стрелец", "Козерог", "Водолей", "Рыбы")
@@ -28,6 +41,9 @@ ASPECT_NAMES = {
     "⚺": "полусекстиль", "Q": "квинтиль", "∠∠": "полутороквадрат",
 }
 MAJOR_ASPECTS = {"☌", "☍", "△", "□", "⚹"}
+TRANSIT_POINTS = PLANETS + ANGLES
+# Row order inside a block: luminaries and angles, personal planets, social, outer (DESIGN §3).
+POINT_GROUPS = {"☉": 0, "☽": 0, "AS": 0, "MC": 0, "☿": 1, "♀": 1, "♂": 1, "♃": 2, "♄": 2, "♅": 3, "♆": 3, "♇": 3}
 CORE_POINTS = {"☉", "☽", "AS", "MC", "☿", "♀", "♂"}
 # Defining axes are always exact oppositions and carry no information.
 AXES = {frozenset(("AS", "DS")), frozenset(("MC", "IC")), frozenset(("☊", "☋"))}
@@ -140,8 +156,8 @@ def build_chart_context(db, user_id, chart_id):
         "aspects": aspect_rows(stored.aspects_for_circle, stored.aspects_structured, bodies),
         "pattern_columns": ["type", "bodies"], "patterns": pattern_rows,
         "omitted": {"aspects": 0},
-        "limitations": "Only natal calculations; no transits." if chart.birth_utc and chart.timezone else
-            "Legacy chart: birth timezone/minutes unverified; missing cusps remain unknown. Do not infer or recalculate.",
+        "limitations": LEGACY_LIMITATIONS if transits.verified_zone(chart) is None else VERIFIED_LIMITATIONS,
+        "transits": transit_context(chart, stored, transits.server_now()),
     }
     # Keep every placement and cusp; drop whole aspect rows from the least important end.
     rows = context["aspects"]
@@ -153,3 +169,80 @@ def build_chart_context(db, user_id, chart_id):
     if len(value.encode('utf-8')) > CHART_CONTEXT_BUDGET:
         raise HTTPException(422, "Данные карты превышают бюджет AI-контекста; требуется проверка карты.")
     return value
+
+
+def _local_date(moment, zone):
+    return None if moment is None else transits.as_utc(moment).astimezone(zone).date().isoformat()
+
+
+def _transit_key(transit, zone):
+    """Active rows first (by point group, then orb), then future ones (by point group, then start date)."""
+    group = POINT_GROUPS.get(transit.point, len(POINT_GROUPS))
+    tie = (transit.body, transit.aspect, transit.point, transit.target % 360)   # same clock -> same text
+    if transit.orb_now is not None:
+        return (0, group, transit.orb_now, "", tie)
+    start = transit.periods[0][0] if transit.periods else None
+    return (1, group, 0, _local_date(start, zone) or "", tie)
+
+
+def _transit_row(transit, zone):
+    return [body_name(transit.body), ASPECT_NAMES.get(transit.aspect, transit.aspect), body_name(transit.point),
+            None if transit.orb_now is None else round(transit.orb_now, 1),
+            [[_local_date(start, zone), _local_date(end, zone)] for start, end in transit.periods],
+            [_local_date(moment, zone) for moment in transit.exact]]
+
+
+class _MissingPositions(Exception):
+    pass
+
+
+def _failure_reason(error):
+    if isinstance(error, swisseph.Error):
+        return "ephemeris_error"
+    return "missing_saved_positions" if isinstance(error, _MissingPositions) else "unclassified"
+
+
+def transit_context(chart, stored, now):
+    """The "transits" block. Never raises: a failure leaves the natal context and one closed log line."""
+    started = time.monotonic()
+    try:
+        zone = transits.verified_zone(chart)
+        if zone is None:
+            return {"status": "unavailable", "reason": "legacy_chart"}
+        bodies = stored.bodies_for_circle
+        natal, missing = {}, []
+        for symbol in TRANSIT_POINTS:
+            body = bodies.get(symbol)
+            if isinstance(body, dict) and valid_longitude(body.get("degree")):
+                natal[symbol] = body["degree"]
+            else:
+                missing.append(body_name(symbol))
+        if not natal:
+            raise _MissingPositions()
+        hz = transits.horizon(zone, now)
+        sky = transits.sky_now(now)
+        found = transits.find_transits(natal, hz)
+        cusps, _ = stored_cusps(stored)
+        rows = [_transit_row(t, zone) for t in sorted(found, key=lambda t: _transit_key(t, zone))]
+        block = {
+            "status": "ok", "today": hz.today.isoformat(), "range_to": hz.last_day.isoformat(),
+            "dates_timezone": zone.key, "orb_deg": transits.ORB,
+            "sky_now_columns": ["body", "sign", "degree_in_sign", "retrograde", "natal_house"],
+            "sky_now": [[body_name(s.body), sign_of(s.longitude), degree_in_sign(s.longitude), s.retrograde,
+                         house_for_longitude(s.longitude, cusps) if cusps else None] for s in sky],
+            "columns": ["body", "aspect", "point", "orb_now", "periods", "exact"],
+            "rows": rows, "omitted": 0,
+        }
+        if missing:
+            block["points_missing"] = missing
+        while rows and len(compact_json(block).encode("utf-8")) > TRANSIT_BLOCK_BUDGET:
+            rows.pop()
+            block["omitted"] += 1
+    except Exception as error:  # noqa: BLE001 - isolation is the contract; the reason set is closed
+        logger.warning("AI transits outcome=failed reason=%s duration_ms=%d",
+                       _failure_reason(error), round((time.monotonic() - started) * 1000))
+        return {"status": "unavailable", "reason": "calculation_failed"}
+    duration_ms = round((time.monotonic() - started) * 1000)
+    if duration_ms > SLOW_TRANSITS_MS:
+        logger.warning("AI transits outcome=slow duration_ms=%d rows=%d", duration_ms, len(found))
+    return block

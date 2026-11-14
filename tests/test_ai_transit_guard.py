@@ -1,11 +1,14 @@
-"""Requests that need live positions must never be sent as natal chart questions."""
+"""Requests that need live positions must never be sent as natal chart questions.
+
+The route test for transit questions moved to test_transits_guard.py (TG4/TG5, TRANSITS-1): an intentional
+contract change - a verified chart now answers them, a legacy chart and the pair chat refuse with new texts.
+"""
 import unittest
 from unittest.mock import patch
 
 import test_my_charts as charts
 import test_relationship_ai as relationships
-from database.queries import GPTMessage, GPTUsage, RelationshipMessage
-from modules.ai_transit_guard import TRANSIT_UNAVAILABLE, requires_transit_data
+from modules.ai_transit_guard import requires_transit_data
 
 
 URANUS_QUESTION = (
@@ -18,7 +21,6 @@ class TransitGuardTests(unittest.TestCase):
     setUp = charts.MyChartsTests.setUp
     tearDown = charts.MyChartsTests.tearDown
     chart = charts.MyChartsTests.chart
-    pair = relationships.RelationshipAITests.pair
 
     def test_detects_dated_positions_and_requested_transit_calculations(self):
         questions = (
@@ -53,27 +55,6 @@ class TransitGuardTests(unittest.TestCase):
         for question in questions:
             with self.subTest(question=question):
                 self.assertFalse(requires_transit_data(question))
-
-    def test_both_routes_stop_before_openai_and_quota_for_json_and_sse(self):
-        relationship_id, chart_id = self.pair()
-        routes = (
-            ("/ask-gpt", {"chart_id": chart_id, "question": URANUS_QUESTION}),
-            (f"/relationships/{relationship_id}/ask", {"question": URANUS_QUESTION}),
-        )
-        with patch("modules.interpretation.client.chat.completions.create") as provider:
-            for url, payload in routes:
-                for accept in ("application/json", "text/event-stream"):
-                    with self.subTest(url=url, accept=accept):
-                        response = self.client.post(
-                            url, json=payload, headers={**self.owner, "Accept": accept}
-                        )
-                        self.assertEqual(response.status_code, 422, response.text)
-                        self.assertEqual(response.json()["detail"], TRANSIT_UNAVAILABLE)
-            provider.assert_not_called()
-        with self.sessions() as db:
-            self.assertEqual(db.query(GPTUsage).count(), 0)
-            self.assertEqual(db.query(GPTMessage).count(), 0)
-            self.assertEqual(db.query(RelationshipMessage).count(), 0)
 
     def test_natal_uranus_question_still_reaches_chat(self):
         chart_id = self.chart()
