@@ -1,6 +1,6 @@
 from uuid import uuid4
 from sqlalchemy import inspect
-from modules.product_analytics import capture_business, context as analytics_context
+from modules.product_analytics import capture_business, capture_payment_failure, context as analytics_context
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
@@ -15,7 +15,12 @@ router = APIRouter(prefix="/payments/stripe", tags=["Payments"])
 @router.post("/checkout")
 def checkout(response: Response, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     response.headers["Cache-Control"] = "no-store"
-    result = billing.create_checkout(db, user.id)
+    try:
+        result = billing.create_checkout(db, user.id)
+    except HTTPException as error:
+        if error.status_code >= 500:
+            capture_payment_failure(db, inspect(user).identity[0], 'stripe', 'checkout', 'payment_failed:checkout:' + str(uuid4()))
+        raise
     capture_business(db.get_bind(), inspect(user).identity[0], 'checkout_initiated',
         {'provider': 'stripe'}, 'checkout:' + str(uuid4()), analytics_context.get())
     return result
