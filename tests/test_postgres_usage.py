@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, Event
+from threading import Barrier, Event, Lock
 from time import monotonic, sleep
 from uuid import uuid4
 from sqlalchemy import create_engine, MetaData, Table, text, inspect
@@ -38,13 +38,13 @@ class PostgreSQLUsageTests(unittest.TestCase):
         legacy = MetaData()
         for table in fixtures.Base.metadata.sorted_tables:
             if table.name in ("analytics_consents", "analytics_account_preferences", "analytics_outbox", "analytics_monthly_budget", "feedback", "stripe_checkouts", "billing_customers", "billing_periods", "billing_events", "billing_conflicts", "gpt_usage", "paddle_checkouts", "paddle_events", "lava_checkouts", "gpt_conversations", "relationships",
-                              "relationship_messages", "relationship_conversations"):
+                              "relationship_messages", "relationship_conversations", "question_packs"):
                 continue
             if table.name == "users":
                 Table("users", legacy, *(col._copy() for col in table.columns if col.name not in
                                           ("plan", "current_period_start", "current_period_end", "payment_provider",
                                            "provider_customer_id", "provider_subscription_id", "subscription_status",
-                                           "paddle_updated_at", "scheduled_cancel_at")))
+                                           "paddle_updated_at", "scheduled_cancel_at", "current_period_interval")))
             elif table.name in ('natal_charts', 'chart_data'):
                 Table(table.name, legacy, *(col._copy() for col in table.columns if col.name not in
                     ('timezone','birth_utc','houses','house_system')))
@@ -93,6 +93,25 @@ class PostgreSQLUsageTests(unittest.TestCase):
         self.apply_script((Path(__file__).parents[1] / 'migrations/relationships.sql').read_text(encoding='utf-8'))
         self.stripe_script = (Path(__file__).parents[1] / 'migrations/stripe_billing.sql').read_text(encoding='utf-8')
         self.apply_script(self.stripe_script)
+        # PRICING-1: the current models map pricing_packs.sql, the last link of the chain. Subclasses that
+        # rehearse an earlier link skip it here and apply it in their own test; the chain is then completed
+        # once, before the first ORM session (a raw-SQL rehearsal never gets the extra link).
+        self.pricing_script = (Path(__file__).parents[1] / 'migrations/pricing_packs.sql').read_text(encoding='utf-8')
+        maker, lock, complete = self.sessions, Lock(), []
+
+        def sessions():
+            with lock:
+                if not complete:
+                    with self.engine.connect() as conn:
+                        names = set(inspect(conn).get_table_names())
+                    if 'question_packs' in names:
+                        complete.append(True)
+                    elif {'stripe_checkouts', 'lava_checkouts'} <= names:
+                        PostgreSQLUsageTests.apply_script(self, self.pricing_script)
+                        complete.append(True)
+            return maker()
+        self.sessions = sessions
+        sessions().close()
 
     def test_birth_migration_preserves_legacy_data_without_inventing_timezone(self):
         self.assertEqual(self.snapshot(), self.before)

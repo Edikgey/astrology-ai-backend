@@ -39,11 +39,13 @@ class FreeBetaTests(unittest.TestCase):
 
     def test_public_config_is_safe_uncached_and_client_cannot_enable_beta(self):
         response = self.client.get('/public-config', headers={'Origin':'https://mylunariaai.com'})
-        self.assertEqual(response.json(), {'free_beta_enabled':True})
+        # PRICING-1 (DESIGN §12, decisions 27/28): /public-config also carries `offers`; in beta nothing is on sale.
+        no_offers = {'premium_year': False, 'question_pack': False, 'pack_size': 50}
+        self.assertEqual(response.json(), {'free_beta_enabled':True, 'offers': no_offers})
         self.assertEqual(response.headers['cache-control'], 'no-store')
         self.assertEqual(response.headers['access-control-allow-origin'], 'https://mylunariaai.com')
         with patch.dict(os.environ, {FLAG: ''}):
-            self.assertEqual(self.client.get('/public-config?free_beta_enabled=true', headers={FLAG:'true'}).json(), {'free_beta_enabled':False})
+            self.assertEqual(self.client.get('/public-config?free_beta_enabled=true', headers={FLAG:'true'}).json(), {'free_beta_enabled':False, 'offers': no_offers})  # no price variables here
             state = self.state()
             self.assertEqual((state['saved_charts_limit'],state['gpt_messages_limit']), (3,10))
 
