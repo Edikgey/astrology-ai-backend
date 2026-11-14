@@ -347,8 +347,7 @@ class PricingBase(unittest.TestCase):
         self.charges.setdefault(charge, {'id': charge, 'livemode': self.livemode, 'payment_intent': pi,
                                          'amount': STRIPE_PACK_CENTS, 'currency': 'usd'})
         self.charges[charge]['amount_refunded'] = amount
-        self.refunds[refund_id] = {'id': refund_id, 'livemode': self.livemode, 'charge': charge, 'amount': amount,
-                                   'currency': 'usd', 'status': 'succeeded'}
+        self.refunds[refund_id] = sf.refund_object(id=refund_id, charge=charge, amount=amount, payment_intent=pi)  # no livemode, as Stripe
         return self.send(self.event(kind, refund_id))
 
     def dispute_stripe(self, pi, kind='charge.dispute.created', status='needs_response'):
@@ -791,7 +790,7 @@ class PricingBE6StripeRefundTests(PricingBase):
         self.bind_subscription()
         self.assertEqual(self.send(self.event('invoice.paid', sf.INVOICE)).json()['outcome'], 'granted')
         pack = self.seed_pack()
-        self.refunds['re_sub'] = {'id': 're_sub', 'livemode': True, 'charge': 'ch_test', 'amount': 999, 'currency': 'usd', 'status': 'succeeded'}
+        self.refunds['re_sub'] = sf.refund_object(id='re_sub')  # no livemode, as Stripe
         self.assertEqual(self.send(self.event('refund.created', 're_sub')).status_code, 200)
         self.assertEqual(self.usage_of(self.owner)['plan'], 'premium')
         self.assertEqual(self.pack(pack)['state'], 'paid')

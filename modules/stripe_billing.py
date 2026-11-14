@@ -36,18 +36,23 @@ CHECKOUT_MANUAL = ("Прошлую оплату нужно проверить в
 STRIPE_UNAVAILABLE = "Stripe сейчас недоступен. Попробуйте позже."
 
 
-def log_checkout_failure(stage, error):
+def stripe_error_fields(error, names=("code", "param", "request_id")):
     # No provider messages, request bodies, emails, keys, or client secrets.
+    fields = {"http_status": error.http_status}
+    for name, value, pattern in (
+        ("code", error.code, r"[a-z_]{1,64}"),
+        ("param", getattr(error, "param", None), r"[a-z_\[\]0-9]{1,100}"),
+        ("request_id", error.request_id, r"req_[A-Za-z0-9]{1,80}"),
+    ):
+        if name in names and isinstance(value, str) and re.fullmatch(pattern, value):
+            fields[name] = value
+    return fields
+
+
+def log_checkout_failure(stage, error):
     diagnostic = {"stage": stage, "exception_class": type(error).__name__}
     if isinstance(error, stripe.StripeError):
-        diagnostic["http_status"] = error.http_status
-        for name, value, pattern in (
-            ("code", error.code, r"[a-z_]{1,64}"),
-            ("param", getattr(error, "param", None), r"[a-z_\[\]0-9]{1,100}"),
-            ("request_id", error.request_id, r"req_[A-Za-z0-9]{1,80}"),
-        ):
-            if isinstance(value, str) and re.fullmatch(pattern, value):
-                diagnostic[name] = value
+        diagnostic.update(stripe_error_fields(error))
     logger.warning("Stripe checkout failed %s", json.dumps(diagnostic))
 
 API_VERSION = "2026-09-30.endive"
@@ -60,6 +65,32 @@ EVENTS = {
     "charge.dispute.created", "charge.dispute.closed",
 }
 FINANCIAL = {v for v in EVENTS if v.startswith(("refund.", "charge."))}
+# Fixed ValueError texts of this module; any other text is logged as "unclassified".
+REJECT_REASONS = (
+    "Checkout environment mismatch", "Customer mismatch", "Invalid identifier", "Invalid period", "Invalid timestamp",
+    "Invoice ownership mismatch", "Pack environment mismatch", "Pack payment mismatch", "Pack session ownership mismatch",
+    "Paid period mismatch", "Price of the other plan", "Session mismatch", "Session ownership mismatch",
+    "Subscription ownership mismatch", "Unexpected invoice lines", "Unexpected pack amount", "Unexpected pack line",
+    "Unexpected pack lines", "Unexpected pack payment", "Unexpected paid invoice", "Unexpected recurring line",
+    "Unexpected subscription items", "Unknown subscription status", "Wrong account or API version",
+    "Wrong payment environment",
+)
+
+
+def log_webhook_rejection(status, event, error):
+    """One line per rejected event: closed set of fields, never provider or exception text."""
+    kind = event.get("type") if isinstance(event, dict) else None
+    diagnostic = {"status": status, "type": kind if isinstance(kind, str) and kind in EVENTS else "other",
+                  "exception_class": type(error).__name__}
+    event_id = event.get("id") if isinstance(event, dict) else None
+    if isinstance(event_id, str) and re.fullmatch(r"evt_[A-Za-z0-9]{1,80}", event_id):
+        diagnostic["event_id"] = event_id
+    if status == 400:
+        text = error.args[0] if isinstance(error, ValueError) and len(error.args) == 1 else None
+        diagnostic["reason"] = text if isinstance(text, str) and text in REJECT_REASONS else "unclassified"
+    if isinstance(error, stripe.StripeError):
+        diagnostic.update(stripe_error_fields(error, ("code", "request_id")))
+    logger.warning("Stripe webhook rejected %s", json.dumps(diagnostic))
 
 
 def ident(value, prefix):
@@ -139,8 +170,12 @@ def api():
     return client.v1
 
 
+def plain(value):
+    return value.to_dict(recursive=True) if isinstance(value, stripe.StripeObject) else value
+
+
 def checked(value):
-    if isinstance(value, stripe.StripeObject): value = value.to_dict(recursive=True)
+    value = plain(value)
     if value.get("livemode") is not livemode():
         raise ValueError("Wrong payment environment")
     return value
@@ -506,7 +541,8 @@ def resolve(client, kind, obj):
         invoice = checked(client.invoices.retrieve(ident(obj, "in")))
     else:
         if kind.startswith("refund."):
-            refund = checked(client.refunds.retrieve(ident(obj, "re")))
+            # A Refund has no livemode: its charge proves the payment environment, checked() below.
+            refund = plain(client.refunds.retrieve(ident(obj, "re")))
             charge_id = refund.get("charge")
             financial = {"reference_id": refund["id"], "status": refund["status"], "amount": refund["amount"], "currency": refund["currency"]}
         elif kind.startswith("charge.dispute."):
@@ -684,13 +720,15 @@ def process_event(db, event):
         return outcome
     except HTTPException:
         db.rollback(); raise
-    except (ValueError, KeyError, TypeError, AttributeError, OverflowError):
+    except (ValueError, KeyError, TypeError, AttributeError, OverflowError) as error:
         db.rollback()
         if owner_checked and user_id:
             capture_payment_failure(db, user_id, "stripe", "confirmation", "payment_failed:confirmation:" + key)
+        log_webhook_rejection(400, event, error)
         raise HTTPException(400, "Invalid or unverified Stripe event") from None
-    except stripe.StripeError:
+    except stripe.StripeError as error:
         db.rollback()
+        log_webhook_rejection(503, event, error)
         raise HTTPException(503, "Stripe verification temporarily unavailable") from None
     except Exception:
         db.rollback(); raise
