@@ -1474,6 +1474,135 @@ class PricingR2LavaRefundMatchingTests(PricingBase):
                 self.assertEqual((response.status_code, response.json()['outcome']), (200, 'recorded_unmatched'))
                 self.assertEqual(self.state_of(a), ('paid', None))
 
+# =========================================================================== Round 3 (REVIEW.md «Раунд 2» P2-3; DESIGN §13)
+from urllib.parse import parse_qs, urlsplit  # noqa: E402
+
+from modules import lava_client  # noqa: E402
+
+LAVA_RETURN_FIELDS = ('successful_return_url', 'failure_return_url', 'cancel_return_url')
+
+
+class PricingR3ReturnUrlTests(PricingBase):
+    """BE-R3-1..3, BE-R3-5: every return URL the server builds carries exactly one closed `product=` (offers.PRODUCTS);
+    the rest of the variable stays as is (literal {CHECKOUT_SESSION_ID}, billing, status), the parameter goes before `#`."""
+
+    def query(self, url):
+        return parse_qs(urlsplit(url).query, keep_blank_values=True)
+
+    def assert_product(self, url, product, provider):
+        self.assertEqual(url.count('product='), 1, url)
+        query = self.query(url)
+        self.assertEqual(query.get('product'), [product], url)
+        self.assertEqual(query.get('billing'), [provider], url)
+        if provider == 'stripe':
+            self.assertIn('session_id={CHECKOUT_SESSION_ID}', url)  # Stripe's placeholder, not percent-encoded
+
+    def stripe_return(self, index):
+        return self.created[index][0]['return_url']
+
+    def test_be_r3_1_stripe_return_url_names_the_product(self):
+        self.buy_stripe_pack()
+        self.assert_product(self.stripe_return(0), 'question_pack', 'stripe')
+        self.assertEqual(self.checkout('stripe', self.owner).status_code, 200)
+        self.assert_product(self.stripe_return(1), 'premium_month', 'stripe')
+        with self.sessions() as db:  # a fresh account for the year (user 1 already has a monthly attempt)
+            db.add(User(id=3, email='c@example.test', password_hash='unused')); db.commit()
+        third = {'Authorization': 'Bearer ' + fixtures.create_access_token({'sub': '3'})}
+        self.assertEqual(self.checkout('stripe', third, 'premium_year').status_code, 200)
+        self.assert_product(self.stripe_return(2), 'premium_year', 'stripe')
+
+    def test_be_r3_2_lava_return_urls_name_the_product(self):
+        self.buy_lava_pack()
+        self.assertEqual(self.checkout('lava', self.owner).status_code, 200)
+        with self.sessions() as db:
+            db.add(User(id=3, email='c@example.test', password_hash='unused')); db.commit()
+        third = {'Authorization': 'Bearer ' + fixtures.create_access_token({'sub': '3'})}
+        self.assertEqual(self.checkout('lava', third, 'premium_year').status_code, 200)
+        for body, product in zip(self.lava_posts, ('question_pack', 'premium_month', 'premium_year')):
+            for field in LAVA_RETURN_FIELDS:
+                with self.subTest(product=product, field=field):
+                    self.assert_product(body[field], product, 'lava')
+
+    def test_be_r3_3_fragment_keeps_its_place(self):
+        with patch.dict(os.environ, {'STRIPE_CHECKOUT_RETURN_URL': sf.ENV['STRIPE_CHECKOUT_RETURN_URL'] + '#paid',
+                                     'LAVA_SUCCESS_RETURN_URL': lf.ENV['LAVA_SUCCESS_RETURN_URL'] + '&status=success#done'}):
+            self.buy_stripe_pack()
+            self.buy_lava_pack()
+        stripe_url = self.stripe_return(0)
+        self.assertTrue(stripe_url.endswith('#paid'), stripe_url)
+        self.assertEqual(urlsplit(stripe_url).fragment, 'paid')
+        self.assert_product(stripe_url, 'question_pack', 'stripe')
+        lava_url = self.lava_posts[0]['successful_return_url']
+        self.assertEqual(urlsplit(lava_url).fragment, 'done')
+        self.assertEqual(self.query(lava_url).get('status'), ['success'])
+        self.assert_product(lava_url, 'question_pack', 'lava')
+
+    def test_be_r3_3_variable_with_product_is_a_configuration_error(self):
+        with patch.dict(os.environ, {'STRIPE_CHECKOUT_RETURN_URL': sf.ENV['STRIPE_CHECKOUT_RETURN_URL'] + '&product=premium_month'}):
+            for product in (None, 'question_pack'):
+                with self.subTest(provider='stripe', product=product):
+                    response = self.checkout('stripe', self.other, product)
+                    self.assertEqual(response.status_code, 503, response.text)
+                    self.assertEqual(response.json()['detail'], stripe_billing.STRIPE_UNAVAILABLE)
+        self.api.customers.create.assert_not_called()
+        self.api.checkout.sessions.create.assert_not_called()
+        for variable in ('LAVA_SUCCESS_RETURN_URL', 'LAVA_FAILURE_RETURN_URL', 'LAVA_CANCEL_RETURN_URL'):
+            with self.subTest(provider='lava', variable=variable), patch.dict(os.environ, {variable: lf.ENV[variable] + '&product=question_pack'}):
+                response = self.checkout('lava', self.other, 'question_pack')
+                self.assertEqual(response.status_code, 503, response.text)
+                self.assertEqual(response.json()['detail'], lava_client.RUB_NOT_AVAILABLE)
+        self.network.assert_not_called()
+        self.assertEqual(self.checkout('lava', self.other, 'question_pack').status_code, 200)  # positive control
+
+    def test_be_r3_5_guard_closed_product_and_no_other_parameters(self):
+        # GUARD on 5051fae: unknown product -> 422 before any provider call; extra fields ignored;
+        # the server adds nothing to the return URLs except (after round 3) `product`.
+        for provider in ('stripe', 'lava'):
+            with self.subTest(provider=provider):
+                self.assertEqual(self.checkout(provider, self.other, 'Question_Pack').status_code, 422)
+        self.api.checkout.sessions.create.assert_not_called()
+        self.network.assert_not_called()
+        response = self.checkout('stripe', self.other, 'question_pack', price='price_evil', user_id=1)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.created[0][0]['line_items'], [{'price': PACK_PRICE, 'quantity': 1}])
+        self.assertEqual(self.checkout('lava', self.other, 'question_pack', offerId='evil', amount=1).status_code, 200)
+        env_keys = set(self.query(sf.ENV['STRIPE_CHECKOUT_RETURN_URL']))
+        self.assertLessEqual(set(self.query(self.stripe_return(0))), env_keys | {'product'})
+        for field in LAVA_RETURN_FIELDS:
+            self.assertLessEqual(set(self.query(self.lava_posts[0][field])), {'billing', 'product'})
+
+
+class PricingR3PackRecentlyPaidTests(PricingBase):
+    """BE-R3-4: /account/usage `pack_recently_paid` — an own pack in `paid` with paid_at >= now - 30 min on the server
+    clock modules.usage.utcnow; revoked, unpaid and another user's packs do not count."""
+
+    def recent_at(self, moment, headers=None):
+        with patch('modules.usage.utcnow', return_value=moment):
+            return self.usage_of(headers or self.other)['pack_recently_paid']
+
+    def test_be_r3_4_window_is_30_minutes_from_payment(self):
+        paid = datetime.utcnow().replace(microsecond=0) - timedelta(hours=2)
+        self.seed_pack(user_id=2, paid_at=paid)
+        self.assertTrue(self.recent_at(paid + timedelta(minutes=29, seconds=59)))
+        self.assertFalse(self.recent_at(paid + timedelta(minutes=30, seconds=1)))
+
+    def test_be_r3_4_revoked_unpaid_and_foreign_packs_do_not_count(self):
+        now = datetime.utcnow().replace(microsecond=0)
+        self.seed_pack(user_id=2, state='revoked', paid_at=now - timedelta(minutes=1))
+        self.seed_pack(user_id=2, state='creating', created_at=now - timedelta(minutes=1))
+        self.seed_pack(user_id=2, state='ready', created_at=now - timedelta(minutes=1))
+        self.seed_pack(user_id=1, paid_at=now - timedelta(minutes=1))
+        self.assertFalse(self.recent_at(now))
+        self.assertTrue(self.recent_at(now, self.owner))  # positive control: the owner of the fresh paid pack
+
+    def test_be_r3_4_real_grant_sets_it_and_pack_pending_is_unchanged(self):
+        session_id, _ = self.buy_stripe_pack()
+        state = self.usage_of(self.other)
+        self.assertEqual((state['pack_pending'], state['pack_recently_paid']), (True, False))
+        self.assertEqual(self.send(self.pay_stripe_pack(session_id)).status_code, 200)
+        state = self.usage_of(self.other)
+        self.assertEqual((state['pack_pending'], state['pack_recently_paid'], state['pack_questions_remaining']), (False, True, PACK_SIZE))
+
 import test_metrics2 as m2  # noqa: E402  (after the SQLite cases; reuses the METRICS-2 outbox harness)
 
 
