@@ -52,7 +52,8 @@ _DATED_TRANSIT_REQUEST = re.compile(
 _BODY = re.compile(
     r"\b(?:солнц\w*|сонц\w*|лун[ауыеой]|місяц\w*|меркур\w*|венер\w*|марс\w*|юпітер\w*|"
     r"юпитер\w*|сатурн\w*|уран\w*|нептун\w*|плутон\w*|планет\w*|уз[её]л|узл\w*|вуз[оі]л|вузл\w*|"
-    r"sun|moon|mercury|venus|mars|jupiter|saturn|uranus|neptune|pluto|planets?|nodes?)\b"
+    r"хирон\w*|хірон\w*|"
+    r"sun|moon|mercury|venus|mars|jupiter|saturn|uranus|neptune|pluto|chiron|planets?|nodes?)\b"
 )
 _PLACEMENT = re.compile(
     r"\b(?:где|де|когда|коли|where|when|положени\w*|положенн\w*|"
@@ -85,7 +86,8 @@ _NATAL = re.compile(
 # Bodies with calculated transits; any other named body is not calculated on a date.
 _SLOW_BODY = re.compile(r"юпитер|юпітер|jupiter|сатурн|saturn|уран|uranus|нептун|neptune|плутон|pluto")
 _GENERAL_BODY = re.compile(r"планет|planet")
-# A body after a possessive is the natal point a transit aims at («к моему Солнцу»), not the transiting body.
+# In a sentence about transits or aspects, a body after a possessive is the natal point a transit aims at
+# («транзиты к моему Солнцу»), not the transiting body; elsewhere («где сейчас моя Луна») it is the body asked about.
 _NATAL_POINT_BEFORE = re.compile(r"\b(?:мо[йяеёюиєї]\w*|мій|my|natal|натальн\w*)\s+$")
 _INGRESS = re.compile(r"\b(?:войд[её]т|перейд[её]т|увійде|перейде|enters?|will enter|moves? into)\b")
 _ASPECT_WORD = re.compile(
@@ -117,7 +119,7 @@ def _sentences(question):
 
 
 def _needs_dated_data(sentence):
-    dated = _TIME.search(sentence)
+    dated = _TIME.search(sentence) or _MONTH_YEAR.search(sentence)   # month + any 4-digit year, e.g. «январе 0000»
     asks_position = _PLACEMENT.search(sentence)
     if _TRANSIT.search(sentence):
         if _TRANSIT_REQUEST.search(sentence):
@@ -146,6 +148,9 @@ def _date_outside(sentence, hz):
     found = []
 
     def full_date(year, month, day):
+        if not 1 <= year <= 9999:      # no such calendar year (e.g. 0000): outside the range
+            found.append(True)
+            return " "
         try:
             found.append(not first <= date(year, month, day) <= last)
         except ValueError:      # not a calendar date, e.g. 31.02
@@ -158,6 +163,9 @@ def _date_outside(sentence, hz):
     sentence = _MONTH_DAY_YEAR.sub(lambda m: full_date(int(m[3]), _month_number(m[1]), int(m[2])), sentence)
     for match in _MONTH_YEAR.finditer(sentence):
         year, month = int(match[2]), _month_number(match[1])
+        if not 1 <= year <= 9999:
+            found.append(True)
+            continue
         found.append(date(year, month, calendar.monthrange(year, month)[1]) < first or date(year, month, 1) > last)
     sentence = _MONTH_YEAR.sub(" ", sentence)
     found += [not hz.today.year <= int(year) <= hz.last_day.year for year in _YEAR.findall(sentence)]
@@ -169,7 +177,9 @@ def _answerable(sentence):
     """A slow body, the planets in general or no body is named, and it is not a sign or house ingress."""
     if _INGRESS.search(sentence) and not _ASPECT_WORD.search(sentence):
         return False
-    named = [m[0] for m in _BODY.finditer(sentence) if not _NATAL_POINT_BEFORE.search(sentence[:m.start()])]
+    targeted = _TRANSIT.search(sentence) or _ASPECT_WORD.search(sentence)
+    named = [m[0] for m in _BODY.finditer(sentence)
+             if not (targeted and _NATAL_POINT_BEFORE.search(sentence[:m.start()]))]
     return not named or any(_SLOW_BODY.match(word) or _GENERAL_BODY.match(word) for word in named)
 
 
