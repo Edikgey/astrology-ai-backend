@@ -133,14 +133,17 @@ class PricingPostgresBase(unittest.TestCase):
             return conn.execute(text(sql), params).scalar_one()
 
     def wait_blocked(self, pids, holder_pid):
-        deadline, blocked = monotonic() + 10, set()
+        """Every worker waits on a lock: PostgreSQL queues the second behind the first, so a worker may be
+        blocked by the holder or by the other worker; the chain must start at the holder."""
+        deadline, blockers = monotonic() + 10, {}
         while monotonic() < deadline:
             with self.engine.connect() as observer:
-                blocked = {pid for pid in pids if holder_pid in observer.execute(text('SELECT pg_blocking_pids(:p)'), {'p': pid}).scalar_one()}
-            if blocked == set(pids):
+                blockers = {pid: set(observer.execute(text('SELECT pg_blocking_pids(:p)'), {'p': pid}).scalar_one()) for pid in pids}
+            if (all(blockers.values()) and all(b <= {holder_pid, *pids} for b in blockers.values())
+                    and any(holder_pid in b for b in blockers.values())):
                 return
             sleep(0.02)
-        self.fail(f'workers not blocked on the user lock: {sorted(blocked)} of {sorted(pids)}')
+        self.fail(f'workers not all waiting on the user lock behind the holder: {blockers}')
 
 
 # =========================================================================== BE-3
