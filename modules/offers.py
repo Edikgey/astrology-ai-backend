@@ -7,6 +7,7 @@ new options come from the environment (names only in git). The month keeps its e
 import os
 import re
 from decimal import Decimal
+from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -69,6 +70,19 @@ def available(provider, product):
     else:
         from modules.lava_client import configured
     return configured()
+
+
+def with_product(url, product):
+    """Return URL of one payment + exactly one closed `product` (DESIGN §13), before any `#`; the rest stays as is.
+
+    The tab that comes back knows which confirmation to wait for; access is still decided by /account/usage.
+    A variable that already names a product is a configuration error (ValueError).
+    """
+    if product not in PRODUCTS or "product" in parse_qs(urlsplit(url).query, keep_blank_values=True):
+        raise ValueError("Return URL already names a product")
+    base, hash_mark, fragment = url.partition("#")
+    joiner = "" if base.endswith(("?", "&")) else "&" if "?" in base else "?"
+    return base + joiner + "product=" + product + hash_mark + fragment
 
 
 def public_offers():

@@ -78,6 +78,14 @@ def config():
         raise HTTPException(503, RUB_NOT_AVAILABLE) from None
 
 
+def product_returns(returns, product):
+    """The three return URLs of one invoice, each naming its product once (DESIGN §13)."""
+    try:
+        return {field: offers.with_product(url, product) for field, url in returns.items()}
+    except ValueError:
+        raise HTTPException(503, RUB_NOT_AVAILABLE) from None
+
+
 def configured():
     try:
         config()

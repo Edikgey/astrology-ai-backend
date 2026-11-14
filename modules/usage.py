@@ -143,6 +143,10 @@ def account_usage(db, user_id):
             QuestionPack.user_id == user_id, QuestionPack.state.in_(("creating", "ready")),
             QuestionPack.created_at >= now - PACK_PENDING_WINDOW,
             or_(QuestionPack.expires_at.is_(None), QuestionPack.expires_at > now)).first() is not None
+        # A pack paid within the same window: lets a returning tab confirm the pack (DESIGN §13); revoked never counts.
+        result["pack_recently_paid"] = db.query(QuestionPack).filter(
+            QuestionPack.user_id == user_id, QuestionPack.state == "paid",
+            QuestionPack.paid_at >= now - PACK_PENDING_WINDOW).first() is not None
         from modules.lava_client import configured
         result["lava_checkout_available"] = configured()
         from modules.stripe_billing import configured as stripe_configured

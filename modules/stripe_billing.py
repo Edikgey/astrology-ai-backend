@@ -105,7 +105,7 @@ def configured():
         return False
 
 
-def return_url(name):
+def return_url(name, product=None):
     value = os.getenv(name, "")
     parts = urlsplit(value)
     try:
@@ -118,7 +118,12 @@ def return_url(name):
         allowed = parts.scheme == "http" and parts.hostname in ("localhost", "127.0.0.1") and port == 3000
     if not allowed or parts.username or parts.password:
         raise HTTPException(503, STRIPE_UNAVAILABLE)
-    return value
+    if product is None:  # the portal returns to the account page, no payment to confirm
+        return value
+    try:
+        return offers.with_product(value, product)
+    except ValueError:
+        raise HTTPException(503, STRIPE_UNAVAILABLE) from None
 
 
 def api():
@@ -247,7 +252,7 @@ def create_checkout(db, user_id, product="premium_month"):
         client = api()
         stage = "price_read"
         validate_price(client.prices.retrieve(price), product=product)
-        destination = return_url("STRIPE_CHECKOUT_RETURN_URL")
+        destination = return_url("STRIPE_CHECKOUT_RETURN_URL", product)
         stage = "intent_bind"
         user = locked_billing_user(db, user_id)
         eligible_checkout(db, user, product)
@@ -326,7 +331,7 @@ def create_pack_checkout(db, user_id, price):
         client = api()
         stage = "price_read"
         validate_price(client.prices.retrieve(price), product="question_pack")
-        destination = return_url("STRIPE_CHECKOUT_RETURN_URL")
+        destination = return_url("STRIPE_CHECKOUT_RETURN_URL", "question_pack")
         stage = "pack_bind"
         user = locked_billing_user(db, user_id)
         pack = db.query(QuestionPack).filter_by(user_id=user_id, provider="stripe", account_id=account, livemode=live).filter(

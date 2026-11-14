@@ -134,6 +134,7 @@ def create_checkout(db, user_id, product="premium_month"):
     if product == "question_pack":
         return create_pack_checkout(db, user_id, target)
     offer, returns = api.config()
+    returns = api.product_returns(returns, product)
     offer, periodicity = target or offer, offers.LAVA_PERIODICITY[product]
     binding = None
     try:
@@ -195,7 +196,7 @@ def create_checkout(db, user_id, product="premium_month"):
 
 def create_pack_checkout(db, user_id, offer):
     """One-time invoice for a question pack; independent of the subscription attempt and its ownership."""
-    _, returns = api.config()
+    returns = api.product_returns(api.config()[1], "question_pack")
     pack_id = None
     try:
         user = locked_user(db, user_id)
