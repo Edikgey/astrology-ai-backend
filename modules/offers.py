@@ -19,6 +19,7 @@ STRIPE_CENTS = {"premium_month": 999, "premium_year": 6999, "question_pack": 499
 LAVA_RUB = {"premium_month": Decimal("799"), "premium_year": Decimal("4790"), "question_pack": Decimal("399")}
 LAVA_PERIODICITY = {"premium_month": "MONTHLY", "premium_year": "PERIOD_YEAR", "question_pack": "ONE_TIME"}
 INTERVALS = {"premium_month": "month", "premium_year": "year"}
+LAVA_SUBSCRIPTIONS = {"MONTHLY": "premium_month", "PERIOD_YEAR": "premium_year"}  # lava_checkouts.periodicity
 VARIABLES = {
     ("stripe", "premium_year"): "STRIPE_PREMIUM_ANNUAL_PRICE_ID",
     ("stripe", "question_pack"): "STRIPE_QUESTION_PACK_PRICE_ID",
@@ -31,6 +32,8 @@ BETA_REFUSALS = {
     "premium_year": "Годовой тариф появится после окончания бесплатной беты.",
     "question_pack": "Сейчас идёт бесплатная бета: вопросы без лимита, пакет не нужен.",
 }
+HAS_PREMIUM_YEAR = ("У вас уже есть Premium. Годовой тариф можно оформить, когда закончится текущий период: "
+                    "отключите продление в «Мои карты».")
 PACK_PENDING = ("Проверяем оплату пакета. Не оплачивайте повторно — обновите страницу через минуту. "
                 "Если сообщение повторится, напишите в поддержку: lunariaai.support@gmail.com.")
 

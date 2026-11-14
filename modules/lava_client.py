@@ -10,8 +10,9 @@ from uuid import UUID
 import httpx
 from fastapi import HTTPException
 
+from modules import offers
+
 BASE_URL = "https://gate.lava.top"
-PREMIUM_RUB = Decimal("799")
 logger = logging.getLogger(__name__)
 
 # One neutral text: the same request serves reads, invoice creation and cancellation.
@@ -143,8 +144,13 @@ def request(method, path, **kwargs):
         raise HTTPException(502, PROVIDER_SILENT) from None
 
 
-def verified_offer(offer_id):
-    """Reject catalog drift before creating a chargeable invoice; never set custom amount."""
+def verified_offer(offer_id, option="premium_month"):
+    """Reject catalog drift before creating a chargeable invoice; never set custom amount.
+
+    Subscriptions (month, year) need a SUBSCRIPTION product; the pack a one-time product (not a subscription).
+    """
+    periodicity, amount = offers.LAVA_PERIODICITY[option], offers.LAVA_RUB[option]
+    subscription = periodicity != "ONE_TIME"
     path = "/api/v2/products?showAllSubscriptionPeriods=true"
     for _ in range(20):
         catalog = request("GET", path)
@@ -155,9 +161,9 @@ def verified_offer(offer_id):
                 if offer.get("id") != offer_id:
                     continue
                 prices = [p for p in offer.get("prices", []) if p.get("currency") == "RUB"
-                          and p.get("periodicity") == "MONTHLY"]
-                if (product.get("type") != "SUBSCRIPTION" or product.get("isDynamicPrice") is True
-                        or len(prices) != 1 or Decimal(str(prices[0].get("amount"))) != PREMIUM_RUB):
+                          and p.get("periodicity") == periodicity]
+                if ((product.get("type") == "SUBSCRIPTION") != subscription or product.get("isDynamicPrice") is True
+                        or len(prices) != 1 or Decimal(str(prices[0].get("amount"))) != amount):
                     raise HTTPException(503, RUB_TEMPORARILY_UNAVAILABLE)
                 return external_id(product["id"])
         following = catalog.get("nextPage")

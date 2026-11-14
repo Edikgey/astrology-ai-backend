@@ -34,8 +34,6 @@ CHECKOUT_UNKNOWN = ("Не удалось открыть или проверит�
 CHECKOUT_MANUAL = ("Прошлую оплату нужно проверить вручную. Не оплачивайте повторно — напишите в поддержку: "
                    "lunariaai.support@gmail.com.")
 STRIPE_UNAVAILABLE = "Stripe сейчас недоступен. Попробуйте позже."
-HAS_PREMIUM_YEAR = ("У вас уже есть Premium. Годовой тариф можно оформить, когда закончится текущий период: "
-                    "отключите продление в «Мои карты».")
 
 
 def log_checkout_failure(stage, error):
@@ -164,7 +162,7 @@ def eligible_checkout(db, user, product="premium_month"):
         raise HTTPException(409, ("Подписка этого аккаунта оформлена через Lava.top, поэтому оплата через Stripe недоступна. "
                                  "Чтобы сменить способ оплаты, напишите в поддержку: lunariaai.support@gmail.com."))
     if product == "premium_year" and effective_plan(user) == "premium":
-        raise HTTPException(409, HAS_PREMIUM_YEAR)
+        raise HTTPException(409, offers.HAS_PREMIUM_YEAR)
     if effective_plan(user) == "premium" or user.subscription_status in ("active", "past_due", "paused", "trialing", "unpaid", "incomplete"):
         raise HTTPException(409, ("У аккаунта уже есть подписка или незавершённая оплата. Не оплачивайте повторно — "
                                  "обновите страницу через минуту. Если Premium не появится, напишите в поддержку: "

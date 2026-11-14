@@ -12,8 +12,9 @@ from fastapi import HTTPException
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from database.queries import User, BillingEvent, LavaCheckout
+from database.queries import User, BillingEvent, LavaCheckout, QuestionPack
 from modules import lava_client as api
+from modules import offers
 from modules.subscription_access import apply_subscription_access
 from modules.usage import locked_user
 from modules.plans import effective_plan
@@ -34,6 +35,13 @@ CHECKOUT_UNKNOWN = ("Не удалось открыть или проверит�
 HAS_SUBSCRIPTION = ("Оплата в рублях для этого аккаунта недоступна: у него уже есть подписка или оплата через Stripe. "
                     "Чтобы сменить способ оплаты, напишите в поддержку: lunariaai.support@gmail.com.")
 NO_LAVA_SUBSCRIPTION = "У аккаунта нет подписки через Lava.top — отключать нечего. Обновите страницу."
+OTHER_INVOICE = ("В Lava уже открыта оплата другого тарифа Premium. Завершите её во вкладке Lava или напишите в "
+                 "поддержку: lunariaai.support@gmail.com. Не оплачивайте оба.")
+CREATION_UNCLEAR = "Создание оплаты ожидает проверки. Обратитесь в поддержку перед повторной оплатой."
+
+
+def subscription_amount(periodicity):
+    return offers.LAVA_RUB[offers.LAVA_SUBSCRIPTIONS[periodicity]]
 
 
 def owns_checkout(db, user, checkout):
@@ -82,7 +90,7 @@ def reconcile_checkout(db, user_id):
     if not checkout:
         db.rollback()
         return
-    binding, contract, buyer = checkout.id, checkout.contract_id, checkout.buyer_email
+    binding, contract, buyer, periodicity = checkout.id, checkout.contract_id, checkout.buyer_email, checkout.periodicity
     db.rollback()
     if not contract:
         raise HTTPException(409, CHECKOUT_PENDING)
@@ -93,7 +101,7 @@ def reconcile_checkout(db, user_id):
         status = invoice["status"]
         if status not in ("NEW", "IN_PROGRESS", "COMPLETED", "FAILED"):
             raise ValueError()
-        state = snapshot(SimpleNamespace(contract_id=contract, buyer_email=buyer)) if status == "FAILED" else None
+        state = snapshot(SimpleNamespace(contract_id=contract, buyer_email=buyer, periodicity=periodicity)) if status == "FAILED" else None
     except (ValueError, KeyError, TypeError, AttributeError, InvalidOperation):
         raise HTTPException(502, CHECKOUT_UNKNOWN) from None
     user = locked_user(db, user_id)
@@ -122,39 +130,46 @@ def reconcile_checkout(db, user_id):
 
 
 def create_checkout(db, user_id, product="premium_month"):
-    if product != "premium_month":
-        raise HTTPException(503, "Этот вариант оплаты пока недоступен. Выберите другой или попробуйте позже.")
+    target = offers.require("lava", product)  # beta and unset options refuse before any provider call
+    if product == "question_pack":
+        return create_pack_checkout(db, user_id, target)
     offer, returns = api.config()
+    offer, periodicity = target or offer, offers.LAVA_PERIODICITY[product]
     binding = None
     try:
         reconcile_checkout(db, user_id)
         user = locked_user(db, user_id)
+        if product == "premium_year" and user.plan == "premium":
+            raise HTTPException(409, offers.HAS_PREMIUM_YEAR)
         if user.payment_provider not in (None, "lava") or user.plan == "premium" or user.subscription_status in ("active", "past_due", "paused", "trialing"):
             raise HTTPException(409, HAS_SUBSCRIPTION)
         old = db.query(LavaCheckout).filter_by(user_id=user_id).order_by(LavaCheckout.created_at.desc()).first()
         if old and old.state in ("creating", "ready"):
+            if old.periodicity != periodicity:
+                raise HTTPException(409, OTHER_INVOICE)  # Lava cannot cancel an open invoice
             if not old.payment_url:
-                raise HTTPException(409, "Создание оплаты ожидает проверки. Обратитесь в поддержку перед повторной оплатой.")
+                raise HTTPException(409, CREATION_UNCLEAR)
             db.commit()
             return {"url": old.payment_url}
         email = user.email
         db.rollback()
-        product = api.verified_offer(offer)
+        # One positional argument for the month keeps the existing catalog check call unchanged.
+        product = api.verified_offer(offer) if periodicity == "MONTHLY" else api.verified_offer(offer, product)
         # Recheck while locked after catalog HTTP; simultaneous checkouts serialize.
         user = locked_user(db, user_id)
         if user.payment_provider not in (None, "lava") or user.plan == "premium" or user.subscription_status in ("active", "past_due", "paused", "trialing"):
             raise HTTPException(409, HAS_SUBSCRIPTION)
         if db.query(LavaCheckout).filter_by(user_id=user_id).filter(LavaCheckout.state.in_(("creating", "ready"))).first():
             raise HTTPException(409, "Оплата уже создаётся. Обновите страницу.")
-        checkout = LavaCheckout(user_id=user_id, offer_id=offer, product_id=product, buyer_email=email)
+        checkout = LavaCheckout(user_id=user_id, offer_id=offer, product_id=product, buyer_email=email, periodicity=periodicity)
         db.add(checkout); db.flush()
         binding = checkout.id
         db.commit()  # Keep ambiguous attempts blocked; never retry invoice POST automatically.
         response = api.request("POST", "/api/v3/invoice", json={"email": email, "offerId": offer,
-            "currency": "RUB", "periodicity": "MONTHLY", "buyerLanguage": "RU", **returns})
+            "currency": "RUB", "periodicity": periodicity, "buyerLanguage": "RU", **returns})
         contract = api.external_id(response["id"])
         url = api.https_url(response["paymentUrl"])
-        if response.get("amountTotal", {}).get("currency") != "RUB" or Decimal(str(response["amountTotal"]["amount"])) != api.PREMIUM_RUB:
+        if response.get("amountTotal", {}).get("currency") != "RUB" or Decimal(str(response["amountTotal"]["amount"])) != subscription_amount(periodicity):
             raise ValueError("Unexpected invoice amount")
         locked_user(db, user_id)
         checkout = db.get(LavaCheckout, binding)
@@ -169,6 +184,80 @@ def create_checkout(db, user_id, product="premium_month"):
             if checkout.state == "creating" and not checkout.contract_id and not checkout.payment_url:
                 # Lava refused or the request never left: no invoice exists, so nothing to reconcile.
                 checkout.state = "rejected"
+            db.commit()
+        raise
+    except HTTPException:
+        db.rollback(); raise
+    except (ValueError, KeyError, TypeError, AttributeError, InvalidOperation):
+        db.rollback()
+        raise HTTPException(502, "Оплату нужно проверить. Обратитесь в поддержку перед повторной оплатой.") from None
+
+
+def create_pack_checkout(db, user_id, offer):
+    """One-time invoice for a question pack; independent of the subscription attempt and its ownership."""
+    _, returns = api.config()
+    pack_id = None
+    try:
+        user = locked_user(db, user_id)
+        pack = db.query(QuestionPack).filter_by(user_id=user_id, provider="lava").filter(
+            QuestionPack.state.in_(("creating", "ready"))).order_by(QuestionPack.created_at.desc()).first()
+        email = user.email
+        if pack:
+            if not pack.contract_id or not pack.payment_url:
+                raise HTTPException(409, CREATION_UNCLEAR)
+            binding, contract, buyer, url = pack.id, pack.contract_id, pack.buyer_email, pack.payment_url
+            db.rollback()
+            # Read before reuse: FAILED opens a new invoice, a paid or paying one is never offered again.
+            invoice = api.request("GET", "/api/v2/invoices/" + contract)
+            try:
+                if api.external_id(invoice["id"]) != contract or invoice["buyer"]["email"] != buyer:
+                    raise ValueError()
+                status = invoice["status"]
+                if status not in ("NEW", "IN_PROGRESS", "COMPLETED", "FAILED"):
+                    raise ValueError()
+            except (ValueError, KeyError, TypeError, AttributeError):
+                raise HTTPException(502, CHECKOUT_UNKNOWN) from None
+            if status == "NEW":
+                return {"url": url}
+            if status != "FAILED":
+                raise HTTPException(409, offers.PACK_PENDING)
+            locked_user(db, user_id)
+            pack = db.get(QuestionPack, binding)
+            db.refresh(pack)
+            if pack.state != "ready":
+                raise HTTPException(409, offers.PACK_PENDING)
+            pack.state = "failed"
+            db.commit()
+        db.rollback()
+        product = api.verified_offer(offer, "question_pack")
+        locked_user(db, user_id)  # recheck after catalog HTTP; simultaneous clicks serialize
+        if db.query(QuestionPack).filter_by(user_id=user_id, provider="lava").filter(
+                QuestionPack.state.in_(("creating", "ready"))).first():
+            raise HTTPException(409, "Оплата уже создаётся. Обновите страницу.")
+        pack = QuestionPack(user_id=user_id, provider="lava", quantity=offers.PACK_SIZE, state="creating",
+                            offer_id=offer, product_id=product, buyer_email=email)
+        db.add(pack); db.flush()
+        pack_id = pack.id
+        db.commit()  # keep an ambiguous attempt blocked; the invoice POST is never retried automatically
+        response = api.request("POST", "/api/v3/invoice", json={"email": email, "offerId": offer,
+            "currency": "RUB", "periodicity": "ONE_TIME", "buyerLanguage": "RU", **returns})
+        contract = api.external_id(response["id"])
+        url = api.https_url(response["paymentUrl"])
+        if (response.get("amountTotal", {}).get("currency") != "RUB"
+                or Decimal(str(response["amountTotal"]["amount"])) != offers.LAVA_RUB["question_pack"]):
+            raise ValueError("Unexpected invoice amount")
+        locked_user(db, user_id)
+        pack = db.get(QuestionPack, pack_id)
+        pack.contract_id, pack.payment_url, pack.state = contract, url, "ready"
+        db.commit()
+        return {"url": url}
+    except api.InvoiceNotCreated:
+        db.rollback()
+        if pack_id:
+            locked_user(db, user_id)
+            pack = db.get(QuestionPack, pack_id)
+            if pack.state == "creating" and not pack.contract_id and not pack.payment_url:
+                pack.state = "rejected"  # Lava refused or the request never left: no invoice exists
             db.commit()
         raise
     except HTTPException:
@@ -209,21 +298,26 @@ def parse_event(body):
     at = utc(body["cancelledAt"] if kind == "subscription.cancelled" else body["timestamp"])
     contract = api.external_id(body["contractId"])
     root = api.external_id(body["parentContractId"]) if body.get("parentContractId") else contract
+    amount = None
     if kind == "subscription.cancelled":
         utc(body["willExpireAt"])
     else:
-        expected = "subscription-active" if kind.endswith(".success") else "subscription-failed"
-        if body["status"] != expected or body["currency"] != "RUB" or Decimal(str(body["amount"])) != api.PREMIUM_RUB:
+        # A subscription reports subscription-*, a one-time pack completed/failed; the amount is checked
+        # against the bought product after binding.
+        expected = ("subscription-active", "completed") if kind.endswith(".success") else ("subscription-failed", "failed")
+        amount = Decimal(str(body["amount"]))
+        if body["status"] not in expected or body["currency"] != "RUB" or not amount.is_finite() or amount <= 0:
             raise ValueError()
     # Documented immutable contract/event/time fields; exclude error text and delivery details.
     key = hashlib.sha256(json.dumps([kind, contract, root, at.isoformat()], separators=(",", ":")).encode()).hexdigest()
-    return dict(kind=kind, key=key, at=at, data=body, details=None, root=root, contract=contract,
-                product=api.external_id(body["product"]["id"]), email=email(body["buyer"]["email"]))
+    return dict(kind=kind, key=key, at=at, data=body, details=None, root=root, contract=contract, amount=amount,
+                status=body.get("status"), product=api.external_id(body["product"]["id"]), email=email(body["buyer"]["email"]))
 
 
 def snapshot(checkout):
     value = api.request("GET", "/api/v1/subscriptions/" + checkout.contract_id)
-    if api.external_id(value["id"]) != checkout.contract_id or value["buyer"]["email"] != checkout.buyer_email or value["periodicity"] != "MONTHLY":
+    if (api.external_id(value["id"]) != checkout.contract_id or value["buyer"]["email"] != checkout.buyer_email
+            or value["periodicity"] != checkout.periodicity):
         raise ValueError("Subscription binding mismatch")
     if value["subscriptionStatus"] not in ("ACTIVE", "CANCELLED", "FAILED"):
         raise ValueError()
@@ -241,7 +335,7 @@ def snapshot(checkout):
             payments.append((utc(payment["datetime"]), payment))
             completed_ids.add(api.external_id(payment["id"]))
     paid = max(payments, key=lambda p: p[0]) if payments else None
-    if paid and (Decimal(str(paid[1]["amount"])) != api.PREMIUM_RUB or paid[1]["currency"] != "RUB"):
+    if paid and (Decimal(str(paid[1]["amount"])) != subscription_amount(checkout.periodicity) or paid[1]["currency"] != "RUB"):
         raise ValueError("Unexpected paid amount")
     return dict(paid=paid[0] if paid else None, end=end, cancelled=cancelled,
                 terminated=terminated, status=value["subscriptionStatus"], completed_ids=completed_ids)
@@ -270,6 +364,7 @@ def apply_snapshot(db, user, checkout, state):
         cancel_at = end if state["status"] == "CANCELLED" or state["cancelled"] else None
         apply_subscription_access(db, user, "grant", period_start=paid, period_end=end,
                                   scheduled_cancel_at=cancel_at)
+        user.current_period_interval = offers.INTERVALS[offers.LAVA_SUBSCRIPTIONS[checkout.periodicity]]
         user.subscription_status = "canceled" if cancel_at else "past_due" if state["status"] == "FAILED" else "active"
         checkout.paid_at = paid
     elif paid:
@@ -292,6 +387,9 @@ def process_event(db, body):
         event["key"] = "lava:" + event["key"]
         if db.get(BillingEvent, event["key"]):
             db.rollback(); return "duplicate"
+        if event["kind"] in FINANCIAL and db.query(QuestionPack).filter_by(
+                provider="lava", offer_id=event["offer"], product_id=event["product"]).first():
+            return process_pack_financial(db, event)
         if event["kind"] in FINANCIAL:
             candidates = db.query(LavaCheckout).filter_by(offer_id=event["offer"], product_id=event["product"],
                                                          buyer_email=event["email"]).all()
@@ -307,10 +405,16 @@ def process_event(db, body):
                 root = api.external_id((invoice.get("parentInvoice") or {}).get("id", event["contract"]))
                 checkout = db.query(LavaCheckout).filter_by(contract_id=root).first()
             if not checkout:
+                pack = db.query(QuestionPack).filter_by(provider="lava", contract_id=event["root"]).first()
+                if pack:
+                    return process_pack_payment(db, event, pack)
                 # Includes webhook-before-checkout-response race: retry, do not bind by email.
                 raise HTTPException(503, "Payment binding is not available yet")
             if checkout.product_id != event["product"] or checkout.buyer_email != event["email"]:
                 raise ValueError("Checkout mismatch")
+            if event["kind"] != "subscription.cancelled" and (not event["status"].startswith("subscription-")
+                    or event["amount"] != subscription_amount(checkout.periodicity)):
+                raise ValueError("Unexpected subscription payment")
             owner_checked = True
         binding, user_id = (checkout.id, checkout.user_id) if checkout else (None, None)
         state = None
@@ -325,7 +429,8 @@ def process_event(db, body):
             if (allowed or success) and needs_state:
                 # Load scalar binding before ending read transaction; HTTP has no DB lock.
                 checkout = db.get(LavaCheckout, binding)
-                saved = SimpleNamespace(contract_id=checkout.contract_id, buyer_email=checkout.buyer_email)
+                saved = SimpleNamespace(contract_id=checkout.contract_id, buyer_email=checkout.buyer_email,
+                                        periodicity=checkout.periodicity)
                 db.rollback()
                 state = snapshot(saved)
                 if event["kind"] not in FINANCIAL:
@@ -389,6 +494,76 @@ def process_event(db, body):
         raise HTTPException(400, "Invalid or unverified Lava event") from None
     except Exception:
         db.rollback(); raise
+
+
+def record_pack_event(db, event, user_id, details):
+    """Event row under the user lock; False when this delivery was already recorded."""
+    locked_billing_user(db, user_id)
+    insert = pg_insert if db.bind.dialect.name == "postgresql" else sqlite_insert
+    return db.execute(insert(BillingEvent).values(provider="lava", event_id=event["key"], event_type=event["kind"],
+        occurred_at=event["at"], processed_at=datetime.utcnow(), details=details, outcome="processed"
+    ).on_conflict_do_nothing(index_elements=["event_id"])).rowcount != 0
+
+
+def process_pack_payment(db, event, pack):
+    """A pack becomes paid once, after an authenticated invoice read confirms the one-time payment."""
+    success = event["kind"] == "payment.success"
+    if (event["kind"] not in ("payment.success", "payment.failed") or event["contract"] != event["root"]
+            or pack.product_id != event["product"] or pack.buyer_email != event["email"]
+            or event["status"] != ("completed" if success else "failed")
+            or (success and event["amount"] != offers.LAVA_RUB["question_pack"])):
+        raise ValueError("Pack payment mismatch")
+    pack_id, user_id, contract, buyer = pack.id, pack.user_id, pack.contract_id, pack.buyer_email
+    db.rollback()
+    invoice = api.request("GET", "/api/v2/invoices/" + contract)
+    receipt = invoice["receipt"]
+    if (api.external_id(invoice["id"]) != contract or invoice["type"] != "INVOICE" or invoice["buyer"]["email"] != buyer
+            or receipt["currency"] != "RUB" or Decimal(str(receipt["amount"])) != offers.LAVA_RUB["question_pack"]):
+        raise ValueError("Pack invoice mismatch")
+    if invoice["status"] != ("COMPLETED" if success else "FAILED"):
+        raise HTTPException(503, "Payment confirmation is pending")
+    if not record_pack_event(db, event, user_id, {"pack_id": pack_id}):
+        db.commit(); return "duplicate"
+    pack = db.get(QuestionPack, pack_id)
+    db.refresh(pack)
+    outcome = "pack_unchanged"
+    if pack.state in ("creating", "ready"):
+        pack.state = "paid" if success else "failed"
+        if success:
+            pack.paid_at = datetime.utcnow()
+        outcome = "pack_granted" if success else "pack_failed"
+    db.get(BillingEvent, event["key"]).outcome = outcome
+    db.commit()
+    return outcome
+
+
+def process_pack_financial(db, event):
+    """No contract id in a Lava refund: revoke only when exactly one paid pack of this email matches."""
+    candidates = db.query(QuestionPack).filter_by(provider="lava", offer_id=event["offer"], product_id=event["product"],
+                                                  buyer_email=event["email"], state="paid").all()
+    candidates = [pack for pack in candidates if pack.paid_at <= event["at"]]
+    if len(candidates) != 1:
+        db.rollback()
+        insert = pg_insert if db.bind.dialect.name == "postgresql" else sqlite_insert
+        result = db.execute(insert(BillingEvent).values(provider="lava", event_id=event["key"], event_type=event["kind"],
+            occurred_at=event["at"], processed_at=datetime.utcnow(), details=event["details"], outcome="recorded_unmatched"
+        ).on_conflict_do_nothing(index_elements=["event_id"]))
+        db.commit()
+        return "recorded_unmatched" if result.rowcount else "duplicate"
+    pack_id, user_id = candidates[0].id, candidates[0].user_id
+    db.rollback()
+    if not record_pack_event(db, event, user_id, {**event["details"], "pack_id": pack_id}):
+        db.commit(); return "duplicate"
+    pack = db.get(QuestionPack, pack_id)
+    db.refresh(pack)
+    outcome = "pack_unchanged"
+    if pack.state == "paid":
+        pack.state, pack.revoked_at = "revoked", datetime.utcnow()
+        pack.revoke_reason = "refund" if event["kind"] == "refund.success" else "dispute"
+        outcome = "pack_revoked"
+    db.get(BillingEvent, event["key"]).outcome = outcome
+    db.commit()
+    return outcome
 
 
 def cancel_subscription(db, user_id):
