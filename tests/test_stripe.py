@@ -52,6 +52,15 @@ def event(kind='invoice.paid', object_id=INVOICE, event_id=None):
         'created': int(time.time()), 'type': kind, 'data': {'object': {'id': object_id}}}
 
 
+def refund_object(**changes):
+    """Shape of a real Stripe Refund (read on the stand, PAY-REFUND-EVENT): it has NO `livemode`."""
+    value = {'id': 're_test', 'object': 'refund', 'amount': 999, 'charge': 'ch_test', 'currency': 'usd',
+             'payment_intent': 'pi_isolated', 'status': 'succeeded', 'created': int(time.time()), 'metadata': {}}
+    value.update(changes)
+    assert 'livemode' not in value, 'a real Refund has no livemode'
+    return value
+
+
 def install_fake(test):
     test.api = Mock()
     test.api.prices.retrieve.side_effect = lambda _: price()
@@ -66,7 +75,7 @@ def install_fake(test):
     test.api.checkout.sessions.create.return_value = {'id': 'cs_live_new', 'livemode': True, 'status': 'open',
         'client_secret': 'cs_live_new_secret_test', 'expires_at': int(time.time()) + 3600}
     test.api.billing_portal.sessions.create.return_value = {'url': 'https://billing.stripe.com/p/session/test'}
-    test.api.refunds.retrieve.return_value = {'id': 're_test', 'livemode': True, 'charge': 'ch_test', 'amount': 999, 'currency': 'usd', 'status': 'succeeded'}
+    test.api.refunds.retrieve.return_value = refund_object()
     test.api.charges.retrieve.return_value = {'id': 'ch_test', 'livemode': True, 'payment_intent': 'pi_isolated', 'amount_refunded': 999, 'currency': 'usd'}
     test.api.disputes.retrieve.return_value = {'id': 'dp_test', 'livemode': True, 'charge': 'ch_test', 'amount': 999, 'currency': 'usd', 'status': 'needs_response'}
     mock = patch.object(billing, 'api', return_value=test.api); mock.start(); test.addCleanup(mock.stop)
