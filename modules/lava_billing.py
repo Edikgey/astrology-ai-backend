@@ -538,10 +538,15 @@ def process_pack_payment(db, event, pack):
 
 
 def process_pack_financial(db, event):
-    """No contract id in a Lava refund: revoke only when exactly one paid pack of this email matches."""
+    """No contract id in a Lava refund: act only when exactly one pack of this email was paid before the event.
+
+    Revoked packs stay candidates, so a repeated refund or a second dispute about the same pack never moves
+    on to another paid pack (paid -> revoked; already revoked -> unchanged; 0 or >= 2 -> unmatched).
+    """
     candidates = db.query(QuestionPack).filter_by(provider="lava", offer_id=event["offer"], product_id=event["product"],
-                                                  buyer_email=event["email"], state="paid").all()
-    candidates = [pack for pack in candidates if pack.paid_at <= event["at"]]
+                                                  buyer_email=event["email"]).filter(
+        QuestionPack.state.in_(("paid", "revoked"))).all()
+    candidates = [pack for pack in candidates if pack.paid_at and pack.paid_at <= event["at"]]
     if len(candidates) != 1:
         db.rollback()
         insert = pg_insert if db.bind.dialect.name == "postgresql" else sqlite_insert

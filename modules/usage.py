@@ -14,6 +14,7 @@ from modules.plans import plan_limits, effective_plan
 
 OPENAI_TIMEOUT_SECONDS = 60
 RESERVATION_TTL = timedelta(minutes=5)
+PACK_PENDING_WINDOW = timedelta(minutes=30)  # DESIGN §12, review round 1 (P2-1)
 
 
 def utcnow():
@@ -137,8 +138,10 @@ def account_usage(db, user_id):
                                                    and not user.scheduled_cancel_at))
         now = utcnow()
         result["pack_questions_remaining"] = sum(left for _, left in pack_balances(db, user_id, now))
+        # Bounded on the server clock: an abandoned payment stays a record but never holds the flag.
         result["pack_pending"] = db.query(QuestionPack).filter(
             QuestionPack.user_id == user_id, QuestionPack.state.in_(("creating", "ready")),
+            QuestionPack.created_at >= now - PACK_PENDING_WINDOW,
             or_(QuestionPack.expires_at.is_(None), QuestionPack.expires_at > now)).first() is not None
         from modules.lava_client import configured
         result["lava_checkout_available"] = configured()

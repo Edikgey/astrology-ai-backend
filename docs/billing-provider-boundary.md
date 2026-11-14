@@ -120,8 +120,11 @@ are used up or the Premium period is not valid. A pack never changes subscriptio
 ownership and can be bought with any plan at either provider. Refunds and disputes
 revoke only the unused remainder of their pack, also before the grant (Stripe finds
 the pack through PaymentIntent metadata); a closed dispute restores nothing. A Lava
-refund has no contract id: it revokes only when exactly one paid pack of that email
-matches, otherwise it is recorded unmatched for support.
+refund has no contract id: the candidates are that email's paid or already revoked
+packs paid before the event; exactly one paid is revoked, exactly one revoked stays
+as is (a repeat never moves to another pack), otherwise it is recorded unmatched for
+support. pack_pending is true only for an unfinished pack created at most 30 minutes
+ago (server clock).
 
 Stripe test mode exists only for the loopback stand: STRIPE_LIVEMODE is exactly
 "true" (production, unchanged) or exactly "false" (sk_test_ key, return URLs only
