@@ -15,7 +15,7 @@ from modules.interpretation import ChartInterpreter
 from uuid import UUID
 from modules.chart_limits import saved_chart_limit
 from modules import usage
-from modules.ai_transit_guard import require_supported_question
+from modules.ai_transit_guard import require_supported_chart_question
 from database.queries import Relationship
 from sqlalchemy import or_
 from modules.security_limits import enforce
@@ -293,7 +293,7 @@ def ask_gpt_interpretation(
     # Copy scalar values before reserve commits/expires the ORM instances.
     user_id, chart_id = current_user.id, chart.id
     chart_args = (chart.year, chart.month, chart.day, chart.hour, chart.lon, chart.lat)
-    require_supported_question(data.question)
+    require_supported_chart_question(data.question, chart)
     reservation_id = usage.reserve(db, user_id, chart_id)
     try:
         if 'text/event-stream' in request.headers.get('accept', ''):

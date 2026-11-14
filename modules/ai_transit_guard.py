@@ -1,13 +1,38 @@
-"""Detect explicit requests for chart facts that require dated transit data."""
+"""Detect requests for dated sky data and decide, before the quota, whether the chat can answer them.
+
+Calculated: transits of Jupiter..Pluto to a verified chart for 12 months (TRANSITS-1 DESIGN §4).
+"""
+import calendar
 import re
+from datetime import date, timedelta
 
 from fastapi import HTTPException
 
+from modules import transits
 
-TRANSIT_UNAVAILABLE = (
-    "Lunaria пока не рассчитывает транзиты. Могу объяснить, как они работают, "
-    "или разобрать положения в натальной карте."
+
+TRANSITS_LEGACY_CHART = (
+    "Для этой карты транзиты не считаются: она построена в старой версии Lunaria, где часовой пояс "
+    "рождения не проверялся. Постройте карту заново, выбрав место рождения из подсказок, и спросите "
+    "о транзитах в её чате."
 )
+TRANSITS_RELATIONSHIP = (
+    "В разборе пары транзиты не считаются. Спросите о транзитах в чате своей карты — там они "
+    "рассчитаны на 12 месяцев вперёд."
+)
+TRANSITS_NOT_CALCULATED = (
+    "Lunaria считает транзиты Юпитера, Сатурна, Урана, Нептуна и Плутона к натальной карте на "
+    "12 месяцев вперёд. Положения Солнца, Луны, Меркурия, Венеры и Марса на дату и переходы планет "
+    "в другой знак пока не считаются — спросите о транзитах к карте."
+)
+_MONTHS_GENITIVE = ("января", "февраля", "марта", "апреля", "мая", "июня",
+                    "июля", "августа", "сентября", "октября", "ноября", "декабря")
+
+
+def transits_beyond_horizon(last_day: date) -> str:
+    return (f"Транзиты рассчитаны с сегодняшнего дня по {last_day.day} {_MONTHS_GENITIVE[last_day.month - 1]} "
+            f"{last_day.year} года. Спросите о периоде в эти сроки.")
+
 
 _SENTENCE_END = re.compile(r"(?<=[.!?;])\s+|\n+")
 _TRANSIT = re.compile(r"\b(?:транзит\w*|transits?|transiting)\b")
@@ -57,23 +82,115 @@ _NATAL = re.compile(
 )
 
 
+# Bodies with calculated transits; any other named body is not calculated on a date.
+_SLOW_BODY = re.compile(r"юпитер|юпітер|jupiter|сатурн|saturn|уран|uranus|нептун|neptune|плутон|pluto")
+_GENERAL_BODY = re.compile(r"планет|planet")
+# A body after a possessive is the natal point a transit aims at («к моему Солнцу»), not the transiting body.
+_NATAL_POINT_BEFORE = re.compile(r"\b(?:мо[йяеёюиєї]\w*|мій|my|natal|натальн\w*)\s+$")
+_INGRESS = re.compile(r"\b(?:войд[её]т|перейд[её]т|увійде|перейде|enters?|will enter|moves? into)\b")
+_ASPECT_WORD = re.compile(
+    r"\b(?:квадрат\w*|трин\w*|оппозиц\w*|опозиц\w*|соединени\w*|з['’]єднан\w*|секстил\w*|аспект\w*|"
+    r"squares?|trines?|opposition|conjunction|sextile|aspects?)\b"
+)
+_BIRTH = re.compile(r"родил|рожд|born|народи|народж")
+_MONTHS = (
+    r"январ\w*|січ\w*|january", r"феврал\w*|лют\w*|february", r"март\w*|берез\w*|march",
+    r"апрел\w*|квіт\w*|april", r"ма[йяе]|трав\w*|may", r"июн\w*|черв\w*|june",
+    r"июл\w*|лип\w*|july", r"август\w*|серп\w*|august", r"сентябр\w*|верес\w*|september",
+    r"октябр\w*|жовт\w*|october", r"ноябр\w*|листопад\w*|november", r"декабр\w*|груд\w*|december",
+)
+_MONTH = "(" + "|".join(_MONTHS) + ")"
+_NUMERIC_DATE = re.compile(r"\b(\d{1,2})[./](\d{1,2})[./](\d{4}|\d{2})\b")
+_DAY_MONTH_YEAR = re.compile(r"\b(\d{1,2})\s+" + _MONTH + r"\s+(\d{4})\b")
+_MONTH_DAY_YEAR = re.compile(r"\b" + _MONTH + r"\s+(\d{1,2}),?\s+(\d{4})\b")
+_MONTH_YEAR = re.compile(r"\b" + _MONTH + r"\s+(\d{4})\b")
+_YEAR = re.compile(r"\b((?:19|20|21)\d{2})\b")
+_IN_YEARS = re.compile(
+    r"\b(?:через|in)\s+(\d+|два|две|дві|три|четыре|чотири|пять|п['’]ять|шесть|шість|семь|сім|восемь|вісім|"
+    r"девять|дев['’]ять|десять|пару|несколько|кілька|two|three|four|five|six|seven|eight|nine|ten|several)"
+    r"\s+(?:лет|года|рок\w*|years)\b"
+)
+
+
+def _sentences(question):
+    return _SENTENCE_END.split(question.casefold())
+
+
+def _needs_dated_data(sentence):
+    dated = _TIME.search(sentence)
+    asks_position = _PLACEMENT.search(sentence)
+    if _TRANSIT.search(sentence):
+        if _TRANSIT_REQUEST.search(sentence):
+            return True
+        if dated and (asks_position or _DATED_TRANSIT_REQUEST.search(sentence)):
+            return True
+        if asks_position and _TRANSITING.search(sentence) and _BODY.search(sentence):
+            return True
+    return bool(dated and asks_position and _BODY.search(sentence) and not _NATAL.search(sentence))
+
+
 def requires_transit_data(question: str) -> bool:
     """Keep general questions about transits and explicitly natal requests in chat."""
-    for sentence in _SENTENCE_END.split(question.casefold()):
-        dated = _TIME.search(sentence)
-        asks_position = _PLACEMENT.search(sentence)
-        if _TRANSIT.search(sentence):
-            if _TRANSIT_REQUEST.search(sentence):
-                return True
-            if dated and (asks_position or _DATED_TRANSIT_REQUEST.search(sentence)):
-                return True
-            if asks_position and _TRANSITING.search(sentence) and _BODY.search(sentence):
-                return True
-        if dated and asks_position and _BODY.search(sentence) and not _NATAL.search(sentence):
-            return True
-    return False
+    return any(_needs_dated_data(sentence) for sentence in _sentences(question))
+
+
+def _month_number(word):
+    return next(i + 1 for i, pattern in enumerate(_MONTHS) if re.fullmatch(pattern, word))
+
+
+def _date_outside(sentence, hz):
+    """True if the sentence names a date, month, year or "in N years" outside today-1 .. last_day+1."""
+    if _BIRTH.search(sentence):
+        return False
+    first, last = hz.today - timedelta(days=1), hz.last_day + timedelta(days=1)
+    found = []
+
+    def full_date(year, month, day):
+        try:
+            found.append(not first <= date(year, month, day) <= last)
+        except ValueError:      # not a calendar date, e.g. 31.02
+            pass
+        return " "
+
+    sentence = _NUMERIC_DATE.sub(
+        lambda m: full_date(int(m[3]) + (2000 if len(m[3]) == 2 else 0), int(m[2]), int(m[1])), sentence)
+    sentence = _DAY_MONTH_YEAR.sub(lambda m: full_date(int(m[3]), _month_number(m[2]), int(m[1])), sentence)
+    sentence = _MONTH_DAY_YEAR.sub(lambda m: full_date(int(m[3]), _month_number(m[1]), int(m[2])), sentence)
+    for match in _MONTH_YEAR.finditer(sentence):
+        year, month = int(match[2]), _month_number(match[1])
+        found.append(date(year, month, calendar.monthrange(year, month)[1]) < first or date(year, month, 1) > last)
+    sentence = _MONTH_YEAR.sub(" ", sentence)
+    found += [not hz.today.year <= int(year) <= hz.last_day.year for year in _YEAR.findall(sentence)]
+    found += [not m[1].isdigit() or int(m[1]) >= 2 for m in _IN_YEARS.finditer(sentence)]
+    return any(found)
+
+
+def _answerable(sentence):
+    """A slow body, the planets in general or no body is named, and it is not a sign or house ingress."""
+    if _INGRESS.search(sentence) and not _ASPECT_WORD.search(sentence):
+        return False
+    named = [m[0] for m in _BODY.finditer(sentence) if not _NATAL_POINT_BEFORE.search(sentence[:m.start()])]
+    return not named or any(_SLOW_BODY.match(word) or _GENERAL_BODY.match(word) for word in named)
 
 
 def require_supported_question(question: str) -> None:
+    """Pair chat: no transits there (DECISIONS №25)."""
     if requires_transit_data(question):
-        raise HTTPException(status_code=422, detail=TRANSIT_UNAVAILABLE)
+        raise HTTPException(status_code=422, detail=TRANSITS_RELATIONSHIP)
+
+
+def require_supported_chart_question(question: str, chart, now=None) -> None:
+    """Chart chat, before usage.reserve: answerable transit questions pass, the rest get an honest refusal."""
+    flagged = [sentence for sentence in _sentences(question) if _needs_dated_data(sentence)]
+    if not flagged:
+        return
+    zone = transits.verified_zone(chart)
+    if zone is None:
+        raise HTTPException(status_code=422, detail=TRANSITS_LEGACY_CHART)
+    hz = transits.horizon(zone, now or transits.server_now())
+    outside = [_date_outside(sentence, hz) for sentence in flagged]
+    if any(not out and _answerable(sentence) for sentence, out in zip(flagged, outside)):
+        return
+    if any(outside):
+        raise HTTPException(status_code=422, detail=transits_beyond_horizon(hz.last_day))
+    raise HTTPException(status_code=422, detail=TRANSITS_NOT_CALCULATED)
