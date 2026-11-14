@@ -93,9 +93,13 @@ class GuardRouteBase(TransitContextBase):
                 with self.subTest(question=payload['question'], sse=sse):
                     response = self.post(url, payload, sse)
                     self.assertEqual(response.status_code, 422, response.text)
-                    self.assertEqual(response.json()['detail'], detail)
-            provider.assert_not_called()
-        self.assertEqual(self.counts(), before)
+                    if isinstance(detail, (set, frozenset)):
+                        self.assertIn(response.json()['detail'], detail)
+                    else:
+                        self.assertEqual(response.json()['detail'], detail)
+            with self.subTest(question=payload['question'], check='no model, no quota'):
+                provider.assert_not_called()
+                self.assertEqual(self.counts(), before)
 
     def assert_answered_with_block(self, question):
         """A fresh verified chart per call: a long history would add a memory-summary provider call."""
@@ -149,6 +153,65 @@ class TransitQuestionTests(GuardRouteBase):
         self.assertEqual(ai_transit_guard.transits_beyond_horizon(date(2028, 3, 1)),
                          'Транзиты рассчитаны с сегодняшнего дня по 1 марта 2028 года. Спросите о периоде в эти сроки.')
         self.assertTrue(callable(ai_transit_guard.require_supported_chart_question))
+
+
+class GuardRound2Tests(GuardRouteBase):
+    """REVIEW.md of 7ed7589: P2-1 (a possessive before Moon/Mars must not turn a sky-position question into
+    an answerable one), P3-1 (year 0 is a clean 422, never 500), P3-3 (Chiron is not calculated), P3-2 (birth
+    sentence keeps its own date). JSON and SSE; refusals reach neither the model nor the quota."""
+
+    MY_FAST_BODY_ON_A_DATE = (
+        'Где будет моя Луна 1 декабря 2026?',
+        'Где сейчас мой Марс?',
+        'Where is my Moon now?',
+        'Где сейчас моя Луна?',
+        'Где сейчас моя Венера и мой Меркурий?',
+    )
+    TRANSITS_TO_MY_POINT = (                       # green guards: the possessive still marks the natal target
+        'Покажи транзиты к моему Солнцу',
+        'Какие транзиты к моей Луне?',
+        'Когда Сатурн будет в квадрате к моему Солнцу?',
+    )
+    YEAR_ZERO = (
+        'Какие транзиты в январе 0000?',
+        'Покажи мои транзиты на январь 0000.',
+        'Транзиты на 15.01.0000?',
+    )
+    CHIRON = (
+        'Где сейчас Хирон?',
+        'Покажи транзиты Хирона.',
+        'Where is Chiron now?',
+    )
+    BIRTH_SENTENCE = (                             # green guards: the birth date is not a date out of range
+        'Я родилась 15.03.1990. Какие у меня сейчас транзиты?',
+        'Я родилась 15.03.1990, какие у меня сейчас транзиты?',    # one sentence: the birth exception decides
+    )
+
+    def test_r2_p2_1_my_moon_or_mars_on_a_date_is_not_calculated(self):
+        cid = self.verified()
+        for question in self.MY_FAST_BODY_ON_A_DATE:
+            self.assert_refused('/ask-gpt', {'chart_id': cid, 'question': question}, NOT_CALCULATED_TEXT)
+
+    def test_r2_p2_1_transits_to_my_natal_point_still_pass(self):
+        self.premium()
+        for question in self.TRANSITS_TO_MY_POINT:
+            self.assert_answered_with_block(question)
+
+    def test_r2_p3_1_year_zero_is_a_clean_refusal_before_quota(self):
+        cid = self.verified()
+        for question in self.YEAR_ZERO:
+            self.assert_refused('/ask-gpt', {'chart_id': cid, 'question': question},
+                                frozenset({BEYOND_TEXT, NOT_CALCULATED_TEXT}))
+
+    def test_r2_p3_3_chiron_as_the_moving_body_is_not_calculated(self):
+        cid = self.verified()
+        for question in self.CHIRON:
+            self.assert_refused('/ask-gpt', {'chart_id': cid, 'question': question}, NOT_CALCULATED_TEXT)
+
+    def test_r2_p3_2_birth_sentence_date_is_not_out_of_range(self):
+        self.premium()
+        for question in self.BIRTH_SENTENCE:
+            self.assert_answered_with_block(question)
 
 
 class NatalQuestionsStillPass(cq.ChatQualityBase):
