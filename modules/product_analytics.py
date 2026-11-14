@@ -272,6 +272,40 @@ def capture_business(bind, user_id, name, properties, key, request_context=None)
         log.warning('Analytics handoff unavailable (%s)', type(error).__name__)
 
 
+def capture_payment_failure(db, user_id, provider, stage, key):
+    """Call only after the payment outcome is final (commit/rollback). Never raises, never changes it."""
+    try:
+        capture_business(db.get_bind(), user_id, 'payment_failed', {'provider': provider, 'stage': stage}, key, context.get())
+    except Exception as error:
+        log.warning('Analytics handoff unavailable (%s)', type(error).__name__)
+
+
+def shadow_limit(db, consent, user_id, name, properties, ctx, occurred_at):
+    """Beta only: would this successful action have hit the free limit? Real limits are not consulted or changed."""
+    from modules.free_beta import free_beta_enabled
+    from modules.plans import PLAN_LIMITS, effective_plan
+    from database.queries import User, NatalChart, GPTUsage
+    if name == 'ai_answer_completed':
+        resource = 'question'
+    elif name == 'guest_chart_saved' or (name == 'chart_creation_completed' and properties.get('actor') == 'account'):
+        resource = 'chart'
+    else:
+        return
+    user = db.get(User, user_id) if user_id else None
+    if not free_beta_enabled() or user is None or effective_plan(user) != 'free':
+        return
+    free = PLAN_LIMITS['free']
+    if resource == 'chart':
+        before, limit = db.query(NatalChart).filter(NatalChart.user_id == user_id).count() - 1, free.max_saved_charts
+    else:
+        before, limit = db.query(GPTUsage).filter(GPTUsage.user_id == user_id, GPTUsage.status == 'succeeded').count() - 1, free.gpt_message_limit
+    if before >= limit:
+        # One per account and resource while the outbox row is retained (7 days).
+        event_id = str(UUID(digest('event', f'free_limit:{resource}:{user_id}')[:32], version=4))
+        enqueue(db, consent, 'free_limit_would_block', {'resource': resource}, event_id=event_id,
+            session_id=ctx.get('session_id'), route_key=ctx.get('route_key'), viewport_class=ctx.get('viewport_class', 'unknown'), occurred_at=occurred_at)
+
+
 def drain_fact_queue(limit=20):
     for _ in range(limit):
         try:
@@ -312,7 +346,7 @@ def persist_business(bind, user_id, name, properties, key, request_context, occu
             if occurred_at and consent.accepted_at > occurred_at:
                 return
             event_id = str(UUID(digest('event', key)[:32], version=4))
-            enqueue(db, consent, name, properties, event_id=event_id,
+            accepted = enqueue(db, consent, name, properties, event_id=event_id,
                 session_id=ctx.get('session_id'), route_key=ctx.get('route_key'), viewport_class=ctx.get('viewport_class', 'unknown'), occurred_at=occurred_at)
             if name == 'billing_period_paid' and key.startswith('paid:'):
                 # Query financial facts only on the worker's separate connection.
@@ -326,6 +360,10 @@ def persist_business(bind, user_id, name, properties, key, request_context, occu
                         enqueue(db, consent, 'subscription_started', {'provider': period.provider}, event_id=started_id,
                             session_id=ctx.get('session_id'), route_key=ctx.get('route_key'), occurred_at=occurred_at)
             db.commit()
+            if accepted:
+                # Own transaction after the main event is committed: a failed count cannot drop it.
+                shadow_limit(db, consent, user_id, name, properties, ctx, occurred_at)
+                db.commit()
     except Exception as error:
         log.warning('Analytics capture unavailable (%s)', type(error).__name__)
 
@@ -359,6 +397,10 @@ def observe_flush(db, _):
                 elapsed = max(0, (now() - row.created_at).total_seconds())
                 bucket = 'under_5s' if elapsed < 5 else '5_to_15s' if elapsed < 15 else '15_to_30s' if elapsed < 30 else 'over_30s'
                 fact(row.user_id, 'ai_answer_completed', {'subject': 'relationship' if row.relationship_id else 'natal', 'latency': bucket}, f'answer:{row.id}')
+            elif (isinstance(row, NatalChart) and row not in db.new and row.user_id and ctx and ctx.get('auth')
+                    and state.attrs.user_id.history.has_changes()):
+                # Only migrate_guest_data_to_user assigns an owner to an existing chart (sign-in paths).
+                fact(row.user_id, 'guest_chart_saved', {'method': 'google' if ctx.get('auth') == 'google' else 'email'}, f'guest_chart:{row.id}')
             elif isinstance(row, BillingPeriod) and row.applied and (row in db.new or state.attrs.applied.history.has_changes()):
                 fact(row.user_id, 'billing_period_paid', {'provider': row.provider}, f'paid:{row.id}')
             elif isinstance(row, User):

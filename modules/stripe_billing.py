@@ -21,6 +21,7 @@ from database.queries import User, StripeCheckout, BillingCustomer, BillingEvent
 from modules.billing_conflicts import locked_billing_user, release_legacy_unpaid_owner, conflict_for, record_conflict
 from modules.subscription_access import apply_subscription_access
 from modules.plans import effective_plan
+from modules.product_analytics import capture_payment_failure
 
 logger = logging.getLogger(__name__)
 
@@ -384,6 +385,7 @@ def resolve(client, kind, obj):
 
 
 def process_event(db, event):
+    user_id, owner_checked = None, False  # analytics only: confirmation failures after ownership
     try:
         account, price = config()
         checked(event)
@@ -435,6 +437,7 @@ def process_event(db, event):
                     or sub.get("metadata", {}).get("user_id") != str(user_id)
                     or (saved_sub and saved_sub != sub_id)):
                 raise ValueError("Subscription ownership mismatch")
+            owner_checked = True
             items = sub["items"]
             if items.get("has_more") or len(items["data"]) != 1 or items["data"][0].get("quantity") != 1:
                 raise ValueError("Unexpected subscription items")
@@ -518,11 +521,17 @@ def process_event(db, event):
                 "invoice_id": invoice["id"] if invoice else None}
         db.get(BillingEvent, key).outcome = outcome
         db.commit()
+        if kind == "invoice.payment_failed" and invoice and invoice.get("status") != "paid":
+            stage = {"subscription_create": "first_payment", "subscription_cycle": "renewal"}.get(invoice.get("billing_reason"))
+            if stage:  # one per invoice: Stripe sends this event on every failed attempt
+                capture_payment_failure(db, user_id, "stripe", stage, "payment_failed:stripe:" + invoice["id"])
         return outcome
     except HTTPException:
         db.rollback(); raise
     except (ValueError, KeyError, TypeError, AttributeError, OverflowError):
         db.rollback()
+        if owner_checked and user_id:
+            capture_payment_failure(db, user_id, "stripe", "confirmation", "payment_failed:confirmation:" + key)
         raise HTTPException(400, "Invalid or unverified Stripe event") from None
     except stripe.StripeError:
         db.rollback()

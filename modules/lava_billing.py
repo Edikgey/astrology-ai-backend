@@ -18,6 +18,7 @@ from modules.subscription_access import apply_subscription_access
 from modules.usage import locked_user
 from modules.plans import effective_plan
 from modules.billing_conflicts import conflict_for, record_conflict, locked_billing_user
+from modules.product_analytics import capture_payment_failure
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +281,7 @@ def apply_snapshot(db, user, checkout, state):
 
 
 def process_event(db, body):
+    user_id, owner_checked = None, False  # analytics only: confirmation failures after binding
     try:
         event = parse_event(body)
         if event is None:
@@ -307,6 +309,7 @@ def process_event(db, body):
                 raise HTTPException(503, "Payment binding is not available yet")
             if checkout.product_id != event["product"] or checkout.buyer_email != event["email"]:
                 raise ValueError("Checkout mismatch")
+            owner_checked = True
         binding, user_id = (checkout.id, checkout.user_id) if checkout else (None, None)
         state = None
         if checkout:
@@ -370,11 +373,17 @@ def process_event(db, body):
                 checkout.updated_at = max(filter(None, (checkout.updated_at, event["at"], state["paid"], state["cancelled"], state["terminated"])))
         db.get(BillingEvent, event["key"]).outcome = outcome
         db.commit()
+        if state and user_id and event["kind"] in ("payment.failed", "subscription.recurring.payment.failed"):
+            # state comes from the Lava API, so the failure is confirmed, not just reported.
+            capture_payment_failure(db, user_id, "lava", "first_payment" if event["kind"] == "payment.failed" else "renewal",
+                                    "payment_failed:lava:" + event["contract"])
         return outcome
     except HTTPException:
         db.rollback(); raise
     except (ValueError, KeyError, TypeError, AttributeError, InvalidOperation):
         db.rollback()
+        if owner_checked and user_id:
+            capture_payment_failure(db, user_id, "lava", "confirmation", "payment_failed:confirmation:" + event["key"])
         raise HTTPException(400, "Invalid or unverified Lava event") from None
     except Exception:
         db.rollback(); raise
