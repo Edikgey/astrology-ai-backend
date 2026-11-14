@@ -74,11 +74,20 @@ def date(value):
     return datetime.utcfromtimestamp(value)
 
 
+def livemode():
+    """Exactly "true" is production; exactly "false" is the loopback test stand; anything else refuses."""
+    value = os.getenv("STRIPE_LIVEMODE")
+    if value not in ("true", "false"):
+        raise HTTPException(503, STRIPE_UNAVAILABLE)
+    return value == "true"
+
+
 def config():
     key = os.getenv("STRIPE_SECRET_KEY", "")
     account = os.getenv("STRIPE_ACCOUNT_ID", "")
     price = os.getenv("STRIPE_PREMIUM_PRICE_ID", "")
-    if (not key.startswith(("sk_live_", "rk_live_")) or os.getenv("STRIPE_LIVEMODE") != "true"
+    keys = ("sk_live_", "rk_live_") if livemode() else ("sk_test_",)
+    if (not key.startswith(keys)
             or not re.fullmatch(r"acct_[A-Za-z0-9]+", account)
             or not re.fullmatch(r"price_[A-Za-z0-9]+", price)
             or os.getenv("STRIPE_API_VERSION", API_VERSION) != API_VERSION):
@@ -97,7 +106,15 @@ def configured():
 def return_url(name):
     value = os.getenv(name, "")
     parts = urlsplit(value)
-    if parts.scheme != "https" or parts.hostname != "mylunariaai.com" or parts.username or parts.password or parts.port:
+    try:
+        port = parts.port
+    except ValueError:
+        raise HTTPException(503, STRIPE_UNAVAILABLE) from None
+    if livemode():
+        allowed = parts.scheme == "https" and parts.hostname == "mylunariaai.com" and not port
+    else:  # the test stand returns only to the local frontend
+        allowed = parts.scheme == "http" and parts.hostname in ("localhost", "127.0.0.1") and port == 3000
+    if not allowed or parts.username or parts.password:
         raise HTTPException(503, STRIPE_UNAVAILABLE)
     return value
 
@@ -117,7 +134,7 @@ def api():
 
 def checked(value):
     if isinstance(value, stripe.StripeObject): value = value.to_dict(recursive=True)
-    if value.get("livemode") is not True:
+    if value.get("livemode") is not livemode():
         raise ValueError("Wrong payment environment")
     return value
 
@@ -171,6 +188,7 @@ def create_checkout(db, user_id):
     if not configured():
         raise HTTPException(503, STRIPE_UNAVAILABLE)
     account, price = config()
+    live = livemode()
     stage = "account_read"
     try:
         client = api()
@@ -180,7 +198,7 @@ def create_checkout(db, user_id):
         stage = "intent_bind"
         user = locked_billing_user(db, user_id)
         eligible_checkout(db, user)
-        intent = db.query(StripeCheckout).filter_by(user_id=user_id, account_id=account, livemode=True).filter(
+        intent = db.query(StripeCheckout).filter_by(user_id=user_id, account_id=account, livemode=live).filter(
             StripeCheckout.state.in_(("creating", "ready"))).order_by(StripeCheckout.created_at.desc()).first()
         if intent and intent.session_id:
             saved_id = intent.session_id
@@ -200,12 +218,12 @@ def create_checkout(db, user_id):
         if intent and intent.created_at < datetime.utcnow() - timedelta(hours=23):
             # Stripe retains idempotency keys for at least 24h, not indefinitely.
             raise HTTPException(409, CHECKOUT_MANUAL)
-        customer = db.query(BillingCustomer).filter_by(user_id=user_id, provider="stripe", account_id=account, livemode=True).first()
+        customer = db.query(BillingCustomer).filter_by(user_id=user_id, provider="stripe", account_id=account, livemode=live).first()
         if customer is None:
-            customer = BillingCustomer(user_id=user_id, provider="stripe", account_id=account, livemode=True)
+            customer = BillingCustomer(user_id=user_id, provider="stripe", account_id=account, livemode=live)
             db.add(customer); db.flush()
         if intent is None:
-            intent = StripeCheckout(user_id=user_id, account_id=account, livemode=True)
+            intent = StripeCheckout(user_id=user_id, account_id=account, livemode=live)
             db.add(intent); db.flush()
         binding, customer_binding, customer_id, email = intent.id, customer.id, customer.customer_id, user.email
         if not customer_id and customer.created_at < datetime.utcnow() - timedelta(hours=23):
@@ -254,7 +272,8 @@ def create_checkout(db, user_id):
 
 def checkout_status(db, user_id, session_id):
     account, _ = config()
-    intent = db.query(StripeCheckout).filter_by(user_id=user_id, account_id=account, livemode=True, session_id=session_id).first()
+    live = livemode()
+    intent = db.query(StripeCheckout).filter_by(user_id=user_id, account_id=account, livemode=live, session_id=session_id).first()
     if intent is None: raise HTTPException(404, "Оплата не найдена. Обновите страницу.")
     return {"state": intent.state}
 
@@ -266,10 +285,11 @@ def portal_customer_id(db, user):
             or not user.provider_customer_id or not user.provider_subscription_id):
         return None
     account = os.getenv("STRIPE_ACCOUNT_ID", "")
+    live = os.getenv("STRIPE_LIVEMODE") != "false"  # unconfigured keeps the historical live scope
     customer = db.query(BillingCustomer).filter_by(user_id=user.id, provider="stripe",
-        account_id=account, livemode=True, customer_id=user.provider_customer_id).first()
+        account_id=account, livemode=live, customer_id=user.provider_customer_id).first()
     bound = db.query(StripeCheckout).filter_by(user_id=user.id, account_id=account,
-        livemode=True, customer_id=user.provider_customer_id,
+        livemode=live, customer_id=user.provider_customer_id,
         subscription_id=user.provider_subscription_id).first()
     return customer.customer_id if customer and bound else None
 
@@ -388,12 +408,13 @@ def process_event(db, event):
     user_id, owner_checked = None, False  # analytics only: confirmation failures after ownership
     try:
         account, price = config()
+        live = livemode()
         checked(event)
         if event.get("account") not in (None, account) or event.get("api_version") != API_VERSION:
             raise ValueError("Wrong account or API version")
         event_id, kind = ident(event, "evt"), event["type"]
         occurred = date(event["created"])
-        key = "stripe:" + account + ":live:" + event_id
+        key = "stripe:" + account + (":live:" if live else ":test:") + event_id  # production keeps its historical keys
         if db.get(BillingEvent, key):
             db.rollback(); return "duplicate"
         db.rollback()
@@ -403,7 +424,7 @@ def process_event(db, event):
         session, invoice, financial, sub_id = resolve(client, kind, event["data"]["object"])
         if sub_id:
             # Locate locally first when possible, then read lifecycle after revision capture.
-            intent = db.query(StripeCheckout).filter_by(subscription_id=sub_id, account_id=account, livemode=True).first()
+            intent = db.query(StripeCheckout).filter_by(subscription_id=sub_id, account_id=account, livemode=live).first()
             if intent is None:
                 discovery = checked(client.subscriptions.retrieve(sub_id))
                 binding = (discovery.get("metadata") or {}).get("checkout_binding")
@@ -416,7 +437,7 @@ def process_event(db, event):
         if intent is None:
             # Non-subscription financial records are audit only.
             return record_event(db, key, kind, occurred, "recorded_unmatched", financial)
-        if intent.account_id != account or intent.livemode is not True:
+        if intent.account_id != account or intent.livemode is not live:
             raise ValueError("Checkout environment mismatch")
         binding, user_id, revision = intent.id, intent.user_id, intent.revision
         expected_customer, saved_session, saved_sub = intent.customer_id, intent.session_id, intent.subscription_id
@@ -478,13 +499,13 @@ def process_event(db, event):
             row = None
             if period:
                 invoice_id, start, end = period
-                row = db.query(BillingPeriod).filter_by(provider="stripe", account_id=account, livemode=True, invoice_id=invoice_id).first()
+                row = db.query(BillingPeriod).filter_by(provider="stripe", account_id=account, livemode=live, invoice_id=invoice_id).first()
                 if row is None:
-                    row = db.query(BillingPeriod).filter_by(provider="stripe", account_id=account, livemode=True, subscription_id=sub_id, period_start=start).first()
+                    row = db.query(BillingPeriod).filter_by(provider="stripe", account_id=account, livemode=live, subscription_id=sub_id, period_start=start).first()
                 if row and (row.user_id != user_id or row.subscription_id != sub_id or row.period_start != start or row.period_end != end):
                     raise ValueError("Paid period mismatch")
                 if row is None:
-                    row = BillingPeriod(user_id=user_id, provider="stripe", account_id=account, livemode=True,
+                    row = BillingPeriod(user_id=user_id, provider="stripe", account_id=account, livemode=live,
                         invoice_id=invoice_id, subscription_id=sub_id, period_start=start, period_end=end)
                     db.add(row)
             if conflict or other:
