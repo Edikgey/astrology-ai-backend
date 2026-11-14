@@ -130,7 +130,7 @@ def reconcile_checkout(db, user_id):
 
 
 def create_checkout(db, user_id, product="premium_month"):
-    target = offers.require("lava", product)  # beta and unset options refuse before any provider call
+    target = offers.require("lava", product)  # unset options refuse before any provider call
     if product == "question_pack":
         return create_pack_checkout(db, user_id, target)
     offer, returns = api.config()
