@@ -121,7 +121,9 @@ def reconcile_checkout(db, user_id):
         raise HTTPException(409, CHECKOUT_PENDING)
 
 
-def create_checkout(db, user_id):
+def create_checkout(db, user_id, product="premium_month"):
+    if product != "premium_month":
+        raise HTTPException(503, "Этот вариант оплаты пока недоступен. Выберите другой или попробуйте позже.")
     offer, returns = api.config()
     binding = None
     try:
