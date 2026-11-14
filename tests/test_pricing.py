@@ -520,12 +520,14 @@ class PricingS0ProductionGuardTests(PricingBase):
         self.api.checkout.sessions.create.assert_not_called()
 
     def test_s0_11_guard_production_variables_keep_todays_checkout(self):
-        # GUARD: with production variables the monthly checkout is exactly today's.
+        # GUARD: with production variables the monthly checkout is today's. Intentional contract change (DESIGN §13,
+        # BE-R3-1): the return URL is the variable unchanged plus exactly one `product=premium_month`.
         response = self.checkout('stripe', self.other)
         self.assertEqual(response.status_code, 200, response.text)
         params, options = self.created[0]
         self.assertEqual((params['mode'], params['line_items'], params['return_url']),
-                         ('subscription', [{'price': sf.PRICE, 'quantity': 1}], sf.ENV['STRIPE_CHECKOUT_RETURN_URL']))
+                         ('subscription', [{'price': sf.PRICE, 'quantity': 1}],
+                          sf.ENV['STRIPE_CHECKOUT_RETURN_URL'] + '&product=premium_month'))
         self.assertTrue(options['idempotency_key'].startswith('checkout:'))
         with self.sessions() as db:
             self.assertEqual([c.livemode for c in db.query(StripeCheckout).filter_by(user_id=2)], [True])
