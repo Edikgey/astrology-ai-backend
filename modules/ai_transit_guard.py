@@ -25,6 +25,18 @@ TRANSITS_NOT_CALCULATED = (
     "12 месяцев вперёд. Положения Солнца, Луны, Меркурия, Венеры и Марса на дату и переходы планет "
     "в другой знак пока не считаются — спросите о транзитах к карте."
 )
+MY_MONTH_LEGACY_CHART = (
+    "Обзор месяца строится по транзитам, а для этой карты они не считаются: она построена в старой версии "
+    "Lunaria, где часовой пояс рождения не проверялся. Постройте карту заново, выбрав место рождения из "
+    "подсказок, и спросите о своём месяце в её чате."
+)
+MY_MONTH_RELATIONSHIP = (
+    "В разборе пары обзор месяца не строится — здесь нет транзитов. Спросите «Мой месяц» в чате своей карты."
+)
+MY_MONTH_UNAVAILABLE = (
+    "Сейчас не получилось рассчитать транзиты для обзора месяца. Квота не списана — попробуйте ещё раз через "
+    "несколько минут."
+)
 _MONTHS_GENITIVE = ("января", "февраля", "марта", "апреля", "мая", "июня",
                     "июля", "августа", "сентября", "октября", "ноября", "декабря")
 
@@ -136,6 +148,39 @@ def requires_transit_data(question: str) -> bool:
     return any(_needs_dated_data(sentence) for sentence in _sentences(question))
 
 
+# «Мой месяц» (MY-MONTH DESIGN §2.2): the next 30 days from today, not a calendar month («в декабре», «next month»).
+_RU_MONTH = r"месяц(?:а|у|ем|е)?"        # singular only: «ближайшие месяцы» is not a month overview
+_UK_MONTH = r"місяц(?:ь|я|ю|ем|і)?"
+_ANY_MONTH = "(?:" + _RU_MONTH + "|" + _UK_MONTH + ")"
+_MONTH_NAMED = re.compile(
+    r"\b(?:мой|моём|моем|мій|моєму|my)\s+(?:" + _ANY_MONTH + r"|month)\b|"
+    r"\b(?:прогноз\w*|обзор\w*|огляд\w*|гороскоп\w*|forecast|overview|horoscope)\s+"
+    r"(?:на\s+|for\s+(?:the\s+)?)?(?:" + _ANY_MONTH + r"|month)\b"
+)
+_MONTH_SCOPE = re.compile(
+    r"\b(?:этот|этом|этого|текущ\w*|ближайш\w*|цей|цьому|цього|поточн\w*|найближч\w*)\s+" + _ANY_MONTH + r"\b|"
+    r"\b(?:ближайш\w*|следующ\w*|найближч\w*|наступн\w*|next|coming)\s+(?:30|тридцать|тридцять|thirty)\s+(?:дн\w*|days)\b|"
+    r"\b" + _ANY_MONTH + r"\s+(?:вперёд|вперед|наперёд|наперед)\b|"
+    r"\b(?:this|coming)\s+month\b|\bmonth\s+ahead\b"
+)
+_MONTH_OUTLOOK = re.compile(
+    r"\b(?:жд[её]т|ждут|ждать|ожида\w*|будет|принес[её]т|предстоит|чека\w*|буде|принесе|"
+    r"прогноз\w*|обзор\w*|огляд\w*|expect\w*|forecast\w*|overview|outlook|will|bring\w*|hold\w*)\b|"
+    r"обратить\s+внимание|звернути\s+увагу|in\s+store"
+)
+
+
+def _asks_month(sentence):
+    if _BIRTH.search(sentence):
+        return False
+    return bool(_MONTH_NAMED.search(sentence) or (_MONTH_SCOPE.search(sentence) and _MONTH_OUTLOOK.search(sentence)))
+
+
+def is_month_request(question: str) -> bool:
+    """Pure: a request for the overview of the next 30 days (the «Мой месяц» button or written words)."""
+    return any(_asks_month(sentence) for sentence in _sentences(question))
+
+
 def _month_number(word):
     return next(i + 1 for i, pattern in enumerate(_MONTHS) if re.fullmatch(pattern, word))
 
@@ -184,15 +229,20 @@ def _answerable(sentence):
 
 
 def require_supported_question(question: str) -> None:
-    """Pair chat: no transits there (DECISIONS №25)."""
+    """Pair chat: no transits and no month overview there (DECISIONS №25, №26)."""
     if requires_transit_data(question):
         raise HTTPException(status_code=422, detail=TRANSITS_RELATIONSHIP)
+    if is_month_request(question):
+        raise HTTPException(status_code=422, detail=MY_MONTH_RELATIONSHIP)
 
 
 def require_supported_chart_question(question: str, chart, now=None) -> None:
     """Chart chat, before usage.reserve: answerable transit questions pass, the rest get an honest refusal."""
     flagged = [sentence for sentence in _sentences(question) if _needs_dated_data(sentence)]
     if not flagged:
+        # A month overview is built on transits: a legacy chart is refused here, before the quota.
+        if is_month_request(question) and transits.verified_zone(chart) is None:
+            raise HTTPException(status_code=422, detail=MY_MONTH_LEGACY_CHART)
         return
     zone = transits.verified_zone(chart)
     if zone is None:

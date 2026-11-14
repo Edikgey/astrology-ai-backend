@@ -12,7 +12,8 @@ from modules.ai_chart_context import build_chart_context, compact_json
 from modules.ai_subject import owned_subject, subject_fields, conversation_tables
 from modules.ai_relationship_context import build_relationship_context
 from modules.relationship_prompt import RELATIONSHIP_SYSTEM_PROMPT, RELATIONSHIP_SUMMARY_PROMPT
-from modules.astrology_prompt import ASTROLOGY_SYSTEM_PROMPT, SUMMARY_SYSTEM_PROMPT
+from modules.astrology_prompt import ASTROLOGY_SYSTEM_PROMPT, MY_MONTH_PROMPT, SUMMARY_SYSTEM_PROMPT
+from modules.ai_transit_guard import is_month_request
 
 # UTF-8 bytes conservatively bound text tokens, without a tokenizer download.
 # Actual provider tokens are recorded separately; these are NOT product quotas.
@@ -169,9 +170,14 @@ def prepare_answer(db, user_id, chart_id, question, client, params, *, relations
         raise HTTPException(401, "Войдите в аккаунт.")
     fields = subject_fields(chart_id, relationship_id)
     Message, Memory = conversation_tables(relationship_id)
-    chart_context = (build_chart_context(db, user_id, chart_id) if relationship_id is None else
+    # Same question text and detector as the guard before the quota (MY-MONTH DESIGN §2.5).
+    month = relationship_id is None and is_month_request(question)
+    chart_context = (build_chart_context(db, user_id, chart_id, month=month) if relationship_id is None else
                      build_relationship_context(db, user_id, relationship_id))
-    system_prompt = ASTROLOGY_SYSTEM_PROMPT if relationship_id is None else RELATIONSHIP_SYSTEM_PROMPT
+    if relationship_id is not None:
+        system_prompt = RELATIONSHIP_SYSTEM_PROMPT
+    else:
+        system_prompt = ASTROLOGY_SYSTEM_PROMPT + "\n" + MY_MONTH_PROMPT if month else ASTROLOGY_SYSTEM_PROMPT
     summary_prompt = SUMMARY_SYSTEM_PROMPT if relationship_id is None else RELATIONSHIP_SUMMARY_PROMPT
     memory = db.query(Memory).filter_by(**fields, **({'user_id': user_id} if relationship_id is None else {})).first()
     cursor = memory.through_message_id if memory else 0

@@ -9,16 +9,20 @@ import logging
 import math
 import re
 import time
+from datetime import timedelta
 import swisseph
 from fastapi import HTTPException
 from database.queries import NatalChart, ChartData
 from modules import transits
+from modules.ai_transit_guard import MY_MONTH_LEGACY_CHART, MY_MONTH_UNAVAILABLE
 from modules.cusp_math import house_for_longitude
 from modules.ephemeris import ASTEROID_SYMBOLS
 from modules.synastry import ANGLES, PLANETS, stored_cusps, valid_longitude
 
 CHART_CONTEXT_BUDGET = 24000  # UTF-8 bytes, within the shared 64000-byte total guard.
 TRANSIT_BLOCK_BUDGET = 4000   # UTF-8 bytes of the transits block, inside CHART_CONTEXT_BUDGET.
+MONTH_DAYS = 30               # «Мой месяц»: today .. today + 30 local days, both inclusive.
+MONTH_BLOCK_BUDGET = 2000     # UTF-8 bytes of transits.month, outside TRANSIT_BLOCK_BUDGET.
 SLOW_TRANSITS_MS = 500
 VERIFIED_LIMITATIONS = "Saved natal calculations are never recalculated; dated sky data only in transits."
 LEGACY_LIMITATIONS = ("Legacy chart: birth timezone/minutes unverified; missing cusps remain unknown. "
@@ -121,7 +125,8 @@ def aspect_rows(aspects, structured, bodies):
     return [row for _, row in sorted(ranked, key=lambda item: item[0])]
 
 
-def build_chart_context(db, user_id, chart_id):
+def build_chart_context(db, user_id, chart_id, month=False):
+    """Compact JSON context; month=True adds transits.month and refuses when transits are unavailable."""
     chart = db.query(NatalChart).filter_by(id=chart_id, user_id=user_id).first()
     if chart is None or user_id is None:
         raise HTTPException(404, "Карта недоступна.")
@@ -157,8 +162,13 @@ def build_chart_context(db, user_id, chart_id):
         "pattern_columns": ["type", "bodies"], "patterns": pattern_rows,
         "omitted": {"aspects": 0},
         "limitations": LEGACY_LIMITATIONS if transits.verified_zone(chart) is None else VERIFIED_LIMITATIONS,
-        "transits": transit_context(chart, stored, transits.server_now()),
+        "transits": transit_context(chart, stored, transits.server_now(), month=month),
     }
+    # A month overview without transits would be empty or invented; the quota is released by the caller.
+    if month and context["transits"]["status"] != "ok":
+        if context["transits"].get("reason") == "legacy_chart":
+            raise HTTPException(422, MY_MONTH_LEGACY_CHART)
+        raise HTTPException(503, MY_MONTH_UNAVAILABLE)
     # Keep every placement and cusp; drop whole aspect rows from the least important end.
     rows = context["aspects"]
     value = compact_json(context)
@@ -202,7 +212,33 @@ def _failure_reason(error):
     return "missing_saved_positions" if isinstance(error, _MissingPositions) else "unclassified"
 
 
-def transit_context(chart, stored, now):
+def _month_block(ordered, hz, zone):
+    """transits.month: rows of the year block (same order) with a period meeting today..today+MONTH_DAYS.
+
+    Periods keep their real dates; exact dates are kept only inside the window, by the local day.
+    """
+    last = hz.today + timedelta(days=MONTH_DAYS)
+
+    def local_day(moment):
+        return transits.as_utc(moment).astimezone(zone).date()
+
+    picked = []
+    for t in ordered:
+        periods = [(start, end) for start, end in t.periods if start is None or local_day(start) <= last]
+        if periods:
+            exact = [x for x in t.exact if hz.today <= local_day(x) <= last]
+            picked.append(t._replace(periods=periods, exact=exact))
+    rows = [_transit_row(t, zone) for t in picked]
+    block = {"from": hz.today.isoformat(), "to": last.isoformat(), "rows": rows, "omitted": 0}
+    while rows and len(compact_json(block).encode("utf-8")) > MONTH_BLOCK_BUDGET:
+        rows.pop()
+        block["omitted"] += 1
+    if block["omitted"]:
+        logger.warning("AI month outcome=trimmed rows=%d omitted=%d", len(rows), block["omitted"])
+    return block
+
+
+def transit_context(chart, stored, now, month=False):
     """The "transits" block. Never raises: a failure leaves the natal context and one closed log line."""
     started = time.monotonic()
     try:
@@ -223,7 +259,8 @@ def transit_context(chart, stored, now):
         sky = transits.sky_now(now)
         found = transits.find_transits(natal, hz)
         cusps, _ = stored_cusps(stored)
-        rows = [_transit_row(t, zone) for t in sorted(found, key=lambda t: _transit_key(t, zone))]
+        ordered = sorted(found, key=lambda t: _transit_key(t, zone))
+        rows = [_transit_row(t, zone) for t in ordered]
         block = {
             "status": "ok", "today": hz.today.isoformat(), "range_to": hz.last_day.isoformat(),
             "dates_timezone": zone.key, "orb_deg": transits.ORB,
@@ -238,6 +275,8 @@ def transit_context(chart, stored, now):
         while rows and len(compact_json(block).encode("utf-8")) > TRANSIT_BLOCK_BUDGET:
             rows.pop()
             block["omitted"] += 1
+        if month:     # after the year block is trimmed: its budget never counts the slice
+            block["month"] = _month_block(ordered, hz, zone)
     except Exception as error:  # noqa: BLE001 - isolation is the contract; the reason set is closed
         logger.warning("AI transits outcome=failed reason=%s duration_ms=%d",
                        _failure_reason(error), round((time.monotonic() - started) * 1000))
