@@ -258,12 +258,12 @@ class PricingBase(unittest.TestCase):
         self.assertEqual(len(found), 1, 'pack row not found')
         return found[0]
 
-    def seed_pack(self, user_id=1, quantity=PACK_SIZE, paid_at=None, state='paid', pi=None):
+    def seed_pack(self, user_id=1, quantity=PACK_SIZE, paid_at=None, state='paid', pi=None, created_at=None):
         pack_id = str(uuid4())
         paid_at = paid_at or datetime.utcnow() - timedelta(hours=1)
         values = dict(id=pack_id, user_id=user_id, provider='stripe', account_id=sf.ACCOUNT, livemode=True,
                       quantity=quantity, state=state, customer_id=sf.CUSTOMER, session_id='cs_live_seed' + pack_id[:8],
-                      payment_intent_id=pi or 'pi_seed' + pack_id[:8], created_at=paid_at - timedelta(minutes=5),
+                      payment_intent_id=pi or 'pi_seed' + pack_id[:8], created_at=created_at or paid_at - timedelta(minutes=5),
                       paid_at=paid_at if state in ('paid', 'revoked') else None)
         with self.engine.begin() as conn:
             conn.execute(self.table('question_packs').insert().values(**values))
@@ -377,14 +377,15 @@ class PricingBase(unittest.TestCase):
             value['parentContractId'] = parent
         return value
 
-    def lava_financial(self, kind='refund.success', email=BUYER, offer=PACK_OFFER, product=PACK_PRODUCT, amount=LAVA_PACK_RUB):
+    def lava_financial(self, kind='refund.success', email=BUYER, offer=PACK_OFFER, product=PACK_PRODUCT, amount=LAVA_PACK_RUB,
+                       at=None, partial=False):
         data = {'amount': amount, 'currency': 'RUB', 'subscription_cancelled': False, 'customer_email': email,
                 'product': {'product_id': product, 'tier_id': offer}}
         if kind == 'refund.success':
-            data.update(refund_id=str(uuid4()), refund_type='full')
+            data.update(refund_id=str(uuid4()), refund_type='partial' if partial else 'full')
         else:
             data.update(chargeback_id=str(uuid4()), dispute_date='2026-11-14')
-        return {'event_id': str(uuid4()), 'event_type': kind, 'created_at': iso(datetime.utcnow() + timedelta(seconds=5)), 'data': data}
+        return {'event_id': str(uuid4()), 'event_type': kind, 'created_at': iso(at or datetime.utcnow() + timedelta(seconds=5)), 'data': data}
 
     def buy_lava_pack(self, headers=None):
         response = self.checkout('lava', headers or self.other, 'question_pack')
@@ -1376,6 +1377,102 @@ class PricingBE13SchemaTests(unittest.TestCase):
                 check(name, properties, source='client')
         self.assertEqual(check('payment_provider_selected', {'provider': 'lava'}, source='client'), {'provider': 'lava'})  # unchanged
 
+
+# =========================================================================== Round 2 (REVIEW.md P2-1, P2-2; DESIGN §12 last two bullets)
+class PricingR2PackPendingTests(PricingBase):
+    """P2-1: pack_pending only while a pack in creating/ready was created at most 30 minutes ago (server clock
+    modules.usage.utcnow). Old unfinished packs stay records but never hold the flag."""
+
+    def pending_at(self, moment, headers=None):
+        with patch('modules.usage.utcnow', return_value=moment):
+            return self.usage_of(headers or self.other)['pack_pending']
+
+    def test_r2_p2_1_window_is_30_minutes_from_creation(self):
+        created = datetime.utcnow().replace(microsecond=0) - timedelta(hours=1)
+        self.seed_pack(user_id=2, state='ready', created_at=created)
+        self.assertTrue(self.pending_at(created + timedelta(minutes=29, seconds=59)))
+        self.assertTrue(self.pending_at(created + timedelta(minutes=30)))
+        self.assertFalse(self.pending_at(created + timedelta(minutes=30, seconds=1)))
+
+    def test_r2_p2_1_abandoned_lava_invoice_stops_holding_the_flag(self):
+        self.buy_lava_pack()
+        now = datetime.utcnow()
+        self.assertTrue(self.pending_at(now + timedelta(minutes=1)))
+        self.assertFalse(self.pending_at(now + timedelta(minutes=31)))
+        self.assertFalse(self.pending_at(now + timedelta(days=3)))
+        self.assertEqual(self.packs(2)[0]['state'], 'ready')  # stays a record; only FAILED / expiry change it
+
+    def test_r2_p2_1_unfinished_stripe_pack_older_than_30_minutes_is_not_pending(self):
+        self.buy_stripe_pack()  # the session expires in 1 h: the flag must not follow expires_at
+        self.assertFalse(self.pending_at(datetime.utcnow() + timedelta(minutes=31)))
+        self.seed_pack(user_id=2, state='creating', created_at=datetime.utcnow() - timedelta(hours=2))  # ambiguous creation, no expiry
+        self.assertFalse(self.pending_at(datetime.utcnow() + timedelta(minutes=31)))
+
+    def test_r2_p2_1_fresh_pack_still_pending_next_to_a_stale_one(self):
+        self.seed_pack(user_id=2, state='ready', created_at=datetime.utcnow() - timedelta(days=2))
+        self.assertFalse(self.usage_of(self.other)['pack_pending'])
+        self.buy_lava_pack()  # a fresh attempt next to the stale record
+        self.assertTrue(self.usage_of(self.other)['pack_pending'])
+
+
+class PricingR2LavaRefundMatchingTests(PricingBase):
+    """P2-2: candidates = this email's packs in paid or revoked with paid_at <= event time. One paid -> revoked;
+    one already revoked -> unchanged; zero or >= 2 -> recorded_unmatched; another paid pack is never revoked."""
+
+    def set_paid_at(self, contract, moment):
+        packs = self.table('question_packs')
+        with self.engine.begin() as conn:
+            conn.execute(packs.update().where(packs.c.contract_id == contract).values(
+                paid_at=moment, created_at=moment - timedelta(minutes=5)))
+
+    def state_of(self, contract):
+        row, = [p for p in self.packs(2) if p['contract_id'] == contract]
+        return row['state'], row['revoke_reason']
+
+    def revoked_a_then_paid_b(self):
+        now = datetime.utcnow().replace(microsecond=0)
+        a, _ = self.buy_lava_pack(); self.grant_lava_pack(a); self.set_paid_at(a, now - timedelta(hours=3))
+        first = self.send_lava(self.lava_financial(at=now - timedelta(hours=2), partial=True, amount=100))
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(self.state_of(a), ('revoked', 'refund'))
+        b, _ = self.buy_lava_pack(); self.grant_lava_pack(b); self.set_paid_at(b, now - timedelta(hours=1))
+        return a, b, now
+
+    def test_r2_p2_2_second_partial_refund_about_a_never_revokes_b(self):
+        a, b, now = self.revoked_a_then_paid_b()
+        response = self.send_lava(self.lava_financial(at=now, partial=True, amount=100))
+        self.assertEqual((response.status_code, response.json()['outcome']), (200, 'recorded_unmatched'), response.text)
+        self.assertEqual(self.state_of(b), ('paid', None))
+        self.assertEqual(self.state_of(a), ('revoked', 'refund'))
+        self.assertEqual(self.usage_of(self.other)['pack_questions_remaining'], PACK_SIZE)
+
+    def test_r2_p2_2_chargeback_after_refund_never_revokes_b(self):
+        a, b, now = self.revoked_a_then_paid_b()
+        response = self.send_lava(self.lava_financial('chargeback.initiated', at=now))
+        self.assertEqual((response.status_code, response.json()['outcome']), (200, 'recorded_unmatched'), response.text)
+        self.assertEqual(self.state_of(b), ('paid', None))
+        self.assertEqual(self.usage_of(self.other)['pack_questions_remaining'], PACK_SIZE)
+
+    def test_r2_p2_2_guard_single_revoked_candidate_is_unchanged(self):
+        # GUARD on 73d6bbc (it already leaves A alone); pins «уже revoked -> без изменений», the reason is kept.
+        now = datetime.utcnow().replace(microsecond=0)
+        a, _ = self.buy_lava_pack(); self.grant_lava_pack(a); self.set_paid_at(a, now - timedelta(hours=3))
+        self.assertEqual(self.send_lava(self.lava_financial(at=now - timedelta(hours=2), partial=True, amount=100)).status_code, 200)
+        for value in (self.lava_financial(at=now - timedelta(hours=1), partial=True, amount=100),
+                      self.lava_financial('chargeback.initiated', at=now)):
+            with self.subTest(kind=value['event_type']):
+                self.assertEqual(self.send_lava(value).status_code, 200)
+                self.assertEqual(self.state_of(a), ('revoked', 'refund'))
+
+    def test_r2_p2_2_guard_zero_candidates_and_other_email_are_unmatched(self):
+        # GUARD on 73d6bbc: a pack paid after the event, or another buyer's pack, is never a candidate.
+        now = datetime.utcnow().replace(microsecond=0)
+        a, _ = self.buy_lava_pack(); self.grant_lava_pack(a); self.set_paid_at(a, now - timedelta(hours=1))
+        for value in (self.lava_financial(at=now - timedelta(hours=2)), self.lava_financial(email='a@example.test', at=now)):
+            with self.subTest(email=value['data']['customer_email']):
+                response = self.send_lava(value)
+                self.assertEqual((response.status_code, response.json()['outcome']), (200, 'recorded_unmatched'))
+                self.assertEqual(self.state_of(a), ('paid', None))
 
 import test_metrics2 as m2  # noqa: E402  (after the SQLite cases; reuses the METRICS-2 outbox harness)
 
