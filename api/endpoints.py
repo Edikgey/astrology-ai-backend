@@ -1,5 +1,9 @@
+import logging
+import re
+import time
 from datetime import datetime
 from typing import List, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request, Response
 from sqlalchemy.orm import Session
 from database.connection import get_db
@@ -14,18 +18,27 @@ from database.queries import User, ChartInterpretationData, NatalChart, ChartDat
 from modules.interpretation import ChartInterpreter
 from uuid import UUID
 from modules.chart_limits import saved_chart_limit
-from modules import usage
+from modules import moon_day, transits, usage
 from modules.ai_transit_guard import require_supported_chart_question
 from database.queries import Relationship
 from sqlalchemy import or_
 from modules.security_limits import enforce
 import asyncio
+import swisseph
 
 
 router = APIRouter()
 
 CHART_NOT_FOUND = "Карта не найдена. Откройте её из раздела «Мои карты» или постройте новую."
 CHART_FORBIDDEN = "Нет доступа к этой карте. Откройте свою карту из раздела «Мои карты»."
+CHART_DATA_MISSING = "Расчётные данные карты отсутствуют. Обратитесь в поддержку для восстановления карты."
+MOON_LEGACY_CHART = ("Луну на сегодня для этой карты не посчитать: она построена в старой версии Lunaria, "
+                     "где часовой пояс рождения не проверялся. Постройте карту заново, выбрав место рождения "
+                     "из подсказок, и откройте «Луну сегодня» для новой карты.")
+MOON_UNAVAILABLE = "Сейчас не получилось рассчитать Луну на сегодня. Попробуйте ещё раз через несколько минут."
+DEVICE_ZONE = re.compile(r"[A-Za-z0-9_+\-/]{1,64}")
+SLOW_MOON_DAY_MS = 500
+logger = logging.getLogger(__name__)
 
 import numpy as np
 
@@ -202,7 +215,7 @@ def get_natal_chart_by_id(
     # Получаем все связанные данные
     chart_data = db.query(ChartData).filter_by(chart_id=chart.id).first()
     if not chart_data:
-        raise HTTPException(status_code=404, detail="Расчётные данные карты отсутствуют. Обратитесь в поддержку для восстановления карты.")
+        raise HTTPException(status_code=404, detail=CHART_DATA_MISSING)
 
     return {
         "chart_id": chart.id,
@@ -216,6 +229,69 @@ def get_natal_chart_by_id(
         "timezone": chart.timezone, "birth_utc": chart.birth_utc,
         "house_system": chart_data.house_system or HOUSE_SYSTEM_NAME,
         "time_provenance": "local_iana" if chart.birth_utc and chart.timezone else "legacy_unverified",
+    }
+
+
+def _device_zone(tz):
+    """The device zone if it is a usable IANA key; anything else means "use the chart's zone" (never a 422)."""
+    if not isinstance(tz, str) or not DEVICE_ZONE.fullmatch(tz):
+        return None
+    try:
+        return ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        return None
+
+
+def _moon_day_reason(error):
+    if isinstance(error, moon_day.MissingPositions):
+        return "missing_saved_positions"
+    return "ephemeris_error" if isinstance(error, swisseph.Error) else "unclassified"
+
+
+@router.get("/natal-chart/{chart_id}/moon-day", tags=["Natal Chart"])
+def get_moon_day(
+    chart_id: int,
+    tz: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """«Луна сегодня» (LUNAR-1 DESIGN §3, §4): codes only, no AI, no quota, no writes."""
+    chart = db.query(NatalChart).filter(NatalChart.id == chart_id).first()
+    if not chart:
+        raise HTTPException(status_code=404, detail=CHART_NOT_FOUND)
+    if chart.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail=CHART_FORBIDDEN)
+    chart_zone = transits.verified_zone(chart)
+    if chart_zone is None:
+        raise HTTPException(status_code=422, detail=MOON_LEGACY_CHART)
+    zone = _device_zone(tz) or chart_zone
+    stored = db.query(ChartData).filter_by(chart_id=chart.id).first()
+
+    started = time.monotonic()
+    try:
+        natal = moon_day.natal_points(stored.bodies_for_circle if stored else None)
+        day = moon_day.calculate(natal, zone, transits.server_now())
+    except Exception as error:  # noqa: BLE001 - the reason set is closed; the message never leaves the server
+        missing = isinstance(error, moon_day.MissingPositions)
+        logger.warning("Moon day outcome=failed reason=%s duration_ms=%d",
+                       _moon_day_reason(error), round((time.monotonic() - started) * 1000))
+        raise HTTPException(status_code=404 if missing else 503,
+                            detail=CHART_DATA_MISSING if missing else MOON_UNAVAILABLE) from None
+    duration_ms = round((time.monotonic() - started) * 1000)
+    if duration_ms > SLOW_MOON_DAY_MS:
+        logger.warning("Moon day outcome=slow duration_ms=%d", duration_ms)
+
+    def local(moment):
+        return moment.astimezone(zone).strftime("%H:%M")
+
+    return {
+        "date": day.date.isoformat(),
+        "timezone": zone.key,
+        "phase": {"code": day.phase_code, "illumination": round(100 * day.illumination),
+                  "exact_at": local(day.phase_exact) if day.phase_exact else None},
+        "sign": {"index": day.sign_index,
+                 "ingress": {"at": local(day.ingress[0]), "index": day.ingress[1]} if day.ingress else None},
+        "aspects": [{"at": local(moment), "aspect": aspect, "point": point} for moment, aspect, point in day.aspects],
     }
 
 
