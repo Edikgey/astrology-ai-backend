@@ -10,14 +10,23 @@ from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 from modules import usage
 from modules.ai_conversation import AIAnswer, AnswerCut, stream_answer
+from modules.ai_transit_guard import topic_of
 
 logger = logging.getLogger(__name__)
 
 
-def log_outcome(outcome, relationship_id, model, output_tokens, started):
+def chat_subject(relationship_id, question):
+    """Closed label of the journal line: natal|relationship|topic_career|topic_money|topic_love (TOPICS-1 DESIGN §2.6)."""
+    if relationship_id is not None:
+        return 'relationship'
+    topic = topic_of(question)
+    return f'topic_{topic}' if topic else 'natal'
+
+
+def log_outcome(outcome, subject, model, output_tokens, started):
     """One line per abnormal chat outcome: closed labels and numbers only, never text or ids."""
     logger.warning('AI chat outcome=%s subject=%s model=%s output_tokens=%s duration_ms=%d',
-                   outcome, 'natal' if relationship_id is None else 'relationship', model,
+                   outcome, subject, model,
                    output_tokens if type(output_tokens) is int else 'none',
                    round((time.monotonic() - started) * 1000))
 
@@ -26,6 +35,7 @@ def chat_events(bind, user_id, chart_id, question, reservation_id, client, param
     # FastAPI may close its dependency session before the response is streamed.
     # This session belongs solely to the stream and is never used concurrently.
     started = time.monotonic()
+    subject = chat_subject(relationship_id, question)
     with Session(bind=bind, autoflush=False) as db:
         settled = False
         try:
@@ -36,7 +46,7 @@ def chat_events(bind, user_id, chart_id, question, reservation_id, client, param
                         usage.finalize(db, user_id, reservation_id, question, part)
                         settled = True
                         if any(item.get('discarded') for item in part.summary_usage):
-                            log_outcome('summary_degraded', relationship_id, params['model'],
+                            log_outcome('summary_degraded', subject, params['model'],
                                         part.metadata.get('output_tokens'), started)
                         yield {'type': 'done', 'response': str(part),
                                'follow_up_suggestions': part.follow_up_suggestions}
@@ -45,9 +55,9 @@ def chat_events(bind, user_id, chart_id, question, reservation_id, client, param
         except Exception as error:
             # Refusals before the call (ownership, budget, history) are not chat outcomes.
             if isinstance(error, AnswerCut):
-                log_outcome(error.outcome, relationship_id, params['model'], error.output_tokens, started)
+                log_outcome(error.outcome, subject, params['model'], error.output_tokens, started)
             elif not isinstance(error, HTTPException):
-                log_outcome('interrupted', relationship_id, params['model'], None, started)
+                log_outcome('interrupted', subject, params['model'], None, started)
             usage.release(db, user_id, reservation_id)
             settled = True
             yield {'type': 'error', 'status': error.status_code if isinstance(error, HTTPException) else 502,
