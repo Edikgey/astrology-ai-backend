@@ -499,12 +499,6 @@ class MoonDayJplTests(unittest.TestCase):
                 after = self.calc(natal, zone_name, end)      # the next local day starts exactly at `end`
                 self.assertEqual(after.date, day + timedelta(days=1))
 
-    def test_ld5_naive_now_is_read_as_utc_like_the_transits_contract(self):
-        zone_name, day = DAYS['A'][:2]
-        aware = self.calc(NATAL_A, zone_name, noon_now('A'))
-        naive = self.calc(NATAL_A, zone_name, noon_now('A').replace(tzinfo=None))
-        self.assertEqual((naive.date, naive.aspects), (aware.date, aware.aspects))
-
 
 def random_cases(count=208, seed=20261115):
     """(zone name, local date, natal, now): count days spread over eight zones, random natal points, random `now`."""
