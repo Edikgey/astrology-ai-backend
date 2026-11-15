@@ -12,8 +12,6 @@ from uuid import UUID
 
 from fastapi import HTTPException
 
-from modules.free_beta import free_beta_enabled
-
 PRODUCTS = ("premium_month", "premium_year", "question_pack")
 PACK_SIZE = 50
 STRIPE_CENTS = {"premium_month": 999, "premium_year": 6999, "question_pack": 499}
@@ -29,10 +27,6 @@ VARIABLES = {
 }
 
 UNAVAILABLE_OPTION = "Этот вариант оплаты пока недоступен. Выберите другой или попробуйте позже."
-BETA_REFUSALS = {
-    "premium_year": "Годовой тариф появится после окончания бесплатной беты.",
-    "question_pack": "Сейчас идёт бесплатная бета: вопросы без лимита, пакет не нужен.",
-}
 HAS_PREMIUM_YEAR = ("У вас уже есть Premium. Годовой тариф можно оформить, когда закончится текущий период: "
                     "отключите продление в «Мои карты».")
 PACK_PENDING = ("Проверяем оплату пакета. Не оплачивайте повторно — обновите страницу через минуту. "
@@ -51,11 +45,12 @@ def option_id(provider, product):
 
 
 def require(provider, product):
-    """Refusals before any provider call. Returns the configured id of a new option (None for the month)."""
+    """Refusals before any provider call. Returns the configured id of a new option (None for the month).
+
+    The free beta does not refuse: the year and the pack are sold like the month (DECISIONS №41).
+    """
     if product == "premium_month":
         return None
-    if free_beta_enabled():
-        raise HTTPException(409, BETA_REFUSALS[product])
     value = option_id(provider, product)
     if value is None:
         raise HTTPException(503, UNAVAILABLE_OPTION)
@@ -63,7 +58,7 @@ def require(provider, product):
 
 
 def available(provider, product):
-    if free_beta_enabled() or option_id(provider, product) is None:
+    if option_id(provider, product) is None:
         return False
     if provider == "stripe":
         from modules.stripe_billing import configured

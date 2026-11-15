@@ -274,7 +274,7 @@ def bind_remote_customer(db, client, user_id, customer_binding, email, attempt):
 
 
 def create_checkout(db, user_id, product="premium_month"):
-    target = offers.require("stripe", product)  # beta and unset options refuse before any provider call
+    target = offers.require("stripe", product)  # unset options refuse before any provider call
     if not configured():
         raise HTTPException(503, STRIPE_UNAVAILABLE)
     if product == "question_pack":

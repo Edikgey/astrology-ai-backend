@@ -91,8 +91,8 @@ The provider is read before every payment and must show exactly that price.
 Variables (names only; values live in Railway): STRIPE_PREMIUM_ANNUAL_PRICE_ID,
 STRIPE_QUESTION_PACK_PRICE_ID, LAVA_ANNUAL_OFFER_ID, LAVA_PACK_OFFER_ID. An unset or
 malformed variable hides that option (/account/usage flags, /public-config offers)
-and its checkout answers 503. During the free beta the year and the pack are not
-sold (409, before any provider call) and packs are not spent.
+and its checkout answers 503. During the free beta the year and the pack are sold like
+the month; packs are not spent until the beta ends.
 
 Annual Premium: Stripe uses a second recurring price (year x1, stored as
 stripe_checkouts.price_id; NULL is the month), Lava a separate subscription offer

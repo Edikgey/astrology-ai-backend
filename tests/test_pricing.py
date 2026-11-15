@@ -881,25 +881,26 @@ class PricingBE7LavaPackTests(PricingBase):
 
 # =========================================================================== BE-8 — buying a pack
 class PricingBE8PackCheckoutTests(PricingBase):
-    def test_be8_stripe_pack_in_beta_is_409_without_provider(self):
+    def test_be8_stripe_pack_in_beta_is_sold_like_outside_beta(self):
+        # Intentional contract change (DECISIONS №41, PRICING-BETA-SALE DESIGN §4): was 409 before the provider.
         with patch.dict(os.environ, {FLAG: 'true'}):
             response = self.checkout('stripe', self.other, 'question_pack')
-        self.assertEqual(response.status_code, 409, response.text)
-        self.assertIn(BETA_PACK, text_of(response))
-        self.api.prices.retrieve.assert_not_called()
-        self.api.customers.create.assert_not_called()
-        self.api.checkout.sessions.create.assert_not_called()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn(BETA_PACK, text_of(response))
+        params, _ = self.created[0]
+        self.assertEqual((params['mode'], params['line_items']), ('payment', [{'price': PACK_PRICE, 'quantity': 1}]))
 
     def test_be8_guard_monthly_checkout_in_beta_unchanged(self):
         with patch.dict(os.environ, {FLAG: 'true'}):
             self.assertEqual(self.checkout('stripe', self.other).status_code, 200)
 
-    def test_be8_lava_pack_in_beta_is_409_without_provider(self):
+    def test_be8_lava_pack_in_beta_is_sold_like_outside_beta(self):
+        # Intentional contract change (DECISIONS №41, PRICING-BETA-SALE DESIGN §4): was 409 before the provider.
         with patch.dict(os.environ, {FLAG: 'true'}):
             response = self.checkout('lava', self.other, 'question_pack')
-        self.assertEqual(response.status_code, 409, response.text)
-        self.assertIn(BETA_PACK, text_of(response))
-        self.network.assert_not_called()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn(BETA_PACK, text_of(response))
+        self.assertEqual(self.lava_posts[-1]['offerId'], PACK_OFFER)
 
     def test_be8_missing_pack_variable_is_503(self):
         for provider, variable in (('stripe', 'STRIPE_QUESTION_PACK_PRICE_ID'), ('lava', 'LAVA_PACK_OFFER_ID')):
@@ -1009,13 +1010,14 @@ class PricingBE9StripeAnnualTests(PricingBase):
         line['period'] = {'start': sf.timestamp(self.start), 'end': sf.timestamp(self.year_end)}
         self.invoice_amounts[sf.INVOICE] = amount_paid
 
-    def test_be9_year_in_beta_is_409_without_provider(self):
+    def test_be9_year_in_beta_is_sold_like_outside_beta(self):
+        # Intentional contract change (DECISIONS №41, PRICING-BETA-SALE DESIGN §4): was 409 before the provider.
         with patch.dict(os.environ, {FLAG: 'true'}):
             response = self.checkout('stripe', self.other, 'premium_year')
-        self.assertEqual(response.status_code, 409, response.text)
-        self.assertIn(BETA_YEAR, text_of(response))
-        self.api.prices.retrieve.assert_not_called()
-        self.api.checkout.sessions.create.assert_not_called()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn(BETA_YEAR, text_of(response))
+        params, _ = self.created[0]
+        self.assertEqual((params['mode'], params['line_items']), ('subscription', [{'price': ANNUAL_PRICE, 'quantity': 1}]))
 
     def test_be9_year_checkout_uses_the_annual_price(self):
         response = self.checkout('stripe', self.other, 'premium_year')
@@ -1117,12 +1119,13 @@ class PricingBE10LavaAnnualTests(PricingBase):
             'recurrentPayments': []}
         return contract
 
-    def test_be10_year_in_beta_is_409_without_provider(self):
+    def test_be10_year_in_beta_is_sold_like_outside_beta(self):
+        # Intentional contract change (DECISIONS №41, PRICING-BETA-SALE DESIGN §4): was 409 before the provider.
         with patch.dict(os.environ, {FLAG: 'true'}):
             response = self.checkout('lava', self.other, 'premium_year')
-        self.assertEqual(response.status_code, 409, response.text)
-        self.assertIn(BETA_YEAR, text_of(response))
-        self.network.assert_not_called()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn(BETA_YEAR, text_of(response))
+        self.assertEqual((self.lava_posts[-1]['offerId'], self.lava_posts[-1]['periodicity']), (ANNUAL_OFFER, 'PERIOD_YEAR'))
 
     def test_be10_year_invoice_uses_the_annual_offer(self):
         self.annual_contract()
@@ -1299,10 +1302,11 @@ class PricingBE12AccountFieldsTests(PricingBase):
         state = self.usage_of(self.other)
         self.assertEqual((state['gpt_messages_available'], state['pack_questions_remaining']), (10, PACK_SIZE))
 
-    def test_be12_flags_are_off_in_beta(self):
+    def test_be12_flags_follow_the_configuration_in_beta(self):
+        # Intentional contract change (DECISIONS №41, PRICING-BETA-SALE DESIGN §4): was all four false in beta.
         with patch.dict(os.environ, {FLAG: 'true'}):
             state = self.usage_of(self.other)
-        self.assertEqual([state[k] for k in self.FLAGS], [False] * 4)
+        self.assertEqual([state[k] for k in self.FLAGS], [True] * 4)
 
     def test_be12_each_flag_follows_its_variable(self):
         for variable, flag, bad in (('STRIPE_PREMIUM_ANNUAL_PRICE_ID', 'stripe_annual_checkout_available', 'not-a-price'),
@@ -1331,7 +1335,8 @@ class PricingBE12AccountFieldsTests(PricingBase):
         self.assertEqual(body['offers'], {'premium_year': True, 'question_pack': True, 'pack_size': PACK_SIZE})
         with patch.dict(os.environ, {FLAG: 'true'}):
             beta = self.client.get('/public-config').json()
-        self.assertEqual((beta['free_beta_enabled'], beta['offers']), (True, {'premium_year': False, 'question_pack': False, 'pack_size': PACK_SIZE}))
+        # Intentional contract change (DECISIONS №41, PRICING-BETA-SALE DESIGN §4): was both false in beta.
+        self.assertEqual((beta['free_beta_enabled'], beta['offers']), (True, {'premium_year': True, 'question_pack': True, 'pack_size': PACK_SIZE}))
         # Coordinator clarification (DESIGN §12): true when configured for at least one provider and beta is off.
         with patch.dict(os.environ):
             os.environ.pop('STRIPE_PREMIUM_ANNUAL_PRICE_ID')
@@ -1344,6 +1349,109 @@ class PricingBE12AccountFieldsTests(PricingBase):
             self.assertEqual(none, {'premium_year': False, 'question_pack': False, 'pack_size': PACK_SIZE})
         self.assertNotIn('4.99', json.dumps(body))  # prices are not exposed by the API
         self.assertNotIn('399', json.dumps(body))
+
+
+# =========================================================================== BS — PRICING-BETA-SALE: year and pack are sold in the beta
+class PricingBetaSaleTests(PricingBase):
+    """DESIGN tasks/PRICING-BETA-SALE §4 (BS-1..BS-4), DECISIONS №41. What can be bought is decided only by the server
+    configuration, in the beta and outside it alike; the beta only means «no limits» (a pack is not spent in it).
+    Guards (green before and after): test_be1_beta_is_unlimited_and_never_spends_a_pack, test_be8_guard_monthly_checkout_in_beta_unchanged."""
+    FLAGS = PricingBE12AccountFieldsTests.FLAGS
+
+    def setUp(self):
+        super().setUp()
+        beta = patch.dict(os.environ, {FLAG: 'true'}); beta.start(); self.addCleanup(beta.stop)
+
+    def test_bs1_stripe_year_and_pack_are_created_in_beta(self):
+        for product, price, mode in (('premium_year', ANNUAL_PRICE, 'subscription'), ('question_pack', PACK_PRICE, 'payment')):
+            with self.subTest(product=product):
+                before = len(self.created)
+                response = self.checkout('stripe', self.other, product)
+                self.assertEqual(response.status_code, 200, response.text)
+                params, _ = self.created[before]
+                self.assertEqual((params['mode'], params['line_items']), (mode, [{'price': price, 'quantity': 1}]))
+        month = self.checkout('stripe', self.owner)
+        self.assertEqual(month.status_code, 200, month.text)
+        self.assertEqual(self.created[-1][0]['line_items'], [{'price': sf.PRICE, 'quantity': 1}])
+
+    def test_bs1_lava_year_and_pack_are_created_in_beta(self):
+        for product, offer, periodicity in (('premium_year', ANNUAL_OFFER, 'PERIOD_YEAR'), ('question_pack', PACK_OFFER, 'ONE_TIME')):
+            with self.subTest(product=product):
+                response = self.checkout('lava', self.other, product)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual((self.lava_posts[-1]['offerId'], self.lava_posts[-1]['periodicity']), (offer, periodicity))
+        month = self.checkout('lava', self.owner)
+        self.assertEqual(month.status_code, 200, month.text)
+        self.assertEqual((self.lava_posts[-1]['offerId'], self.lava_posts[-1]['periodicity']), (lf.OFFER, 'MONTHLY'))
+
+    def test_bs2_four_flags_and_public_offers_in_beta(self):
+        state = self.usage_of(self.other)
+        self.assertEqual([state[k] for k in self.FLAGS], [True] * 4)
+        body = self.client.get('/public-config').json()
+        self.assertEqual((body['free_beta_enabled'], body['offers']), (True, {'premium_year': True, 'question_pack': True, 'pack_size': PACK_SIZE}))
+
+    def test_bs2_each_flag_follows_its_variable_in_beta(self):
+        for variable, flag in (('STRIPE_PREMIUM_ANNUAL_PRICE_ID', 'stripe_annual_checkout_available'),
+                               ('STRIPE_QUESTION_PACK_PRICE_ID', 'stripe_pack_checkout_available'),
+                               ('LAVA_ANNUAL_OFFER_ID', 'lava_annual_checkout_available'),
+                               ('LAVA_PACK_OFFER_ID', 'lava_pack_checkout_available')):
+            with self.subTest(variable=variable), patch.dict(os.environ):
+                os.environ.pop(variable)
+                state = self.usage_of(self.other)
+                self.assertEqual({k: state[k] for k in self.FLAGS}, {k: k != flag for k in self.FLAGS})
+        with patch.dict(os.environ):  # without both pack variables the public pack offer is false, the year stays true
+            os.environ.pop('STRIPE_QUESTION_PACK_PRICE_ID'); os.environ.pop('LAVA_PACK_OFFER_ID')
+            self.assertEqual(self.client.get('/public-config').json()['offers'],
+                             {'premium_year': True, 'question_pack': False, 'pack_size': PACK_SIZE})
+
+    def test_bs3_missing_or_bad_variable_is_503_without_provider_in_beta(self):
+        for provider, product, variable in (('stripe', 'premium_year', 'STRIPE_PREMIUM_ANNUAL_PRICE_ID'),
+                                            ('stripe', 'question_pack', 'STRIPE_QUESTION_PACK_PRICE_ID'),
+                                            ('lava', 'premium_year', 'LAVA_ANNUAL_OFFER_ID'),
+                                            ('lava', 'question_pack', 'LAVA_PACK_OFFER_ID')):
+            for what, change in (('missing', None), ('malformed', 'not valid')):
+                with self.subTest(provider=provider, product=product, what=what), patch.dict(os.environ):
+                    os.environ.pop(variable)
+                    if change:
+                        os.environ[variable] = change
+                    response = self.checkout(provider, self.other, product)
+                    self.assertEqual(response.status_code, 503, response.text)
+                    self.assertIn(UNAVAILABLE_OPTION, text_of(response))
+                    self.assertNotIn(BETA_PACK, text_of(response))
+                    self.assertNotIn(BETA_YEAR, text_of(response))
+        self.api.prices.retrieve.assert_not_called()
+        self.api.customers.create.assert_not_called()
+        self.api.checkout.sessions.create.assert_not_called()
+        self.network.assert_not_called()
+
+    def test_bs3_year_over_active_premium_is_409_and_unknown_product_is_422_in_beta(self):
+        self.premium(user_id=2)
+        with self.sessions() as db:
+            user = db.get(User, 2)
+            user.payment_provider, user.provider_customer_id, user.provider_subscription_id, user.subscription_status = 'stripe', 'cus_x', 'sub_x', 'active'
+            db.commit()
+        for provider in ('stripe', 'lava'):
+            with self.subTest(provider=provider):
+                response = self.checkout(provider, self.other, 'premium_year')
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertIn(HAS_PREMIUM_YEAR, text_of(response))
+                self.assertNotIn(BETA_YEAR, text_of(response))
+                self.assertEqual(self.checkout(provider, self.other, 'foo').status_code, 422)
+        self.api.checkout.sessions.create.assert_not_called()
+        self.network.assert_not_called()
+
+    def test_bs4_pack_bought_in_beta_is_granted_kept_in_beta_and_spent_after_it(self):
+        session_id, pack_id = self.buy_stripe_pack()  # in the beta: 200, a real pack session
+        self.assertEqual(self.send(self.pay_stripe_pack(session_id)).status_code, 200)
+        self.assertEqual(self.usage_of(self.other)['pack_questions_remaining'], PACK_SIZE)
+        self.seed_usage(10, user_id=2)
+        self.spend(user_id=2)  # beta: unlimited, the pack is not touched
+        self.assertEqual((self.pack_uses(pack_id), self.usage_of(self.other)['pack_questions_remaining']), (0, PACK_SIZE))
+        self.assertEqual(self.plan_uses(2), 11)
+        with patch.dict(os.environ, {FLAG: 'false'}):  # beta over, 10 of 10 free used: the pack is next
+            self.spend(user_id=2)
+            self.assertEqual((self.pack_uses(pack_id), self.usage_of(self.other)['pack_questions_remaining']), (1, PACK_SIZE - 1))
+            self.assertEqual(self.plan_uses(2), 11)
 
 
 # =========================================================================== BE-13 — analytics: closed values (schema)
