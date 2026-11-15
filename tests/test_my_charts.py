@@ -23,6 +23,7 @@ with patch("dotenv.load_dotenv"), patch.dict(os.environ, {
     "DATABASE_URL": "sqlite://",
     "SECRET_KEY": "my-charts-isolated-tests-only",
     "OPENAI_API_KEY": "test-not-a-real-key",
+    "OPENAI_MODEL": "test-chat-model",
 }):
     from main import api_app as app, app as cors_app
     from api.auth import create_access_token, get_current_user_or_guest, get_password_hash
