@@ -395,7 +395,7 @@ class HistoryAndFailureTests(TopicBase):
             self.assertEqual((self.used(), self.reserved_rows()), (before_used, 0))
         found = outcome_lines(lines)
         self.assertEqual(len(found), 1, found)
-        self.assertRegex(found[0], r'^AI chat outcome=interrupted subject=topic_love model=\S+ output_tokens=none '
+        self.assertRegex(found[0], r'^AI chat outcome=interrupted reason=timeout status=none subject=topic_love model=\S+ output_tokens=none '
                                    r'duration_ms=\d+$')
 
     def test_tb4_an_ordinary_question_keeps_the_natal_label_and_a_good_reading_writes_no_line(self):

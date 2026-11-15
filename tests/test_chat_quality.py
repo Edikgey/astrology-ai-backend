@@ -18,9 +18,10 @@ from openai import NOT_GIVEN
 
 import test_my_charts as fixtures
 import test_ai_conversation as conv
+import test_relationship_ai as relationships
 from test_ai_stream import ProviderStream
 from test_synastry import facts
-from database.queries import ChartData, GPTConversation, GPTMessage, GPTUsage, NatalChart, Relationship, User
+from database.queries import ChartData, GPTConversation, GPTMessage, GPTUsage, NatalChart, Relationship, RelationshipMessage, User
 from modules import usage, ai_chart_context
 from modules.ai_chart_context import build_chart_context
 from modules.ai_relationship_context import build_relationship_context
@@ -759,6 +760,105 @@ class MemoryAndJournalTests(ChatQualityBase):
             root.removeHandler(handler)
         self.assertEqual([m for m in seen if 'AI chat outcome=' in m], [], 'a normal answer is not logged')
         self.assertEqual(events[-1]['type'], 'done')
+
+
+# BE-CHAT-OBS DESIGN 3.3 / 5: no fallback model. The model comes only from OPENAI_MODEL; without it the chat refuses.
+UNCONFIGURED = 'Чат временно недоступен. Квота не списана; попробуйте позже.'
+UNCONFIGURED_LINE = (r'^AI chat outcome=unconfigured subject=(natal|relationship) model=none output_tokens=none '
+                     r'duration_ms=\d+$')
+
+
+class ChatModelTests(ChatQualityBase):
+    """The red half fails on the base for its own reason: chat_model / UNCONFIGURED_TEXT do not exist, the model is called."""
+
+    pair = relationships.RelationshipAITests.pair
+
+    def unconfigured_text(self):
+        from modules import ai_conversation
+        self.assertTrue(hasattr(ai_conversation, 'UNCONFIGURED_TEXT'), 'modules.ai_conversation.UNCONFIGURED_TEXT is missing')
+        self.assertEqual(ai_conversation.UNCONFIGURED_TEXT, UNCONFIGURED)
+        self.assertIn('unconfigured', ai_conversation.OUTCOME_TEXTS)
+        return ai_conversation.UNCONFIGURED_TEXT
+
+    def test_obs4_model_comes_only_from_openai_model(self):
+        import modules.interpretation as interpretation
+        self.assertTrue(hasattr(interpretation, 'chat_model'), 'modules.interpretation.chat_model is missing')
+        chat_model = interpretation.chat_model
+        self.assertEqual(chat_model({}), '')
+        self.assertEqual(chat_model({'OPENAI_MODEL': ''}), '')
+        self.assertEqual(chat_model({'OPENAI_MODEL': '   '}), '')
+        self.assertEqual(chat_model({'OPENAI_MODEL': ' gpt-6-luna '}), 'gpt-6-luna')
+        self.assertEqual(chat_model({'OPENAI_REASONING_EFFORT': 'none'}), '')      # the other variable is no model
+        self.assertEqual(OPENAI_PARAMS['model'], 'test-chat-model')                  # the import environment of test_my_charts
+
+    def refused(self, events, api, lines, rid, expected_subject):
+        self.assertEqual(api.call_count, 0, 'the provider was called without a configured model')
+        self.assertEqual(events[-1], {'type': 'error', 'status': 502, 'detail': self.unconfigured_text()})
+        self.assertNotIn('done', [e['type'] for e in events])
+        self.assertEqual(len(lines), 1, lines)
+        self.assertRegex(lines[0], UNCONFIGURED_LINE)
+        self.assertIn(f'subject={expected_subject} ', lines[0])
+        with self.sessions() as db:
+            self.assertEqual(db.get(GPTUsage, rid).status, 'released')
+
+    def stream_without_model(self, question, reserve, **fields):
+        with self.sessions() as db:
+            rid = reserve(db)
+        seen = []
+
+        class Collect(logging.Handler):
+            def emit(self, record):
+                seen.append(record.getMessage())
+        handler, root = Collect(level=logging.DEBUG), logging.getLogger()
+        root.addHandler(handler)       # not assertLogs: on the base nothing is logged and the failure must be the call
+        try:
+            with patch('modules.interpretation.client.chat.completions.create', return_value=ProviderStream()) as api:
+                events = list(chat_events(self.engine, 1, fields.pop('chart_id', None), question, rid, client,
+                                          {**OPENAI_PARAMS, 'model': ''}, **fields))
+        finally:
+            root.removeHandler(handler)
+        return events, api, [m for m in seen if m.startswith('AI chat outcome=')], rid
+
+    def test_obs5_without_model_the_stream_refuses_before_any_call(self):
+        with self.subTest(subject='natal'):
+            cid = self.chart()
+            events, api, lines, rid = self.stream_without_model(
+                'Как мне двигаться дальше?', lambda db: usage.reserve(db, 1, cid), chart_id=cid)
+            self.refused(events, api, lines, rid, 'natal')
+            with self.sessions() as db:
+                self.assertEqual(db.query(GPTMessage).filter_by(chart_id=cid).count(), 2)   # only the fixture pair
+        with self.subTest(subject='relationship'):
+            pair_id, _ = self.pair()
+            events, api, lines, rid = self.stream_without_model(
+                'Как нам лучше понимать друг друга?', lambda db: usage.reserve(db, 1, relationship_id=pair_id),
+                relationship_id=pair_id)
+            self.refused(events, api, lines, rid, 'relationship')
+            with self.sessions() as db:
+                self.assertEqual(db.query(RelationshipMessage).filter_by(relationship_id=pair_id).count(), 0)
+
+    def test_obs6_without_model_json_routes_refuse_without_charge(self):
+        cid = self.chart()
+        pair_id, _ = self.pair()
+        before = self.used()
+        with self.sessions() as db:
+            old_rows = {row.id for row in db.query(GPTUsage)}
+        with patch.dict(OPENAI_PARAMS, {'model': ''}), patch(
+                'modules.interpretation.client.chat.completions.create',
+                return_value=relationships.reply()) as api:
+            natal = self.ask(cid)
+            pair = self.client.post(f'/relationships/{pair_id}/ask', headers=self.owner,
+                                    json={'question': 'Как нам лучше понимать друг друга?'})
+        self.assertEqual(api.call_count, 0, 'the provider was called without a configured model')
+        for name, response in (('natal', natal), ('relationship', pair)):
+            with self.subTest(route=name):
+                self.assertEqual((response.status_code, response.json().get('detail')), (502, self.unconfigured_text()),
+                                 response.text)
+        self.assertEqual(self.used(), before)
+        with self.sessions() as db:
+            self.assertEqual(db.query(GPTMessage).filter_by(chart_id=cid).count(), 2)
+            self.assertEqual(db.query(RelationshipMessage).filter_by(relationship_id=pair_id).count(), 0)
+            new_rows = [row for row in db.query(GPTUsage) if row.id not in old_rows]
+            self.assertEqual([row.status for row in new_rows], ['released'] * 2)     # both reservations released
 
 
 if __name__ == '__main__':
