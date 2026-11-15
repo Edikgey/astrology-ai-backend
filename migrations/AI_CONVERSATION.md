@@ -14,10 +14,14 @@ question. `GPTMessage` history was persisted and rendered by the browser but nev
 to OpenAI. The raw chart cache used symbol/sign/house/retrograde/aspects/pattern rows,
 without explicit birth metadata, degree columns or a separate conversation context.
 
-The existing client is `openai==1.62.0`, Chat Completions, `gpt-4o-mini`, timeout 60 seconds,
-no retries. These defaults are retained. Optional `OPENAI_MODEL` can choose another
-compatible Chat Completions model; compatibility with its sampling/max_tokens parameters
-must be checked before changing it. No model migration or fine-tuning is included.
+The existing client is `openai==1.62.0`, Chat Completions, timeout 60 seconds, no retries.
+`OPENAI_MODEL` is required: there is no fallback model in the code (the former `gpt-4o-mini`
+default was removed in BE-CHAT-OBS). Without it, or with an empty value, every chat route
+refuses before any history read or provider call with outcome `unconfigured` (502, "Чат
+временно недоступен. Квота не списана; попробуйте позже."; the quota is released; the SSE
+route logs `AI chat outcome=unconfigured … model=none`). Compatibility of a new model with
+its sampling/max_tokens parameters must be checked before changing it. No model migration
+or fine-tuning is included.
 
 ## Request and accounting
 

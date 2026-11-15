@@ -4,6 +4,8 @@ import logging
 import time
 from contextlib import closing
 import anyio
+import httpx
+import openai
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -23,10 +25,42 @@ def chat_subject(relationship_id, question):
     return f'topic_{topic}' if topic else 'natal'
 
 
-def log_outcome(outcome, subject, model, output_tokens, started):
-    """One line per abnormal chat outcome: closed labels and numbers only, never text or ids."""
-    logger.warning('AI chat outcome=%s subject=%s model=%s output_tokens=%s duration_ms=%d',
-                   outcome, subject, model,
+def failure_reason(error):
+    """Closed (reason, status) of an interrupted chat (BE-CHAT-OBS DESIGN §3.1). Pure, never raises.
+    Reads only the class, status_code and, for 429, code compared with a constant; never the error text,
+    body, request, response, headers or request id. Order matters: APITimeoutError is an APIConnectionError,
+    httpx.TimeoutException is an httpx.TransportError."""
+    if isinstance(error, AnswerCut):
+        return ('unfinished' if error.outcome == 'interrupted' else 'other'), None
+    if isinstance(error, (openai.APITimeoutError, httpx.TimeoutException, TimeoutError)):
+        return 'timeout', None
+    if isinstance(error, (openai.APIConnectionError, httpx.TransportError)):
+        return 'connection', None
+    if isinstance(error, openai.APIStatusError):
+        status = getattr(error, 'status_code', None)
+        if type(status) is not int or not 400 <= status <= 599:
+            return 'other', None
+        if status in (401, 403):
+            return 'auth', status
+        if status == 404:
+            return 'not_found', status
+        if status == 429:
+            return ('quota' if getattr(error, 'code', None) == 'insufficient_quota' else 'rate_limit'), status
+        return ('bad_request' if status < 500 else 'api_status_5xx'), status
+    if isinstance(error, openai.APIError):
+        return 'api_error', None
+    return 'other', None
+
+
+def log_outcome(outcome, subject, model, output_tokens, started, error=None):
+    """One line per abnormal chat outcome: closed labels and numbers only, never text or ids.
+    outcome=interrupted also carries reason= and status= from failure_reason(error)."""
+    cause = ''
+    if outcome == 'interrupted':
+        reason, status = failure_reason(error)
+        cause = f' reason={reason} status={status if type(status) is int else "none"}'
+    logger.warning('AI chat outcome=%s%s subject=%s model=%s output_tokens=%s duration_ms=%d',
+                   outcome, cause, subject, model or 'none',
                    output_tokens if type(output_tokens) is int else 'none',
                    round((time.monotonic() - started) * 1000))
 
@@ -55,9 +89,9 @@ def chat_events(bind, user_id, chart_id, question, reservation_id, client, param
         except Exception as error:
             # Refusals before the call (ownership, budget, history) are not chat outcomes.
             if isinstance(error, AnswerCut):
-                log_outcome(error.outcome, subject, params['model'], error.output_tokens, started)
+                log_outcome(error.outcome, subject, params['model'], error.output_tokens, started, error)
             elif not isinstance(error, HTTPException):
-                log_outcome('interrupted', subject, params['model'], None, started)
+                log_outcome('interrupted', subject, params['model'], None, started, error)
             usage.release(db, user_id, reservation_id)
             settled = True
             yield {'type': 'error', 'status': error.status_code if isinstance(error, HTTPException) else 502,

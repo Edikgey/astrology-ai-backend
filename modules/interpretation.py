@@ -12,8 +12,15 @@ import os
 client = OpenAI(timeout=OPENAI_TIMEOUT_SECONDS, max_retries=0)
 # Repetition penalties are gone: they push Russian endings toward strained synonyms.
 # Reasoning mode (OPENAI_REASONING_EFFORT) is applied per call in ai_conversation.provider_params.
+
+
+def chat_model(env):
+    """The chat model comes only from OPENAI_MODEL; no fallback model. '' -> the chat refuses (outcome unconfigured)."""
+    return (env.get("OPENAI_MODEL") or "").strip()
+
+
 OPENAI_PARAMS = {
-    "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+    "model": chat_model(os.environ),
     "temperature": 0.7,
 }
 class ChartInterpreter:

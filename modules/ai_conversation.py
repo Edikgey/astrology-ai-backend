@@ -54,12 +54,14 @@ TRUNCATED_TEXT = ("Ответ получился слишком длинным �
                   "Попросите ответить короче или задайте вопрос по частям.")
 FILTERED_TEXT = "AI не смог ответить на этот вопрос. Квота не списана. Попробуйте сформулировать его иначе."
 INTERRUPTED_TEXT = "Ответ прервался. Квота не списана; повторите вопрос."
+UNCONFIGURED_TEXT = "Чат временно недоступен. Квота не списана; попробуйте позже."
 FINISH_OUTCOMES = {'length': 'truncated', 'content_filter': 'filtered'}
-OUTCOME_TEXTS = {'truncated': TRUNCATED_TEXT, 'filtered': FILTERED_TEXT, 'interrupted': INTERRUPTED_TEXT}
+OUTCOME_TEXTS = {'truncated': TRUNCATED_TEXT, 'filtered': FILTERED_TEXT, 'interrupted': INTERRUPTED_TEXT,
+                 'unconfigured': UNCONFIGURED_TEXT}
 
 
 class AnswerCut(HTTPException):
-    """The provider ended the answer abnormally. outcome is a closed label for the journal."""
+    """No answer: the provider ended it abnormally, or the chat is not configured. outcome is a closed label for the journal."""
     def __init__(self, outcome, output_tokens=None):
         super().__init__(502, OUTCOME_TEXTS[outcome])
         self.outcome, self.output_tokens = outcome, output_tokens
@@ -169,6 +171,9 @@ def prepare_answer(db, user_id, chart_id, question, client, params, *, relations
     # An explicit user ID from JWT is mandatory even when called outside the route.
     if user_id is None:
         raise HTTPException(401, "Войдите в аккаунт.")
+    # No fallback model (BE-CHAT-OBS DESIGN §3.3): without OPENAI_MODEL refuse before any read or provider call.
+    if not params.get('model'):
+        raise AnswerCut('unconfigured')
     fields = subject_fields(chart_id, relationship_id)
     Message, Memory = conversation_tables(relationship_id)
     # Same question text and detector as the guard before the quota (MY-MONTH DESIGN §2.5).
