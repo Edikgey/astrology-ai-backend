@@ -12,8 +12,9 @@ from modules.ai_chart_context import build_chart_context, compact_json
 from modules.ai_subject import owned_subject, subject_fields, conversation_tables
 from modules.ai_relationship_context import build_relationship_context
 from modules.relationship_prompt import RELATIONSHIP_SYSTEM_PROMPT, RELATIONSHIP_SUMMARY_PROMPT
-from modules.astrology_prompt import ASTROLOGY_SYSTEM_PROMPT, MY_MONTH_PROMPT, SUMMARY_SYSTEM_PROMPT
-from modules.ai_transit_guard import is_month_request
+from modules.astrology_prompt import (ASTROLOGY_SYSTEM_PROMPT, MY_MONTH_PROMPT, SUMMARY_SYSTEM_PROMPT, TOPIC_FOCUS,
+                                      TOPIC_PROMPT)
+from modules.ai_transit_guard import is_month_request, topic_of
 
 # UTF-8 bytes conservatively bound text tokens, without a tokenizer download.
 # Actual provider tokens are recorded separately; these are NOT product quotas.
@@ -176,8 +177,13 @@ def prepare_answer(db, user_id, chart_id, question, client, params, *, relations
                      build_relationship_context(db, user_id, relationship_id))
     if relationship_id is not None:
         system_prompt = RELATIONSHIP_SYSTEM_PROMPT
+    elif month:
+        system_prompt = ASTROLOGY_SYSTEM_PROMPT + "\n" + MY_MONTH_PROMPT
+    elif topic := topic_of(question):
+        # A ready topic reading (TOPICS-1 DESIGN §2.3): the same context and call, a topic block after the base.
+        system_prompt = ASTROLOGY_SYSTEM_PROMPT + "\n" + TOPIC_PROMPT + "\n" + TOPIC_FOCUS[topic]
     else:
-        system_prompt = ASTROLOGY_SYSTEM_PROMPT + "\n" + MY_MONTH_PROMPT if month else ASTROLOGY_SYSTEM_PROMPT
+        system_prompt = ASTROLOGY_SYSTEM_PROMPT
     summary_prompt = SUMMARY_SYSTEM_PROMPT if relationship_id is None else RELATIONSHIP_SUMMARY_PROMPT
     memory = db.query(Memory).filter_by(**fields, **({'user_id': user_id} if relationship_id is None else {})).first()
     cursor = memory.through_message_id if memory else 0

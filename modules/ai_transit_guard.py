@@ -30,6 +30,11 @@ MY_MONTH_LEGACY_CHART = (
     "Lunaria, где часовой пояс рождения не проверялся. Постройте карту заново, выбрав место рождения из "
     "подсказок, и спросите о своём месяце в её чате."
 )
+TOPIC_LEGACY_CHART = (
+    "Разбор по темам строится по домам карты, а в этой карте они могут быть неточными: она построена в старой "
+    "версии Lunaria, где часовой пояс рождения не проверялся. Постройте карту заново, выбрав место рождения из "
+    "подсказок, и откройте разбор для новой карты."
+)
 MY_MONTH_RELATIONSHIP = (
     "В разборе пары обзор месяца не строится — здесь нет транзитов. Спросите «Мой месяц» в чате своей карты."
 )
@@ -181,6 +186,17 @@ def is_month_request(question: str) -> bool:
     return any(_asks_month(sentence) for sentence in _sentences(question))
 
 
+# The three ready topic readings of the /topics page: recognised only by the exact button text (TOPICS-1 DESIGN §2.1).
+TOPIC_QUESTIONS = {"career": "Призвание и работа: разбор моей карты",
+                   "money": "Деньги: разбор моей карты",
+                   "love": "Любовь: разбор моей карты"}
+
+
+def topic_of(question: str):
+    """Pure: the key of a ready topic reading, only for the exact button text (TOPICS-1 DESIGN §2.1)."""
+    return next((key for key, text in TOPIC_QUESTIONS.items() if text == question.strip()), None)
+
+
 def _month_number(word):
     return next(i + 1 for i, pattern in enumerate(_MONTHS) if re.fullmatch(pattern, word))
 
@@ -243,6 +259,9 @@ def require_supported_chart_question(question: str, chart, now=None) -> None:
         # A month overview is built on transits: a legacy chart is refused here, before the quota.
         if is_month_request(question) and transits.verified_zone(chart) is None:
             raise HTTPException(status_code=422, detail=MY_MONTH_LEGACY_CHART)
+        # A topic reading is built on the houses: a legacy chart is refused here too, before the quota.
+        if topic_of(question) and transits.verified_zone(chart) is None:
+            raise HTTPException(status_code=422, detail=TOPIC_LEGACY_CHART)
         return
     zone = transits.verified_zone(chart)
     if zone is None:
