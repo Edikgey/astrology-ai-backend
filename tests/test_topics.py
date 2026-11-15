@@ -399,7 +399,7 @@ class HistoryAndFailureTests(TopicBase):
                                    r'duration_ms=\d+$')
 
     def test_tb4_an_ordinary_question_keeps_the_natal_label_and_a_good_reading_writes_no_line(self):
-        """Green on the base for the label; a good topic answer is not a journal event (DESIGN 2.6)."""
+        """The ordinary label stays natal (green half on the base); a good topic answer is not a journal event (red half)."""
         cid = self.verified()
         with captured_logs() as lines:
             self.answer(cid, 'Расскажи про мою карту', True, reply=cq.TruncatedStream('length'))
