@@ -18,7 +18,7 @@ from database.queries import User, ChartInterpretationData, NatalChart, ChartDat
 from modules.interpretation import ChartInterpreter
 from uuid import UUID
 from modules.chart_limits import saved_chart_limit
-from modules import moon_day, transits, usage
+from modules import moon_day, solar_return, transits, usage
 from modules.ai_transit_guard import require_supported_chart_question
 from database.queries import Relationship
 from sqlalchemy import or_
@@ -36,6 +36,10 @@ MOON_LEGACY_CHART = ("Луну на сегодня для этой карты н
                      "где часовой пояс рождения не проверялся. Постройте карту заново, выбрав место рождения "
                      "из подсказок, и откройте «Луну сегодня» для новой карты.")
 MOON_UNAVAILABLE = "Сейчас не получилось рассчитать Луну на сегодня. Попробуйте ещё раз через несколько минут."
+SOLAR_LEGACY_CHART = ("Карту года для этой карты не построить: она создана в старой версии Lunaria, где часовой пояс "
+                      "рождения не проверялся. Постройте карту заново, выбрав место рождения из подсказок, и откройте "
+                      "«Мой год» для новой карты.")
+SOLAR_UNAVAILABLE = "Сейчас не получилось рассчитать карту года. Попробуйте ещё раз через несколько минут."
 DEVICE_ZONE = re.compile(r"[A-Za-z0-9_+\-/]{1,64}")
 SLOW_MOON_DAY_MS = 500
 logger = logging.getLogger(__name__)
@@ -292,6 +296,55 @@ def get_moon_day(
         "sign": {"index": day.sign_index,
                  "ingress": {"at": local(day.ingress[0]), "index": day.ingress[1]} if day.ingress else None},
         "aspects": [{"at": local(moment), "aspect": aspect, "point": point} for moment, aspect, point in day.aspects],
+    }
+
+
+@router.get("/natal-chart/{chart_id}/solar-return", tags=["Natal Chart"])
+def get_solar_return(
+    chart_id: int,
+    tz: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """«Мой год» (SOLAR-1 DESIGN §3, §4): the solar return as codes, no AI, no quota, no writes."""
+    chart = db.query(NatalChart).filter(NatalChart.id == chart_id).first()
+    if not chart:
+        raise HTTPException(status_code=404, detail=CHART_NOT_FOUND)
+    if chart.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail=CHART_FORBIDDEN)
+    chart_zone = transits.verified_zone(chart)
+    if chart_zone is None:
+        raise HTTPException(status_code=422, detail=SOLAR_LEGACY_CHART)
+    zone = _device_zone(tz) or chart_zone
+    stored = db.query(ChartData).filter_by(chart_id=chart.id).first()
+
+    started = time.monotonic()
+    try:
+        sun = solar_return.natal_sun(stored.bodies_for_circle if stored else None)
+        year = solar_return.calculate(sun, chart.lat, chart.lon, transits.server_now())
+    except Exception as error:  # noqa: BLE001 - the reason set is closed; the message never leaves the server
+        missing = isinstance(error, moon_day.MissingPositions)
+        logger.warning("Solar return outcome=failed reason=%s duration_ms=%d",
+                       _moon_day_reason(error), round((time.monotonic() - started) * 1000))
+        raise HTTPException(status_code=404 if missing else 503,
+                            detail=CHART_DATA_MISSING if missing else SOLAR_UNAVAILABLE) from None
+    duration_ms = round((time.monotonic() - started) * 1000)
+    if duration_ms > SLOW_MOON_DAY_MS:
+        logger.warning("Solar return outcome=slow duration_ms=%d", duration_ms)
+
+    def local(moment):
+        moment = moment.astimezone(zone)
+        return {"date": moment.date().isoformat(), "time": moment.strftime("%H:%M")}
+
+    return {
+        "timezone": zone.key,
+        "start": local(year.start),
+        "next": local(year.next),
+        "ascendant_sign": year.ascendant_sign,
+        "sun_house": year.sun_house,
+        "moon_sign": year.moon_sign,
+        "moon_house": year.moon_house,
+        "aspects": [{"a": a, "aspect": aspect, "b": b} for a, aspect, b in year.aspects],
     }
 
 
