@@ -104,7 +104,11 @@ for the plan that was bought; a grant writes users.current_period_interval
 rows are counted by their server creation time. Switching plan while a Stripe
 session of the other plan is open expires that session once (idempotency key, no
 automatic retry); a completed one answers "Проверяем оплату". Lava cannot cancel an
-open invoice, so an open invoice of the other plan answers 409.
+open invoice: an invoice of the other plan that Lava reads as NEW in the same request
+becomes superseded in the transaction that creates the new attempt (one POST, no
+automatic retry); IN_PROGRESS answers "Проверяем оплату". A superseded invoice stays
+payable: without a primary subscription its payment grants access, otherwise it is a
+billing conflict for refund.
 
 Question packs (question_packs, gpt_usage.pack_id): one row per purchase. Only a
 signed webhook after a provider read makes a pack paid, exactly once, under the user
