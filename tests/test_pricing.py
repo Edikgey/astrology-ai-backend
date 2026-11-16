@@ -1446,6 +1446,163 @@ class PayLavaSwitchTests(PricingBase):
                 self.assertIn(lava_billing.CHECKOUT_PENDING, text_of(blocked))
             self.assertEqual(len(self.lava_posts), 2)  # never retried automatically
 
+    # ---- BE-REFUND-MATCH rm1-rm7 (tasks/BE-REFUND-MATCH/DESIGN.md @ 63c1b74, §6): a refund/dispute envelope has no contract id;
+    # of several monthly attempts of the buyer the only paid one is chosen, anything unclear stays `recorded_unmatched`.
+    def sub_reads(self):
+        """Contracts whose Lava subscription was read (GET /api/v1/subscriptions/<contract>), in call order."""
+        return [call.args[1].rsplit('/', 1)[1] for call in self.network.call_args_list
+                if call.args[0] == 'GET' and call.args[1].startswith('/api/v1/subscriptions/')]
+
+    def month_year_month(self, paid=True):
+        """Month -> year -> month; returns the contract of the third (MONTHLY, ready) invoice, paid when `paid`."""
+        self.switch_month_to_year()
+        self.assertEqual(self.click('premium_month').status_code, 200)
+        self.assertEqual(self.states(), [('MONTHLY', 'superseded'), ('PERIOD_YEAR', 'superseded'), ('MONTHLY', 'ready')])
+        third = self.attempts()[2][2]
+        self.age_attempts()
+        if paid:
+            self.assertEqual(self.pay(third, 'MONTHLY'), 'processed')
+        return third
+
+    def month_refund(self, kind='refund.success', cancelled=True, email=BUYER):
+        """A Lava refund/dispute of the monthly offer; no contract id in the envelope."""
+        value = self.lava_financial(kind, email=email, offer=lf.OFFER, product=lf.PRODUCT, amount=LAVA_MONTH_RUB)
+        value['data']['subscription_cancelled'] = cancelled
+        return value
+
+    def terminate(self, contract):
+        self.lava_subscriptions[contract].update(subscriptionStatus='CANCELLED', terminatedAt=iso(datetime.utcnow()))
+
+    def outcome(self, value):
+        response = self.send_lava(value)
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()['outcome']
+
+    def test_rm1_refund_after_month_year_month_revokes_the_paid_attempt(self):
+        third = self.month_year_month()
+        self.terminate(third)
+        mark, value = len(self.sub_reads()), self.month_refund()
+        response = self.send_lava(value)
+        self.assertEqual((response.status_code, response.json().get('outcome')), (200, 'processed'), response.text)
+        account = self.account()
+        self.assertEqual((account[0], account[2], account[4]), ('free', third, 'canceled'))
+        self.assertEqual(self.sub_reads()[mark:], [third])
+        self.assertEqual(self.outcome(value), 'duplicate')
+        self.assertEqual(self.sub_reads()[mark:], [third])  # the repeat reads nothing
+        with self.subTest(case='one more monthly attempt `failed` with a contract'):
+            self.reset_lava()
+            with self.engine.begin() as conn:  # a fresh buyer: the revoked account no longer points at a deleted attempt
+                conn.execute(text('UPDATE users SET payment_provider = NULL, provider_customer_id = NULL, '
+                                  'provider_subscription_id = NULL, subscription_status = NULL WHERE id = 2'))
+            paid = self.opened()[1]
+            self.seed_attempt('failed', str(uuid4()))
+            self.age_attempts()
+            self.assertEqual(self.pay(paid, 'MONTHLY'), 'processed')
+            self.terminate(paid)
+            mark = len(self.sub_reads())
+            self.assertEqual(self.outcome(self.month_refund()), 'processed')
+            self.assertEqual((self.account()[0], self.account()[2]), ('free', paid))
+            self.assertEqual(self.sub_reads()[mark:], [paid])
+
+    def test_rm2_chargeback_after_switch_waits_for_lava_state(self):
+        third = self.month_year_month()
+        before, value = self.account(), self.month_refund('chargeback.initiated')
+        response = self.send_lava(value)  # Lava still shows the subscription ACTIVE
+        self.assertEqual(response.status_code, 503, response.text)
+        with self.sessions() as db:
+            self.assertIsNone(db.get(BillingEvent, 'lava:' + value['event_id']))
+        self.assertEqual(self.account(), before)
+        self.lava_subscriptions[third].update(subscriptionStatus='CANCELLED', cancelledAt=iso(datetime.utcnow()))
+        response = self.send_lava(value)
+        self.assertEqual((response.status_code, response.json().get('outcome')), (200, 'processed'), response.text)
+        self.assertEqual(self.account()[0], 'premium')
+        with self.sessions() as db:
+            self.assertEqual(db.get(User, 2).scheduled_cancel_at, self.paid_end)
+
+    def test_rm3_refund_without_cancel_after_switch_is_recorded_only(self):
+        self.month_year_month()
+        before, mark = self.account(), len(self.sub_reads())
+        self.assertEqual(self.outcome(self.month_refund(cancelled=False)), 'recorded')
+        self.assertEqual(self.account(), before)
+        self.assertEqual(self.sub_reads()[mark:], [])
+
+    def test_rm4_two_paid_month_attempts_stay_unmatched(self):  # GUARD: green on b89276f
+        month, _ = self.switch_month_to_year()
+        self.assertEqual(self.click('premium_month').status_code, 200)
+        third = self.attempts()[2][2]
+        self.age_attempts()
+        self.assertEqual(self.pay(month, 'MONTHLY'), 'processed')
+        self.assertEqual(self.pay(third, 'MONTHLY'), 'billing_conflict')
+        before, mark = self.account(), len(self.sub_reads())
+        self.assertEqual(before[2], month)
+        self.assertEqual(self.outcome(self.month_refund()), 'recorded_unmatched')
+        self.assertEqual(self.account(), before)
+        self.assertEqual(self.sub_reads()[mark:], [])
+
+    def test_rm5_no_paid_attempt_or_other_email_stays_unmatched(self):  # GUARD: green on b89276f
+        self.month_year_month(paid=False)
+        before, mark = self.account(), len(self.sub_reads())
+        self.assertEqual(self.outcome(self.month_refund()), 'recorded_unmatched')
+        self.assertEqual(self.account(), before)
+        self.assertEqual(self.sub_reads()[mark:], [])
+        with self.subTest(case='paid scenario, refund of another email'):
+            self.reset_lava()
+            self.month_year_month()
+            before, mark = self.account(), len(self.sub_reads())
+            self.assertEqual(before[0], 'premium')
+            self.assertEqual(self.outcome(self.month_refund(email='a@example.test')), 'recorded_unmatched')
+            self.assertEqual(self.account(), before)
+            self.assertEqual(self.sub_reads()[mark:], [])
+
+    def test_rm6_dispute_after_refund_never_moves_to_the_new_subscription(self):  # GUARD: green on b89276f
+        first = self.opened()[1]
+        self.age_attempts()
+        self.assertEqual(self.pay(first, 'MONTHLY'), 'processed')
+        self.terminate(first)
+        self.assertEqual(self.outcome(self.month_refund()), 'processed')  # one attempt: the refund revokes it
+        self.assertEqual(self.account()[0], 'free')
+        second = self.opened()[1]
+        self.age_attempts(minutes=1)
+        self.assertEqual(self.pay(second, 'MONTHLY'), 'processed')
+        before, mark = self.account(), len(self.sub_reads())
+        self.assertEqual((before[0], before[2]), ('premium', second))
+        with self.sessions() as db:
+            self.assertIsNone(db.get(User, 2).scheduled_cancel_at)
+        self.assertEqual(self.outcome(self.month_refund('chargeback.initiated')), 'recorded_unmatched')
+        self.assertEqual(self.account(), before)
+        self.assertEqual(self.sub_reads()[mark:], [])
+        with self.sessions() as db:
+            self.assertIsNone(db.get(User, 2).scheduled_cancel_at)
+
+    def test_rm7_financial_event_writes_one_safe_line(self):
+        self.month_year_month(paid=False)  # nothing paid: user 2 stays free, so the second scenario is independent of the first
+        contracts = [c for _, _, c, _ in self.attempts()]
+        seen = []
+        with self.assertLogs('modules.lava_billing', 'WARNING') as logged:
+            seen.append((self.send_lava(self.month_refund()).json().get('outcome'), len(logged.records)))
+            self.reset_lava()
+            third = self.month_year_month()
+            contracts += [c for _, _, c, _ in self.attempts()]
+            dispute, value = self.month_refund('chargeback.initiated'), self.month_refund()
+            seen.append((self.send_lava(dispute).status_code, len(logged.records)))  # Lava still ACTIVE: 503, no line
+            self.terminate(third)
+            seen.append((self.send_lava(value).json().get('outcome'), len(logged.records)))
+            seen.append((self.send_lava(value).json().get('outcome'), len(logged.records)))  # repeat: no new line
+        self.assertEqual(seen, [('recorded_unmatched', 1), (503, 1), ('processed', 2), ('duplicate', 2)])
+        parsed = []
+        for record in logged.records:
+            message = record.getMessage()
+            self.assertTrue(message.startswith('Lava financial event '), message)
+            for secret in [BUYER] + contracts:
+                self.assertNotIn(secret, message)
+            parsed.append(json.loads(message[len('Lava financial event '):]))
+        for line in parsed:
+            self.assertEqual(sorted(line), sorted(['event_id', 'type', 'candidates', 'paid', 'outcome']))
+        self.assertEqual((parsed[0]['type'], parsed[0]['candidates'], parsed[0]['paid'], parsed[0]['outcome']),
+                         ('refund.success', 2, 0, 'recorded_unmatched'))
+        self.assertEqual(parsed[1], {'event_id': 'lava:' + value['event_id'], 'type': 'refund.success', 'candidates': 2,
+                                     'paid': 1, 'outcome': 'processed'})
+
 
 # =========================================================================== BE-11 — annual quota, variant A (300 in each month)
 class PricingBE11AnnualQuotaTests(PricingBase):
