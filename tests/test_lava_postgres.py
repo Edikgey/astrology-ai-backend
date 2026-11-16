@@ -3,8 +3,9 @@ import os
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from threading import Barrier, Event
+from threading import Barrier, Event, Lock
 from unittest.mock import patch
+from uuid import uuid4
 
 import httpx
 from fastapi import HTTPException
@@ -232,7 +233,55 @@ class LavaPostgresTests(unittest.TestCase):
         self.assertEqual((after_a, c, script.posts),
                          ([("creating", None, None)], (409, billing.CHECKOUT_PENDING, None), 1))
 
-    # --- PAY-LAVA-CANCEL C8-C10 (tasks/PAY-LAVA-CANCEL/DESIGN.md §3 "Двойное нажатие и две вкладки", §5) -------
+    # --- PAY-LAVA-SWITCH s7 (tasks/PAY-LAVA-SWITCH/DESIGN.md @ c5ef0a3, §2 (4) "Гонка двух кликов", §5 test 7) -------
+    def test_s7_two_tabs_switch_tariff_create_one_new_invoice(self):
+        """An open month invoice (Lava NEW); two tabs pick the year at once; both pass the first lock and the catalog
+        (Barrier in verified_offer, as t9), the second lock on users orders them: one new annual invoice, one 409.
+        Red on 3bfb128: both tabs get 409 OTHER_INVOICE before the catalog, no POST: ([409, 409], 0)."""
+        self.migrate()
+        annual_offer, annual_product, month = str(uuid4()), str(uuid4()), str(uuid4())
+        with self.sessions() as db:
+            buyer = db.get(User, 2).email
+            db.add(LavaCheckout(user_id=2, contract_id=month, offer_id=OFFER, product_id=PRODUCT, buyer_email=buyer,
+                                payment_url="https://pay.example.test/month", state="ready", periodicity="MONTHLY",
+                                created_at=datetime.utcnow() - timedelta(minutes=5)))
+            db.commit()
+        lock, posts, barrier = Lock(), [], Barrier(2)
+
+        def lava(method, path, **kwargs):
+            if method == "GET" and path == "/api/v2/invoices/" + month:
+                return {"id": month, "status": "NEW", "buyer": {"email": buyer}}
+            if method == "POST" and path == "/api/v3/invoice":
+                with lock:
+                    posts.append(kwargs["json"]["periodicity"])
+                    return {"id": str(uuid4()), "paymentUrl": "https://pay.example.test/year/%d" % len(posts),
+                            "amountTotal": {"currency": "RUB", "amount": 4790}}
+            raise AssertionError("unexpected Lava call %s %s" % (method, path))
+
+        def offer(offer_id, option="premium_month"):
+            barrier.wait(timeout=WAIT)  # both tabs pass the catalog check before either takes the second lock
+            return annual_product
+
+        def tab(_):
+            with self.sessions() as db:
+                try:
+                    return 200, billing.create_checkout(db, 2, "premium_year")["url"]
+                except HTTPException as exc:
+                    return exc.status_code, exc.detail
+                except Exception as exc:  # BrokenBarrierError from a bounded wait: a result, not a hang
+                    return "error", type(exc).__name__
+        with patch.dict(os.environ, {**ENV, "LAVA_ANNUAL_OFFER_ID": annual_offer}), \
+                patch.object(billing.api, "request", side_effect=lava), \
+                patch.object(billing.api, "verified_offer", side_effect=offer), ThreadPoolExecutor(max_workers=2) as pool:
+            results = sorted(pool.map(tab, range(2)), key=lambda r: str(r[0]))
+        self.assertEqual(([r[0] for r in results], posts), ([200, 409], ["PERIOD_YEAR"]), results)
+        self.assertEqual(results[1][1], "Оплата уже создаётся. Обновите страницу.")
+        with self.sessions() as db:
+            rows = db.query(LavaCheckout).filter_by(user_id=2).order_by(LavaCheckout.created_at).all()
+            self.assertEqual([(c.periodicity, c.state) for c in rows], [("MONTHLY", "superseded"), ("PERIOD_YEAR", "ready")])
+            self.assertEqual(rows[1].payment_url, results[0][1])
+
+    # --- PAY-LAVA-CANCEL C8-C10(tasks/PAY-LAVA-CANCEL/DESIGN.md §3 "Двойное нажатие и две вкладки", §5) -------
     # Real cancel_subscription + real lava_client.request over httpx.MockTransport; row locks are PostgreSQL's.
     PENDING = (200, {"pending": True}, None)
     DELETE_PARAMS = {"contractId": CONTRACT, "email": "test@example.com"}
