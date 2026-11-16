@@ -35,8 +35,6 @@ CHECKOUT_UNKNOWN = ("Не удалось открыть или проверит�
 HAS_SUBSCRIPTION = ("Оплата в рублях для этого аккаунта недоступна: у него уже есть подписка или оплата через Stripe. "
                     "Чтобы сменить способ оплаты, напишите в поддержку: lunariaai.support@gmail.com.")
 NO_LAVA_SUBSCRIPTION = "У аккаунта нет подписки через Lava.top — отключать нечего. Обновите страницу."
-OTHER_INVOICE = ("В Lava уже открыта оплата другого тарифа Premium. Завершите её во вкладке Lava или напишите в "
-                 "поддержку: lunariaai.support@gmail.com. Не оплачивайте оба.")
 CREATION_UNCLEAR = "Создание оплаты ожидает проверки. Обратитесь в поддержку перед повторной оплатой."
 
 
@@ -80,7 +78,9 @@ def verify(headers):
 
 
 def reconcile_checkout(db, user_id):
-    """Refresh this provider's attempt before reuse. Other providers stay free."""
+    """Refresh this provider's attempt before reuse. Other providers stay free.
+
+    Returns (checkout_id, Lava status) when the latest attempt is open and unpaid (NEW/IN_PROGRESS), else None."""
     user = locked_user(db, user_id)
     if user.plan == "premium" or user.subscription_status in ("active", "past_due", "paused", "trialing"):
         db.rollback()
@@ -127,6 +127,7 @@ def reconcile_checkout(db, user_id):
         raise HTTPException(409, CHECKOUT_PENDING)
     if checkout.state == "failed" or status == "FAILED":
         raise HTTPException(409, CHECKOUT_PENDING)
+    return binding, status
 
 
 def create_checkout(db, user_id, product="premium_month"):
@@ -136,9 +137,9 @@ def create_checkout(db, user_id, product="premium_month"):
     offer, returns = api.config()
     returns = api.product_returns(returns, product)
     offer, periodicity = target or offer, offers.LAVA_PERIODICITY[product]
-    binding = None
+    binding = replace = None
     try:
-        reconcile_checkout(db, user_id)
+        read = reconcile_checkout(db, user_id)
         user = locked_user(db, user_id)
         if product == "premium_year" and user.plan == "premium":
             raise HTTPException(409, offers.HAS_PREMIUM_YEAR)
@@ -146,12 +147,16 @@ def create_checkout(db, user_id, product="premium_month"):
             raise HTTPException(409, HAS_SUBSCRIPTION)
         old = db.query(LavaCheckout).filter_by(user_id=user_id).order_by(LavaCheckout.created_at.desc()).first()
         if old and old.state in ("creating", "ready"):
-            if old.periodicity != periodicity:
-                raise HTTPException(409, OTHER_INVOICE)  # Lava cannot cancel an open invoice
             if not old.payment_url:
                 raise HTTPException(409, CREATION_UNCLEAR)
-            db.commit()
-            return {"url": old.payment_url}
+            # Reuse the link only if its payment would be accepted as the primary subscription.
+            if old.periodicity == periodicity and owns_checkout(db, user, old):
+                db.commit()
+                return {"url": old.payment_url}
+            # Lava cannot cancel an invoice: replace it only when Lava read it as NEW in this request.
+            if read != (old.id, "NEW"):
+                raise HTTPException(409, CHECKOUT_PENDING)
+            replace = old.id
         email = user.email
         db.rollback()
         # One positional argument for the month keeps the existing catalog check call unchanged.
@@ -160,8 +165,13 @@ def create_checkout(db, user_id, product="premium_month"):
         user = locked_user(db, user_id)
         if user.payment_provider not in (None, "lava") or user.plan == "premium" or user.subscription_status in ("active", "past_due", "paused", "trialing"):
             raise HTTPException(409, HAS_SUBSCRIPTION)
-        if db.query(LavaCheckout).filter_by(user_id=user_id).filter(LavaCheckout.state.in_(("creating", "ready"))).first():
+        open_ids = {row.id for row in db.query(LavaCheckout.id).filter_by(user_id=user_id).filter(
+            LavaCheckout.state.in_(("creating", "ready")))}
+        if open_ids != ({replace} if replace else set()):
             raise HTTPException(409, "Оплата уже создаётся. Обновите страницу.")
+        if replace:
+            # The replaced invoice stays payable in Lava; its payment is accepted or becomes a billing conflict.
+            db.get(LavaCheckout, replace).state = "superseded"
         checkout = LavaCheckout(user_id=user_id, offer_id=offer, product_id=product, buyer_email=email, periodicity=periodicity)
         db.add(checkout); db.flush()
         binding = checkout.id

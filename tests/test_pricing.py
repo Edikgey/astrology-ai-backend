@@ -58,7 +58,6 @@ UNAVAILABLE_OPTION = 'Этот вариант оплаты пока недост
 BETA_PACK = 'пакет не нужен'
 BETA_YEAR = 'Годовой тариф появится после окончания бесплатной беты'
 HAS_PREMIUM_YEAR = 'У вас уже есть Premium. Годовой тариф можно оформить'
-LAVA_OTHER_INVOICE = 'В Lava уже открыта оплата другого тарифа Premium'
 NOT_AGAIN = 'Не оплачивайте повторно'
 
 
@@ -1188,13 +1187,264 @@ class PricingBE10LavaAnnualTests(PricingBase):
         with self.sessions() as db:
             self.assertEqual(db.get(User, 2).current_period_end, self.year_end + timedelta(days=365))
 
-    def test_be10_open_monthly_invoice_then_year_is_409(self):
-        month = self.checkout('lava', self.other)
-        self.assertEqual(month.status_code, 200, month.text)
-        response = self.checkout('lava', self.other, 'premium_year')
+
+# =========================================================================== PAY-LAVA-SWITCH — another tariff over an open invoice
+from modules import lava_billing  # noqa: E402
+from modules import lava_client as lava_api  # noqa: E402
+
+SWITCH_SECOND_TAB = 'Оплата уже создаётся. Обновите страницу.'
+
+
+class PayLavaSwitchTests(PricingBase):
+    """PAY-LAVA-SWITCH s1-s6, s8 (tasks/PAY-LAVA-SWITCH/DESIGN.md @ c5ef0a3, §2 tables, §3 failures, §5 regression).
+
+    Intentional contract change (brief :5-11): a Premium tariff over an open, unpaid Lava invoice of the other tariff
+    opens a new invoice; the old attempt becomes `superseded` (it stays payable at Lava). Replaced the former
+    test_be10_open_monthly_invoice_then_year_is_409. Red on 3bfb128: the switch is 409 OTHER_INVOICE before any POST.
+    User 2 (b@example.test) buys; Lava is the patched lava_client.request fake from install_fakes (no network)."""
+
+    PERIODS = {'MONTHLY': (lf.PRODUCT, LAVA_MONTH_RUB, 31), 'PERIOD_YEAR': (ANNUAL_PRODUCT, LAVA_ANNUAL_RUB, 365)}
+
+    # ---- helpers
+    def attempts(self):
+        """[(periodicity, state, contract_id, payment_url)] of user 2 in creation order."""
+        with self.sessions() as db:
+            rows = db.query(LavaCheckout).filter_by(user_id=2).order_by(LavaCheckout.created_at).all()
+            return [(c.periodicity, c.state, c.contract_id, c.payment_url) for c in rows]
+
+    def states(self):
+        return [(periodicity, state) for periodicity, state, _, _ in self.attempts()]
+
+    def click(self, product='premium_month'):
+        return self.checkout('lava', self.other, product)
+
+    def opened(self, product='premium_month'):
+        """A successful click: (url, contract of the attempt that owns this url)."""
+        response = self.click(product)
+        self.assertEqual(response.status_code, 200, response.text)
+        url = response.json()['url']
+        contract, = [c for _, _, c, u in self.attempts() if u == url]
+        return url, contract
+
+    def switch_month_to_year(self):
+        """Open month, then year over it. Both must succeed (red on the base: 409 OTHER_INVOICE)."""
+        month_url, month = self.opened()
+        response = self.click('premium_year')
+        self.assertEqual(response.status_code, 200, response.text)
+        year_url = response.json()['url']
+        self.assertNotEqual(year_url, month_url)
+        year, = [c for _, _, c, u in self.attempts() if u == year_url]
+        self.assertEqual(self.states(), [('MONTHLY', 'superseded'), ('PERIOD_YEAR', 'ready')])
+        return month, year
+
+    def age_attempts(self, minutes=10):
+        """The clicks happened `minutes` ago: payments come later than the switch (sub-second clocks are no input)."""
+        with self.sessions() as db:
+            for row in db.query(LavaCheckout).filter_by(user_id=2).all():
+                row.created_at -= timedelta(minutes=minutes)
+                if row.updated_at:
+                    row.updated_at -= timedelta(minutes=minutes)
+            db.commit()
+
+    def pay(self, contract, periodicity, at=None):
+        """Lava confirms the first payment of `contract` (snapshot + payment.success webhook); returns the outcome."""
+        product, amount, days = self.PERIODS[periodicity]
+        at = (at or datetime.utcnow()).replace(microsecond=0)
+        self.lava_invoices[contract]['status'] = 'COMPLETED'
+        self.lava_subscriptions[contract] = {'id': contract, 'datetime': iso(at), 'status': 'COMPLETED',
+            'receipt': {'amount': amount, 'currency': 'RUB'}, 'buyer': {'email': BUYER}, 'periodicity': periodicity,
+            'subscriptionStatus': 'ACTIVE', 'expiredAt': iso(at + timedelta(days=days)), 'cancelledAt': None,
+            'terminatedAt': None, 'recurrentPayments': []}
+        self.paid_end = at + timedelta(days=days)
+        response = self.send_lava(self.lava_event(contract, product, amount, 'subscription-active', at=at))
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()['outcome']
+
+    def account(self):
+        with self.sessions() as db:
+            u = db.get(User, 2)
+            return (u.plan, u.payment_provider, u.provider_subscription_id, u.current_period_end, u.subscription_status)
+
+    def conflicts(self):
+        rows = self.table('billing_conflicts')
+        with self.engine.connect() as conn:
+            return [dict(r) for r in conn.execute(select(rows).where(rows.c.user_id == 2)).mappings()]
+
+    def posted(self):
+        return [body['periodicity'] for body in self.lava_posts]
+
+    def reset_lava(self):
+        """A fresh buyer for the next subtest: no attempts, no remote invoices, the good catalog, the plain fake."""
+        with self.engine.begin() as conn:
+            conn.execute(text('DELETE FROM lava_checkouts WHERE user_id = 2'))
+        self.lava_posts.clear(); self.lava_invoices.clear(); self.lava_subscriptions.clear()
+        self.lava_catalog = copy.deepcopy(self.good_catalog)
+        self.network.side_effect = self.plain_lava
+
+    def setUp(self):
+        super().setUp()
+        self.good_catalog = copy.deepcopy(self.lava_catalog)
+        self.plain_lava = self.network.side_effect
+
+    def fail_next_year_post(self, error):
+        """The next annual invoice POST reaches Lava (it is counted) and ends with `error`; later POSTs are normal."""
+        plain, armed = self.plain_lava, [True]
+
+        def lava(method, path, **kwargs):
+            if armed[0] and method == 'POST' and path == '/api/v3/invoice' and kwargs['json']['offerId'] == ANNUAL_OFFER:
+                armed[0] = False
+                self.lava_posts.append(copy.deepcopy(kwargs['json']))
+                raise error
+            return plain(method, path, **kwargs)
+        self.network.side_effect = lava
+
+    # ---- s1
+    def test_s1_other_tariff_over_open_invoice_opens_new_one(self):
+        month, year = self.switch_month_to_year()
+        self.assertEqual(self.posted(), ['MONTHLY', 'PERIOD_YEAR'])
+        year_url = self.attempts()[1][3]
+        again = self.click('premium_year')  # the same tariff again: the same link, no new invoice
+        self.assertEqual((again.status_code, again.json().get('url')), (200, year_url), again.text)
+        self.assertEqual(self.posted(), ['MONTHLY', 'PERIOD_YEAR'])
+        with self.subTest(direction='year -> month'):
+            back = self.click('premium_month')
+            self.assertEqual(back.status_code, 200, back.text)
+            self.assertNotIn(back.json()['url'], (self.attempts()[0][3], year_url))
+            self.assertEqual(self.posted(), ['MONTHLY', 'PERIOD_YEAR', 'MONTHLY'])
+            self.assertEqual(self.states(), [('MONTHLY', 'superseded'), ('PERIOD_YEAR', 'superseded'), ('MONTHLY', 'ready')])
+            self.assertEqual(self.click('premium_month').json().get('url'), back.json()['url'])
+            self.assertEqual(len(self.lava_posts), 3)
+
+    # ---- s2
+    def test_s2_in_progress_old_invoice_blocks_switch_without_post(self):
+        month_url, month = self.opened()
+        self.lava_invoices[month]['status'] = 'IN_PROGRESS'
+        response = self.click('premium_year')
         self.assertEqual(response.status_code, 409, response.text)
-        self.assertIn(LAVA_OTHER_INVOICE, text_of(response))
+        self.assertIn(lava_billing.CHECKOUT_PENDING, text_of(response))
+        self.assertEqual((self.posted(), self.states()), (['MONTHLY'], [('MONTHLY', 'ready')]))
+        again = self.click('premium_month')
+        self.assertEqual((again.status_code, again.json().get('url')), (200, month_url), again.text)
         self.assertEqual(len(self.lava_posts), 1)
+
+    # ---- s3
+    def seed_attempt(self, state, contract=None):
+        with self.sessions() as db:
+            db.add(LavaCheckout(user_id=2, offer_id=lf.OFFER, product_id=lf.PRODUCT, buyer_email=BUYER,
+                                periodicity='MONTHLY', state=state, contract_id=contract, payment_url=None))
+            db.commit()
+        if contract:
+            self.lava_invoices[contract] = {'id': contract, 'type': 'SUBSCRIPTION', 'status': 'NEW', 'buyer': {'email': BUYER},
+                'datetime': iso(datetime.utcnow()), 'amountTotal': {'amount': LAVA_MONTH_RUB, 'currency': 'RUB'}}
+
+    def test_s3_unclear_creation_still_blocks_other_tariff(self):
+        with self.subTest(case='(a) creating without contract_id'):  # GUARD: green on 3bfb128
+            self.seed_attempt('creating')
+            response = self.click('premium_year')
+            self.assertEqual(response.status_code, 409, response.text)
+            self.assertIn(lava_billing.CHECKOUT_PENDING, text_of(response))
+            self.assertEqual((self.lava_posts, self.states()), ([], [('MONTHLY', 'creating')]))
+        for state in ('creating', 'ready'):
+            with self.subTest(case='(b) contract_id without payment_url', state=state):
+                self.reset_lava()
+                self.seed_attempt(state, str(uuid4()))
+                response = self.click('premium_year')
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertIn(lava_billing.CREATION_UNCLEAR, text_of(response))
+                self.assertEqual((self.lava_posts, self.states()), ([], [('MONTHLY', state)]))
+
+    # ---- s4
+    def test_s4_old_paid_after_switch_grants_old_and_new_paid_is_conflict(self):
+        month, year = self.switch_month_to_year()
+        self.age_attempts()
+        self.assertEqual(self.pay(month, 'MONTHLY'), 'processed')
+        month_end = self.paid_end
+        self.assertEqual(self.account(), ('premium', 'lava', month, month_end, 'active'))
+        self.assertEqual(self.interval(2), 'month')
+        self.assertEqual(self.states(), [('MONTHLY', 'completed'), ('PERIOD_YEAR', 'ready')])
+        self.assertEqual(self.pay(year, 'PERIOD_YEAR'), 'billing_conflict')
+        conflict, = self.conflicts()
+        self.assertEqual((conflict['provider'], conflict['subscription_id'], conflict['primary_subscription_id'], conflict['status']),
+                         ('lava', year, month, 'open'))
+        self.assertEqual(self.account(), ('premium', 'lava', month, month_end, 'active'))  # no second period
+        self.assertEqual(self.interval(2), 'month')
+
+    # ---- s5
+    def test_s5_new_paid_then_old_paid_is_conflict_once(self):
+        month, year = self.switch_month_to_year()
+        self.age_attempts()
+        self.assertEqual(self.pay(year, 'PERIOD_YEAR'), 'processed')
+        year_end = self.paid_end
+        self.assertEqual(self.account(), ('premium', 'lava', year, year_end, 'active'))
+        self.assertEqual(self.interval(2), 'year')
+        self.assertEqual(self.pay(month, 'MONTHLY'), 'billing_conflict')
+        repeat = self.send_lava(self.lava_event(month, lf.PRODUCT, LAVA_MONTH_RUB, 'subscription-active',
+                                                at=parse_dt(self.lava_subscriptions[month]['datetime'])))
+        self.assertEqual((repeat.status_code, repeat.json().get('outcome')), (200, 'duplicate'), repeat.text)
+        conflict, = self.conflicts()
+        self.assertEqual((conflict['subscription_id'], conflict['primary_subscription_id']), (month, year))
+        self.assertEqual(self.account(), ('premium', 'lava', year, year_end, 'active'))
+        self.assertEqual(self.interval(2), 'year')
+
+    # ---- s6
+    def test_s6_stale_new_invoice_is_not_reused_after_primary_ends(self):
+        month, year = self.switch_month_to_year()
+        self.age_attempts()
+        self.assertEqual(self.pay(month, 'MONTHLY'), 'processed')
+        with self.engine.begin() as conn:  # the month access ended: canceled, period in the past
+            conn.execute(text("UPDATE users SET plan = 'free', subscription_status = 'canceled', "
+                              "current_period_end = :end WHERE id = 2"), {'end': datetime.utcnow() - timedelta(days=1)})
+        old_year_url = self.attempts()[1][3]
+        response = self.click('premium_year')
+        self.assertEqual(response.status_code, 200, response.text)
+        new_url = response.json()['url']
+        self.assertNotEqual(new_url, old_year_url)  # the stale year link would turn its payment into a conflict
+        self.assertEqual(len(self.lava_posts), 3)
+        self.assertEqual(self.states(), [('MONTHLY', 'completed'), ('PERIOD_YEAR', 'superseded'), ('PERIOD_YEAR', 'ready')])
+        new_year, = [c for _, _, c, u in self.attempts() if u == new_url]
+        self.assertEqual(self.pay(new_year, 'PERIOD_YEAR'), 'processed')
+        self.assertEqual(self.account(), ('premium', 'lava', new_year, self.paid_end, 'active'))
+        self.assertEqual(self.interval(2), 'year')
+        self.assertEqual(self.conflicts(), [])
+
+    # ---- s8
+    def test_s8_failed_switch_never_retries_and_keeps_safe_states(self):
+        with self.subTest(case='(a) catalog 503'):
+            month_url, month = self.opened()
+            self.lava_catalog['items'][1]['offers'][0]['prices'][0]['amount'] = 3990  # annual catalog drift
+            response = self.click('premium_year')
+            self.assertEqual(response.status_code, 503, response.text)
+            self.assertEqual((self.posted(), self.states()), (['MONTHLY'], [('MONTHLY', 'ready')]))
+            self.lava_catalog = copy.deepcopy(self.good_catalog)
+            again = self.click('premium_month')
+            self.assertEqual((again.status_code, again.json().get('url')), (200, month_url), again.text)
+            self.assertEqual(len(self.lava_posts), 1)
+        with self.subTest(case='(b) Lava refuses the annual invoice'):
+            self.reset_lava()
+            self.opened()
+            self.fail_next_year_post(lava_api.InvoiceNotCreated(503, lava_api.PROVIDER_SILENT, headers={'Retry-After': '60'}))
+            response = self.click('premium_year')
+            self.assertEqual(response.status_code, 503, response.text)
+            self.assertIn(lava_api.PROVIDER_SILENT, text_of(response))
+            self.assertEqual(self.posted(), ['MONTHLY', 'PERIOD_YEAR'])
+            self.assertEqual(self.states(), [('MONTHLY', 'superseded'), ('PERIOD_YEAR', 'rejected')])
+            retry = self.click('premium_year')  # one click, exactly one new POST
+            self.assertEqual(retry.status_code, 200, retry.text)
+            self.assertEqual(self.posted(), ['MONTHLY', 'PERIOD_YEAR', 'PERIOD_YEAR'])
+            self.assertEqual(self.states(), [('MONTHLY', 'superseded'), ('PERIOD_YEAR', 'rejected'), ('PERIOD_YEAR', 'ready')])
+        with self.subTest(case='(c) annual invoice POST times out'):
+            self.reset_lava()
+            self.opened()
+            self.fail_next_year_post(HTTPException(502, lava_api.PROVIDER_SILENT))  # what request raises on a read timeout
+            response = self.click('premium_year')
+            self.assertEqual(response.status_code, 502, response.text)
+            self.assertEqual(self.posted(), ['MONTHLY', 'PERIOD_YEAR'])
+            self.assertEqual(self.states(), [('MONTHLY', 'superseded'), ('PERIOD_YEAR', 'creating')])
+            for product in ('premium_year', 'premium_month'):
+                blocked = self.click(product)
+                self.assertEqual(blocked.status_code, 409, blocked.text)
+                self.assertIn(lava_billing.CHECKOUT_PENDING, text_of(blocked))
+            self.assertEqual(len(self.lava_posts), 2)  # never retried automatically
 
 
 # =========================================================================== BE-11 — annual quota, variant A (300 in each month)
