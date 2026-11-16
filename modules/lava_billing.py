@@ -388,6 +388,20 @@ def apply_snapshot(db, user, checkout, state):
     return "processed"
 
 
+def financial_checkout(db, event):
+    """(checkout or None, candidates, paid) for a refund/dispute envelope, which carries no contract ID.
+
+    One candidate is taken as before; of several, only the single one the server already recorded as paid.
+    Access still changes only from that attempt's authenticated Lava state."""
+    candidates = [c for c in db.query(LavaCheckout).filter_by(offer_id=event["offer"], product_id=event["product"],
+                                                              buyer_email=event["email"]).all()
+                  if c.contract_id and c.created_at <= event["at"]]
+    paid = [c for c in candidates if c.paid_at or c.state == "completed" or conflict_for(db, "lava", c.contract_id)]
+    if len(candidates) == 1:
+        return candidates[0], 1, len(paid)
+    return (paid[0] if len(paid) == 1 else None), len(candidates), len(paid)
+
+
 def process_event(db, body):
     user_id, owner_checked = None, False  # analytics only: confirmation failures after binding
     try:
@@ -402,12 +416,7 @@ def process_event(db, body):
                 provider="lava", offer_id=event["offer"], product_id=event["product"]).first():
             return process_pack_financial(db, event)
         if event["kind"] in FINANCIAL:
-            candidates = db.query(LavaCheckout).filter_by(offer_id=event["offer"], product_id=event["product"],
-                                                         buyer_email=event["email"]).all()
-            # There is no contract ID in this envelope. Only reconcile a single
-            # locally bound subscription, and only from its authenticated API state.
-            candidates = [c for c in candidates if c.contract_id and c.created_at <= event["at"]]
-            checkout = candidates[0] if len(candidates) == 1 else None
+            checkout, candidates, paid = financial_checkout(db, event)
         else:
             checkout = db.query(LavaCheckout).filter_by(contract_id=event["root"]).first()
             if not checkout and event["kind"] == "subscription.cancelled":
@@ -491,6 +500,10 @@ def process_event(db, body):
                 checkout.updated_at = max(filter(None, (checkout.updated_at, event["at"], state["paid"], state["cancelled"], state["terminated"])))
         db.get(BillingEvent, event["key"]).outcome = outcome
         db.commit()
+        if event["kind"] in FINANCIAL:
+            # Manual reconciliation trail: no email, contract IDs or amounts.
+            logger.warning("Lava financial event %s", json.dumps(dict(event_id=event["key"], type=event["kind"],
+                           candidates=candidates, paid=paid, outcome=outcome)))
         if state and user_id and event["kind"] in ("payment.failed", "subscription.recurring.payment.failed"):
             # state comes from the Lava API, so the failure is confirmed, not just reported.
             capture_payment_failure(db, user_id, "lava", "first_payment" if event["kind"] == "payment.failed" else "renewal",
